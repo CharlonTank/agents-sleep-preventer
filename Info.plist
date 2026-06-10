@@ -35,10 +35,10 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Pour la dictée vocale speech-to-text (Fn+Shift).</string>
+    <string>For local voice dictation with Fn+Shift.</string>
     <key>NSInputMonitoringUsageDescription</key>
-    <string>Pour détecter le raccourci Fn+Shift.</string>
+    <string>To detect the Fn+Shift dictation shortcut.</string>
     <key>NSAccessibilityUsageDescription</key>
-    <string>Pour détecter les raccourcis clavier et insérer le texte transcrit.</string>
+    <string>To detect shortcuts and insert transcribed text.</string>
 </dict>
 </plist>

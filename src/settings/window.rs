@@ -347,10 +347,10 @@ impl SettingsWindow {
                 let _: () = msg_send![tab1, setView: tab1_view];
                 let _: () = msg_send![tab_view, addTabViewItem: tab1];
 
-                // Tab 2: Speech to Text
+                // Tab 2: Dictation
                 let tab2: Id = msg_send![class!(NSTabViewItem), alloc];
                 let tab2: Id = msg_send![tab2, initWithIdentifier: nsstring("speech")];
-                let _: () = msg_send![tab2, setLabel: nsstring("Speech to Text")];
+                let _: () = msg_send![tab2, setLabel: nsstring("Dictation")];
 
                 let tab2_view: Id = msg_send![class!(NSView), alloc];
                 let tab2_view: Id = msg_send![
@@ -363,9 +363,13 @@ impl SettingsWindow {
 
                 // Language selector - at top of tab
                 let lang_label_frame =
-                    NSRect::new(NSPoint::new(20.0, 220.0), NSSize::new(150.0, 20.0));
-                let lang_label =
-                    create_label("Language", lang_label_frame, title_font, title_color);
+                    NSRect::new(NSPoint::new(20.0, 220.0), NSSize::new(200.0, 20.0));
+                let lang_label = create_label(
+                    "Dictation Language",
+                    lang_label_frame,
+                    title_font,
+                    title_color,
+                );
                 let _: () = msg_send![tab2_view, addSubview: lang_label];
 
                 let popup_frame = NSRect::new(NSPoint::new(20.0, 190.0), NSSize::new(200.0, 26.0));

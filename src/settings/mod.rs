@@ -31,8 +31,8 @@ pub struct SpeechToTextSettings {
 impl Default for SpeechToTextSettings {
     fn default() -> Self {
         Self {
-            language: "auto".to_string(),
-            vocabulary_words: vec!["Claude".to_string(), "Anthropic".to_string()],
+            language: default_language(),
+            vocabulary_words: Vec::new(),
         }
     }
 }
@@ -51,7 +51,7 @@ fn default_true() -> bool {
 }
 
 fn default_language() -> String {
-    "auto".to_string()
+    "en".to_string()
 }
 
 impl AppSettings {
@@ -107,8 +107,8 @@ impl AppSettings {
     /// Get the list of supported languages for speech-to-text
     pub fn supported_languages() -> Vec<(&'static str, &'static str)> {
         vec![
-            ("auto", "Auto-detect"),
             ("en", "English"),
+            ("auto", "Auto-detect"),
             ("fr", "French"),
             ("de", "German"),
             ("es", "Spanish"),
@@ -129,11 +129,8 @@ mod tests {
     fn test_default_settings() {
         let settings = AppSettings::default();
         assert!(settings.sleep_prevention.enabled);
-        assert_eq!(settings.speech_to_text.language, "auto");
-        assert!(settings
-            .speech_to_text
-            .vocabulary_words
-            .contains(&"Claude".to_string()));
+        assert_eq!(settings.speech_to_text.language, "en");
+        assert!(settings.speech_to_text.vocabulary_words.is_empty());
     }
 
     #[test]
@@ -142,6 +139,6 @@ mod tests {
         let settings: AppSettings = serde_json::from_str(json).unwrap();
         assert!(!settings.sleep_prevention.enabled);
         // speech_to_text should have defaults
-        assert_eq!(settings.speech_to_text.language, "auto");
+        assert_eq!(settings.speech_to_text.language, "en");
     }
 }

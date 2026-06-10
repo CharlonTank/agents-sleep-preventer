@@ -937,14 +937,14 @@ impl PermissionsWindow {
                 content_view,
                 NSPoint::new(24.0, row1_y),
                 NSSize::new(row_width, row_height),
-                "Autoriser Input Monitoring",
-                "Requis pour detecter le raccourci Fn+Shift.",
+                "Allow Input Monitoring",
+                "Required to detect the Fn+Shift shortcut.",
                 row_title_font,
                 row_desc_font,
                 title_color,
                 desc_color,
                 row_color,
-                "Autoriser",
+                "Allow",
                 button_font,
                 target,
                 1,
@@ -954,14 +954,14 @@ impl PermissionsWindow {
                 content_view,
                 NSPoint::new(24.0, row2_y),
                 NSSize::new(row_width, row_height),
-                "Autoriser l'acces au micro",
-                "Necessaire pour capter l'audio pendant la dictee.",
+                "Allow Microphone Access",
+                "Required to capture audio during dictation.",
                 row_title_font,
                 row_desc_font,
                 title_color,
                 desc_color,
                 row_color,
-                "Autoriser",
+                "Allow",
                 button_font,
                 target,
                 2,
@@ -971,14 +971,14 @@ impl PermissionsWindow {
                 content_view,
                 NSPoint::new(24.0, row3_y),
                 NSSize::new(row_width, row_height),
-                "Autoriser l'accessibilite",
-                "Permet de coller le texte dans vos apps.",
+                "Allow Accessibility",
+                "Required to insert transcribed text into your apps.",
                 row_title_font,
                 row_desc_font,
                 title_color,
                 desc_color,
                 row_color,
-                "Autoriser",
+                "Allow",
                 button_font,
                 target,
                 3,
@@ -989,7 +989,7 @@ impl PermissionsWindow {
             let secondary: Id = msg_send![class!(NSButton), alloc];
             let secondary: Id = msg_send![secondary, initWithFrame: secondary_frame];
             let _: () = msg_send![secondary, setBezelStyle: 1i64];
-            let _: () = msg_send![secondary, setTitle: nsstring("Plus tard")];
+            let _: () = msg_send![secondary, setTitle: nsstring("Later")];
             let _: () = msg_send![secondary, setTag: 0i64];
             let secondary_font: Id = msg_send![class!(NSFont), systemFontOfSize: 13.0 as CGFloat];
             let _: () = msg_send![secondary, setFont: secondary_font];

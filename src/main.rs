@@ -75,9 +75,17 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Register current agent process and disable sleep
-    Start,
+    Start {
+        /// Explicit agent PID for managed heartbeat hooks
+        #[arg(long, hide = true)]
+        pid: Option<u32>,
+    },
     /// Unregister current agent process and re-enable sleep if no others
-    Stop,
+    Stop {
+        /// Explicit agent PID for managed heartbeat hooks
+        #[arg(long, hide = true)]
+        pid: Option<u32>,
+    },
     /// Show current status
     Status,
     /// List active/inactive instances as JSON
@@ -127,8 +135,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command.unwrap_or(Commands::Menubar) {
-        Commands::Start => cmd_start()?,
-        Commands::Stop => cmd_stop()?,
+        Commands::Start { pid } => cmd_start(pid)?,
+        Commands::Stop { pid } => cmd_stop(pid)?,
         Commands::Status => cmd_status()?,
         Commands::List => cmd_list()?,
         Commands::Focus { pid } => cmd_focus(pid)?,
@@ -155,6 +163,7 @@ fn main() -> Result<()> {
 enum AgentKind {
     Claude,
     Codex,
+    Hermes,
 }
 
 #[derive(Debug, Clone)]
@@ -235,6 +244,27 @@ fn is_codex_native_process(process: &ProcessInfo) -> bool {
         && !is_codex_app_server(&tokens)
 }
 
+fn is_python_executable(token: &str) -> bool {
+    let basename = executable_basename(token);
+    basename == "python" || basename == "python3" || basename == "Python"
+}
+
+fn is_hermes_python_module(tokens: &[&str]) -> bool {
+    tokens.windows(2).any(|window| {
+        window[0] == "-m" && (window[1] == "hermes_cli.main" || window[1] == "hermes")
+    })
+}
+
+fn is_hermes_process(process: &ProcessInfo) -> bool {
+    let tokens = process_tokens(process);
+    let arg0 = tokens.first().copied().unwrap_or(&process.comm);
+
+    executable_name_is(arg0, "hermes")
+        || executable_name_is(&process.comm, "hermes")
+        || ((is_python_executable(arg0) || is_python_executable(&process.comm))
+            && is_hermes_python_module(&tokens))
+}
+
 fn classify_agent_process(process: &ProcessInfo) -> Option<AgentKind> {
     let tokens = process_tokens(process);
     let arg0 = tokens.first().copied().unwrap_or(&process.comm);
@@ -245,6 +275,10 @@ fn classify_agent_process(process: &ProcessInfo) -> Option<AgentKind> {
 
     if is_codex_native_process(process) || is_codex_wrapper_process(process) {
         return Some(AgentKind::Codex);
+    }
+
+    if is_hermes_process(process) {
+        return Some(AgentKind::Hermes);
     }
 
     None
@@ -466,11 +500,12 @@ fn format_process_location(pid: u32) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn cmd_start() -> Result<()> {
+fn cmd_start(pid: Option<u32>) -> Result<()> {
     logging::init_quiet();
     ensure_pids_dir()?;
-
-    let agent_pid = find_agent_ancestor().unwrap_or(std::process::id());
+    let agent_pid = pid
+        .or_else(find_agent_ancestor)
+        .unwrap_or_else(std::process::id);
     let pid_file = get_pid_file(agent_pid);
 
     fs::write(&pid_file, "working").context("Failed to write PID file")?;
@@ -478,9 +513,11 @@ fn cmd_start() -> Result<()> {
     sync_sleep_state("hook-start", sleep_prevention_enabled_from_settings())
 }
 
-fn cmd_stop() -> Result<()> {
+fn cmd_stop(pid: Option<u32>) -> Result<()> {
     logging::init_quiet();
-    let agent_pid = find_agent_ancestor().unwrap_or(std::process::id());
+    let agent_pid = pid
+        .or_else(find_agent_ancestor)
+        .unwrap_or_else(std::process::id);
     let pid_file = get_pid_file(agent_pid);
 
     let _ = fs::remove_file(&pid_file);
@@ -503,6 +540,7 @@ fn get_all_agent_processes() -> Vec<ProcessInfo> {
             Some(AgentKind::Codex) => {
                 !(is_codex_wrapper_process(process) && codex_native_parents.contains(&process.pid))
             }
+            Some(AgentKind::Hermes) => true,
             None => false,
         })
         .filter(|process| seen_pids.insert(process.pid))
@@ -1179,6 +1217,311 @@ fn install_codex_hooks(home: &Path, app_binary: &str) -> Result<()> {
     Ok(())
 }
 
+const HERMES_HOOK_EVENTS: [&str; 7] = [
+    "pre_llm_call",
+    "post_llm_call",
+    "pre_tool_call",
+    "post_tool_call",
+    "on_session_end",
+    "on_session_finalize",
+    "on_session_reset",
+];
+
+fn hermes_hooks_yaml(script_path: &str) -> String {
+    let mut yaml = String::from("hooks:\n");
+    for event in HERMES_HOOK_EVENTS {
+        yaml.push_str(&format!(
+            "  {event}:\n    - command: \"{script_path}\"\n      timeout: 5\n"
+        ));
+    }
+    yaml
+}
+
+fn is_top_level_yaml_line(line: &str) -> bool {
+    !line.trim().is_empty()
+        && !line.trim_start().starts_with('#')
+        && line.chars().next().is_some_and(|ch| !ch.is_whitespace())
+}
+
+fn yaml_value_before_comment(value: &str) -> &str {
+    value.split('#').next().unwrap_or(value).trim()
+}
+
+fn root_hooks_line_value(line: &str) -> Option<&str> {
+    if !is_top_level_yaml_line(line) {
+        return None;
+    }
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix("hooks")?.trim_start();
+    let value = rest.strip_prefix(':')?.trim_start();
+    Some(value)
+}
+
+fn hermes_event_line(line: &str) -> Option<(&'static str, bool, bool)> {
+    let trimmed = line.trim();
+    HERMES_HOOK_EVENTS.iter().copied().find_map(|event| {
+        let rest = trimmed.strip_prefix(event)?.trim_start();
+        let value = rest.strip_prefix(':')?.trim_start();
+        let value_before_comment = yaml_value_before_comment(value);
+        let can_append_entry = value_before_comment.is_empty() || value_before_comment == "[]";
+        let normalize_empty_list = value_before_comment == "[]";
+        Some((event, can_append_entry, normalize_empty_list))
+    })
+}
+
+fn hermes_hook_entry_yaml(script_path: &str) -> [String; 2] {
+    [
+        format!("    - command: \"{script_path}\""),
+        "      timeout: 5".to_string(),
+    ]
+}
+
+fn set_hermes_hooks_config(content: &str, script_path: &str) -> String {
+    if content.contains(script_path) {
+        return content.to_string();
+    }
+
+    let block = hermes_hooks_yaml(script_path);
+    if content.trim().is_empty() {
+        return block;
+    }
+
+    let lines = content.lines().collect::<Vec<_>>();
+    if let Some(hooks_idx) = lines
+        .iter()
+        .position(|line| root_hooks_line_value(line).is_some())
+    {
+        let hooks_value = root_hooks_line_value(lines[hooks_idx]).unwrap_or_default();
+        let hooks_value_before_comment = yaml_value_before_comment(hooks_value);
+        let normalize_empty_hooks_map = hooks_value_before_comment == "{}";
+        let hooks_end = lines[hooks_idx + 1..]
+            .iter()
+            .position(|line| is_top_level_yaml_line(line))
+            .map(|offset| hooks_idx + 1 + offset)
+            .unwrap_or(lines.len());
+        let mut seen_events = HashSet::new();
+        let mut output = Vec::new();
+
+        output.extend(lines[..hooks_idx].iter().map(|line| (*line).to_string()));
+        if normalize_empty_hooks_map {
+            output.push("hooks:".to_string());
+        } else {
+            output.push(lines[hooks_idx].to_string());
+        }
+
+        for line in &lines[hooks_idx + 1..hooks_end] {
+            if normalize_empty_hooks_map {
+                output.push((*line).to_string());
+                continue;
+            }
+            if let Some((event, can_append_entry, normalize_empty_list)) = hermes_event_line(line) {
+                seen_events.insert(event);
+                if normalize_empty_list {
+                    output.push(format!("  {event}:"));
+                } else {
+                    output.push((*line).to_string());
+                }
+                if can_append_entry {
+                    for entry_line in hermes_hook_entry_yaml(script_path) {
+                        output.push(entry_line);
+                    }
+                }
+            } else {
+                output.push((*line).to_string());
+            }
+        }
+
+        for event in HERMES_HOOK_EVENTS {
+            if seen_events.insert(event) {
+                output.push(format!("  {event}:"));
+                for entry_line in hermes_hook_entry_yaml(script_path) {
+                    output.push(entry_line);
+                }
+            }
+        }
+
+        output.extend(lines[hooks_end..].iter().map(|line| (*line).to_string()));
+        return format!("{}\n", output.join("\n"));
+    }
+
+    let separator = if content.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    format!("{content}{separator}{block}")
+}
+
+fn remove_hermes_hooks_config(content: &str, script_path: &str) -> String {
+    let command_line = format!("command: \"{script_path}\"");
+    let mut output = Vec::new();
+    let mut lines = content.lines().peekable();
+
+    while let Some(line) = lines.next() {
+        if line.trim_start().starts_with('-') && line.contains(&command_line) {
+            if lines
+                .peek()
+                .is_some_and(|next| next.trim_start().starts_with("timeout:"))
+            {
+                lines.next();
+            }
+            continue;
+        }
+        output.push(line.to_string());
+    }
+
+    if content.ends_with('\n') {
+        format!("{}\n", output.join("\n"))
+    } else {
+        output.join("\n")
+    }
+}
+
+fn hermes_hook_script(app_binary: &str) -> String {
+    format!(
+        r#"#!/bin/bash
+set -euo pipefail
+ASP="{app_binary}"
+[ -x "$ASP" ] || ASP="/usr/local/bin/asp"
+[ -x "$ASP" ] || exit 0
+
+payload="$(cat 2>/dev/null || true)"
+event="${{HERMES_HOOK_EVENT:-${{hook_event_name:-}}}}"
+if [ -z "$event" ]; then
+  event="$(printf '%s' "$payload" | /usr/bin/sed -n 's/.*"hook_event_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | /usr/bin/head -n 1)"
+fi
+if [ -z "$event" ]; then
+  event="$(printf '%s' "$payload" | /usr/bin/sed -n 's/.*"event"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | /usr/bin/head -n 1)"
+fi
+
+find_hermes_pid() {{
+  local pid="${{PPID:-}}"
+  local depth=0
+  while [ -n "$pid" ] && [ "$pid" != "0" ] && [ "$depth" -lt 30 ]; do
+    local line
+    line="$(/bin/ps -p "$pid" -o pid=,comm=,args= 2>/dev/null || true)"
+    case "$line" in
+      *hermes*|*hermes_cli.main*) printf '%s\n' "$pid"; return 0 ;;
+    esac
+    pid="$(/bin/ps -p "$pid" -o ppid= 2>/dev/null | /usr/bin/tr -d ' ' || true)"
+    depth=$((depth + 1))
+  done
+  return 1
+}}
+
+agent_pid="${{HERMES_ASP_AGENT_PID:-}}"
+[ -n "$agent_pid" ] || agent_pid="$(find_hermes_pid || true)"
+[ -n "$agent_pid" ] || exit 0
+state_dir="${{TMPDIR:-/tmp}}/agents-sleep-preventer-hermes"
+/bin/mkdir -p "$state_dir"
+heartbeat_pid_file="$state_dir/$agent_pid.pid"
+stop_file="$state_dir/$agent_pid.stop"
+
+start_heartbeat() {{
+  /bin/rm -f "$stop_file"
+  if [ -f "$heartbeat_pid_file" ] && /bin/kill -0 "$(cat "$heartbeat_pid_file")" 2>/dev/null; then
+    return 0
+  fi
+  (
+    while /bin/kill -0 "$agent_pid" 2>/dev/null && [ ! -f "$stop_file" ]; do
+      "$ASP" start --pid "$agent_pid" 2>/dev/null || true
+      /bin/sleep 10
+    done
+  ) >/dev/null 2>&1 &
+  printf '%s\n' "$!" > "$heartbeat_pid_file"
+}}
+
+stop_heartbeat() {{
+  /usr/bin/touch "$stop_file"
+  if [ -f "$heartbeat_pid_file" ]; then
+    /bin/kill "$(cat "$heartbeat_pid_file")" 2>/dev/null || true
+    /bin/rm -f "$heartbeat_pid_file"
+  fi
+  "$ASP" stop --pid "$agent_pid" 2>/dev/null || true
+}}
+
+case "$event" in
+  on_session_end|on_session_finalize|on_session_reset|agent:end|subagent_stop) stop_heartbeat ;;
+  *) "$ASP" start --pid "$agent_pid" 2>/dev/null || true; start_heartbeat ;;
+esac
+"#
+    )
+}
+
+fn hermes_config_paths(home: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let default_config = home.join(".hermes/config.yaml");
+    if default_config.exists() {
+        paths.push(default_config);
+    }
+
+    let profiles_dir = home.join(".hermes/profiles");
+    if let Ok(entries) = fs::read_dir(profiles_dir) {
+        for entry in entries.flatten() {
+            let config = entry.path().join("config.yaml");
+            if config.exists() {
+                paths.push(config);
+            }
+        }
+    }
+
+    paths
+}
+
+fn install_hermes_hooks(home: &Path, app_binary: &str) -> Result<usize> {
+    let config_paths = hermes_config_paths(home);
+    let mut updated = 0;
+
+    for config_path in config_paths {
+        let Some(config_dir) = config_path.parent() else {
+            continue;
+        };
+        let hooks_dir = config_dir.join("agent-hooks");
+        fs::create_dir_all(&hooks_dir)
+            .with_context(|| format!("Failed to create {}", hooks_dir.display()))?;
+        let script_path = hooks_dir.join("asp-sleep.sh");
+        fs::write(&script_path, hermes_hook_script(app_binary))
+            .with_context(|| format!("Failed to write {}", script_path.display()))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))?;
+            fix_user_ownership(&hooks_dir);
+        }
+
+        let content = fs::read_to_string(&config_path).unwrap_or_default();
+        let updated_content = set_hermes_hooks_config(&content, &script_path.to_string_lossy());
+        if updated_content != content {
+            fs::write(&config_path, updated_content)
+                .with_context(|| format!("Failed to write {}", config_path.display()))?;
+        }
+        updated += 1;
+        println!("  Updated {}", config_path.display());
+    }
+
+    Ok(updated)
+}
+
+fn remove_hermes_hooks(home: &Path) -> Result<usize> {
+    let mut removed = 0;
+    for config_path in hermes_config_paths(home) {
+        if let Some(config_dir) = config_path.parent() {
+            let script_path = config_dir.join("agent-hooks/asp-sleep.sh");
+            let script_path_text = script_path.to_string_lossy();
+            let content = fs::read_to_string(&config_path).unwrap_or_default();
+            let updated_content = remove_hermes_hooks_config(&content, &script_path_text);
+            if updated_content != content {
+                fs::write(&config_path, updated_content)
+                    .with_context(|| format!("Failed to write {}", config_path.display()))?;
+            }
+            let _ = fs::remove_file(script_path);
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1220,6 +1563,141 @@ hooks = false
         let updated = set_codex_hooks_feature(config);
 
         assert_eq!(updated, "[features]\nhooks = true\n");
+    }
+
+    #[test]
+    fn classify_agent_process_detects_hermes_binary() {
+        let process = ProcessInfo {
+            pid: 42,
+            ppid: 1,
+            comm: "hermes".to_string(),
+            args: "/opt/homebrew/bin/hermes --profile agents-sleep-preventer gateway run"
+                .to_string(),
+        };
+
+        assert_eq!(classify_agent_process(&process), Some(AgentKind::Hermes));
+    }
+
+    #[test]
+    fn classify_agent_process_detects_python_module_hermes() {
+        let process = ProcessInfo {
+            pid: 42,
+            ppid: 1,
+            comm: "Python".to_string(),
+            args:
+                "/usr/bin/python3 -m hermes_cli.main --profile agents-sleep-preventer gateway run"
+                    .to_string(),
+        };
+
+        assert_eq!(classify_agent_process(&process), Some(AgentKind::Hermes));
+    }
+
+    #[test]
+    fn classify_agent_process_ignores_unrelated_python() {
+        let process = ProcessInfo {
+            pid: 42,
+            ppid: 1,
+            comm: "Python".to_string(),
+            args: "/usr/bin/python3 -m http.server".to_string(),
+        };
+
+        assert_eq!(classify_agent_process(&process), None);
+    }
+
+    #[test]
+    fn set_hermes_hooks_config_replaces_empty_hooks_map() {
+        let updated = set_hermes_hooks_config(
+            "hooks: {}\nmodel:\n  provider: openrouter\n",
+            "/tmp/asp-sleep.sh",
+        );
+
+        assert!(updated.contains("hooks:\n  pre_llm_call:"));
+        assert!(updated.contains("command: \"/tmp/asp-sleep.sh\""));
+        assert!(updated.contains("model:\n  provider: openrouter"));
+    }
+
+    #[test]
+    fn set_hermes_hooks_config_handles_commented_hooks_header() {
+        let updated = set_hermes_hooks_config(
+            "hooks: # shell integrations\n  pre_llm_call: [] # none yet\nmodel:\n  provider: openrouter\n",
+            "/tmp/asp-sleep.sh",
+        );
+
+        assert_eq!(updated.matches("hooks:").count(), 1);
+        assert_eq!(updated.matches("  pre_llm_call:").count(), 1);
+        assert!(updated.contains("  pre_llm_call:\n    - command: \"/tmp/asp-sleep.sh\""));
+        assert!(updated.contains("model:\n  provider: openrouter"));
+    }
+
+    #[test]
+    fn set_hermes_hooks_config_replaces_commented_empty_hooks_map() {
+        let updated = set_hermes_hooks_config(
+            "hooks: {} # none configured\nmodel:\n  provider: openrouter\n",
+            "/tmp/asp-sleep.sh",
+        );
+
+        assert_eq!(updated.matches("hooks:").count(), 1);
+        assert!(updated.contains("hooks:\n  pre_llm_call:"));
+        assert!(updated.contains("model:\n  provider: openrouter"));
+    }
+
+    #[test]
+    fn set_hermes_hooks_config_is_idempotent() {
+        let once = set_hermes_hooks_config("model:\n  provider: openrouter\n", "/tmp/asp-sleep.sh");
+        let twice = set_hermes_hooks_config(&once, "/tmp/asp-sleep.sh");
+
+        assert_eq!(
+            twice.matches("/tmp/asp-sleep.sh").count(),
+            once.matches("/tmp/asp-sleep.sh").count()
+        );
+    }
+
+    #[test]
+    fn set_hermes_hooks_config_merges_existing_events() {
+        let updated = set_hermes_hooks_config(
+            "model:\n  provider: openrouter\nhooks:\n  pre_llm_call:\n    - command: \"/tmp/existing.sh\"\n      timeout: 7\n  post_tool_call:\n    - command: \"/tmp/tool.sh\"\nsettings:\n  theme: dark\n",
+            "/tmp/asp-sleep.sh",
+        );
+
+        assert_eq!(updated.matches("  pre_llm_call:").count(), 1);
+        assert_eq!(updated.matches("  post_tool_call:").count(), 1);
+        assert!(updated.contains("command: \"/tmp/existing.sh\""));
+        assert!(updated.contains("command: \"/tmp/tool.sh\""));
+        assert!(updated.contains("command: \"/tmp/asp-sleep.sh\""));
+        assert!(updated.contains("settings:\n  theme: dark"));
+    }
+
+    #[test]
+    fn set_hermes_hooks_config_handles_inline_empty_event() {
+        let updated = set_hermes_hooks_config(
+            "hooks:\n  pre_llm_call: []\n  post_llm_call: # keep comment\nsettings:\n  theme: dark\n",
+            "/tmp/asp-sleep.sh",
+        );
+
+        assert_eq!(updated.matches("  pre_llm_call:").count(), 1);
+        assert_eq!(updated.matches("  post_llm_call:").count(), 1);
+        assert!(updated.contains("hooks:\n  pre_llm_call:\n    - command: \"/tmp/asp-sleep.sh\""));
+        assert!(updated
+            .contains("  post_llm_call: # keep comment\n    - command: \"/tmp/asp-sleep.sh\""));
+    }
+
+    #[test]
+    fn remove_hermes_hooks_config_removes_only_asp_entries() {
+        let config = "hooks:\n  pre_llm_call:\n    - command: \"/tmp/asp-sleep.sh\"\n      timeout: 5\n    - command: \"/tmp/existing.sh\"\n      timeout: 7\n  on_session_end:\n    - command: \"/tmp/asp-sleep.sh\"\n      timeout: 5\nmodel:\n  provider: openrouter\n";
+
+        let updated = remove_hermes_hooks_config(config, "/tmp/asp-sleep.sh");
+
+        assert!(!updated.contains("/tmp/asp-sleep.sh"));
+        assert!(updated.contains("command: \"/tmp/existing.sh\""));
+        assert!(updated.contains("model:\n  provider: openrouter"));
+    }
+
+    #[test]
+    fn hermes_hook_script_reads_hook_event_name() {
+        let script = hermes_hook_script("/usr/local/bin/asp");
+
+        assert!(script.contains("hook_event_name"));
+        assert!(script.contains("on_session_end|on_session_finalize|on_session_reset"));
     }
 }
 
@@ -1292,8 +1770,7 @@ fn is_installed() -> bool {
 }
 
 fn run_first_time_setup() -> Result<()> {
-    let message =
-        "Agents Sleep Preventer needs to be configured to work with Claude Code and Codex.
+    let message = "Agents Sleep Preventer needs to be configured for supported coding agents.
 
 This will:
 • Install the CLI tool
@@ -1311,7 +1788,7 @@ Administrator password required.";
     match authorization::execute_script_with_privileges(script) {
         Ok(true) => {
             native_dialogs::show_dialog(
-                "Setup complete!\n\nRestart Claude Code or Codex to activate sleep prevention.",
+                "Setup complete!\n\nRestart your coding agents to activate sleep prevention.",
                 "Agents Sleep Preventer",
             );
             relaunch_app_after_install();
@@ -1934,7 +2411,7 @@ fn cmd_install(auto_yes: bool) -> Result<()> {
             .output();
     }
 
-    println!("Configuring Claude Code hooks...");
+    println!("Configuring coding agent hooks...");
 
     let prevent_path = hooks_dir.join("prevent-sleep.sh");
     let allow_path = hooks_dir.join("allow-sleep.sh");
@@ -1973,8 +2450,14 @@ fn cmd_install(auto_yes: bool) -> Result<()> {
     #[cfg(unix)]
     fix_user_ownership(&settings_file);
 
-    println!("Configuring Codex hooks...");
+    println!("Configuring CLI agent hooks...");
     install_codex_hooks(&home, APP_BINARY_PATH)?;
+
+    println!("Configuring Hermes hooks...");
+    let hermes_profiles = install_hermes_hooks(&home, APP_BINARY_PATH)?;
+    if hermes_profiles == 0 {
+        println!("  No Hermes config.yaml found; skipping Hermes hook configuration");
+    }
 
     if is_root {
         Command::new("pmset").args(["-a", "sleep", "5"]).output()?;
@@ -2020,7 +2503,7 @@ fn cmd_install(auto_yes: bool) -> Result<()> {
     }
 
     println!("\n✅ Installation complete!");
-    println!("\nRestart Claude Code or Codex to activate.");
+    println!("\nRestart your coding agents to activate.");
     println!("\nCommands:");
     println!("  asp status   - Show current state");
     println!("  asp cleanup  - Clean up stale PIDs");
@@ -2062,6 +2545,10 @@ fn cmd_uninstall(keep_model: bool, keep_hooks: bool, keep_data: bool) -> Result<
         }
         if remove_codex_hooks(&home)? {
             println!("Removed Codex hooks");
+        }
+        let hermes_removed = remove_hermes_hooks(&home)?;
+        if hermes_removed > 0 {
+            println!("Removed Hermes hook scripts");
         }
         println!("Removed coding agent hooks");
     }
@@ -2180,7 +2667,7 @@ fn cmd_debug() -> Result<()> {
     for (pid, proc) in sys.processes() {
         let name = proc.name().to_string_lossy();
         let lower = name.to_lowercase();
-        if lower.contains("claude") || lower.contains("codex") {
+        if lower.contains("claude") || lower.contains("codex") || lower.contains("hermes") {
             println!("  PID {}: name={:?}", pid.as_u32(), name);
         }
     }
@@ -2192,7 +2679,7 @@ fn cmd_debug() -> Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         let lower = line.to_lowercase();
-        if lower.contains("claude") || lower.contains("codex") {
+        if lower.contains("claude") || lower.contains("codex") || lower.contains("hermes") {
             println!("  {}", line.trim());
         }
     }
@@ -2202,6 +2689,7 @@ fn cmd_debug() -> Result<()> {
         let kind = match classify_agent_process(&process) {
             Some(AgentKind::Claude) => "claude",
             Some(AgentKind::Codex) => "codex",
+            Some(AgentKind::Hermes) => "hermes",
             None => "unknown",
         };
         println!(

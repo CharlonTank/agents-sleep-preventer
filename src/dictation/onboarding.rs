@@ -46,7 +46,7 @@ fn get_legacy_prefs_path() -> PathBuf {
 }
 
 /// Run the onboarding flow if this is the first launch.
-/// If `auto_dismiss_final` is true, the final "Prêt !" modal will auto-close.
+/// If `auto_dismiss_final` is true, the final "Ready!" modal will auto-close.
 pub fn run_onboarding_if_needed(auto_dismiss_final: bool) {
     if !is_first_launch() {
         return;
@@ -54,12 +54,12 @@ pub fn run_onboarding_if_needed(auto_dismiss_final: bool) {
 
     logging::log("[onboarding] First launch detected, starting setup...");
 
-    let welcome_message = r#"La confidentialite est au coeur d'Agents Sleep Preventer.
-Autorisez ces acces pour activer la dictee vocale."#;
+    let welcome_message = r#"Privacy is at the core of Agents Sleep Preventer.
+Allow these permissions to enable local voice dictation."#;
 
-    let window = PermissionsWindow::new("Configurons les permissions", welcome_message);
-    window.set_primary_button("Continuer la configuration");
-    window.set_secondary_button("Plus tard");
+    let window = PermissionsWindow::new("Set Up Permissions", welcome_message);
+    window.set_primary_button("Continue Setup");
+    window.set_secondary_button("Later");
     window.set_secondary_visible(true);
     window.set_progress(25.0);
 
@@ -93,8 +93,7 @@ Autorisez ces acces pour activer la dictee vocale."#;
         }
     }
 
-    let model_window =
-        native_dialogs::SetupWindow::new("Modèle Whisper", "Vérification du modèle...");
+    let model_window = native_dialogs::SetupWindow::new("Whisper Model", "Checking model...");
     setup_whisper_model(&model_window);
 
     if auto_dismiss_final {
@@ -104,11 +103,11 @@ Autorisez ces acces pour activer la dictee vocale."#;
         return;
     }
     let final_message = if WhisperTranscriber::new().setup_status() == DictationSetupStatus::Ready {
-        "Configuration terminée.\n\nAppuyez sur Fn+Shift pour dicter du texte."
+        "Setup complete.\n\nPress Fn+Shift to dictate text."
     } else {
-        "Configuration terminée.\n\nPour activer la dictée, ouvrez le menu et cliquez sur \"Setup Dictation...\" pour télécharger le modèle Whisper."
+        "Setup complete.\n\nTo enable dictation, open Settings and download the Whisper model."
     };
-    model_window.set_title("Prêt !");
+    model_window.set_title("Ready!");
     model_window.show_progress(true);
     model_window.set_progress(100.0);
     model_window.set_message(final_message);
@@ -123,9 +122,9 @@ Autorisez ces acces pour activer la dictee vocale."#;
 
 fn permission_button_label(granted: bool) -> &'static str {
     if granted {
-        "Autorise"
+        "Allowed"
     } else {
-        "Autoriser"
+        "Allow"
     }
 }
 
@@ -180,7 +179,7 @@ fn handle_permission_toggle(toggle: PermissionToggle) {
                 if !request_input_monitoring_permission() {
                     open_input_monitoring_settings();
                     native_dialogs::show_dialog(
-                        "Dans Reglages Systeme > Confidentialite et securite > Input Monitoring,\ncliquez sur le bouton + puis selectionnez AgentsSleepPreventer.app dans /Applications, puis activez l'interrupteur.",
+                        "In System Settings > Privacy & Security > Input Monitoring,\nclick +, select AgentsSleepPreventer.app in /Applications, then enable the switch.",
                         "Input Monitoring",
                     );
                 }
@@ -234,14 +233,14 @@ fn setup_whisper_model(window: &native_dialogs::SetupWindow) {
         return;
     }
 
-    let message = r#"La dictée utilise un modèle Whisper local (~500 Mo).
+    let message = r#"Dictation uses a local Whisper model (~500 MB).
 
-Voulez-vous le télécharger maintenant ?"#;
+Download it now?"#;
 
-    window.set_title("Modèle Whisper");
+    window.set_title("Whisper Model");
     window.set_message(message);
-    window.set_primary_button("Télécharger");
-    window.set_secondary_button("Plus tard");
+    window.set_primary_button("Download");
+    window.set_secondary_button("Later");
     window.set_secondary_visible(true);
 
     if window.wait_for_action() == native_dialogs::SetupAction::Secondary {
@@ -251,17 +250,17 @@ Voulez-vous le télécharger maintenant ?"#;
 
     match super::transcription::download_model_with_window(window) {
         Ok(()) => {
-            window.set_title("Téléchargement terminé");
+            window.set_title("Download Complete");
             window.show_progress(true);
             window.set_progress(100.0);
-            window.set_message("Le modèle Whisper a été téléchargé.");
-            window.set_primary_button("Continuer");
+            window.set_message("The Whisper model has been downloaded.");
+            window.set_primary_button("Continue");
             window.set_secondary_visible(false);
             window.wait_for_action();
         }
         Err(e) => {
-            window.set_title("Téléchargement échoué");
-            window.set_message(&format!("Échec du téléchargement :\n\n{}", e));
+            window.set_title("Download Failed");
+            window.set_message(&format!("Download failed:\n\n{}", e));
             window.set_primary_button("OK");
             window.set_secondary_visible(false);
             window.wait_for_action();
