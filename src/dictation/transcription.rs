@@ -10,8 +10,10 @@ use objc::{class, msg_send, sel, sel_impl};
 use crate::native_dialogs;
 use crate::settings::AppSettings;
 
-const MODEL_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin";
-const MODEL_FILENAME: &str = "ggml-medium.bin";
+/// Model files we know how to use when locating an already-downloaded model.
+/// Includes the legacy default (`ggml-medium.bin`) so existing installs keep
+/// working after the default model changed to large-v3-turbo.
+const LEGACY_MODEL_FILENAMES: &[&str] = &["ggml-medium.bin", "ggml-base.bin"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DictationSetupStatus {
@@ -89,43 +91,73 @@ impl WhisperTranscriber {
             .join("ClaudeSleepPreventer")
     }
 
+    /// Directories where we store downloaded models, in priority order.
+    fn model_dirs() -> [PathBuf; 2] {
+        [
+            Self::app_support_dir().join("models"),
+            Self::legacy_app_support_dir().join("models"),
+        ]
+    }
+
+    /// The model file name the user has selected in settings.
+    fn selected_model_filename() -> String {
+        // Dev override: WHISPER_MODEL=large-v3-turbo -> ggml-large-v3-turbo.bin
+        if let Ok(name) = env::var("WHISPER_MODEL") {
+            return format!("ggml-{}.bin", name);
+        }
+        AppSettings::load().selected_model().filename.to_string()
+    }
+
+    /// Whether the model currently selected in settings is already downloaded.
+    pub fn selected_model_downloaded() -> bool {
+        let filename = Self::selected_model_filename();
+        Self::model_dirs()
+            .iter()
+            .any(|dir| dir.join(&filename).exists())
+    }
+
     fn find_model() -> Option<PathBuf> {
-        let model_name = env::var("WHISPER_MODEL").unwrap_or_else(|_| "medium".to_string());
-
-        // Check app support directory first (our downloaded models)
-        for app_support_dir in [Self::app_support_dir(), Self::legacy_app_support_dir()] {
-            let app_model = app_support_dir
-                .join("models")
-                .join(format!("ggml-{}.bin", model_name));
-            if app_model.exists() {
-                return Some(app_model);
+        // 1. The selected model, if downloaded.
+        let selected = Self::selected_model_filename();
+        for dir in Self::model_dirs() {
+            let path = dir.join(&selected);
+            if path.exists() {
+                return Some(path);
             }
         }
 
-        // Check homebrew location (if user had it installed before)
+        // 2. Any other known model we downloaded previously, so dictation keeps
+        //    working for existing installs that have a different model on disk.
+        let known: Vec<String> = AppSettings::supported_models()
+            .iter()
+            .map(|m| m.filename.to_string())
+            .chain(LEGACY_MODEL_FILENAMES.iter().map(|s| s.to_string()))
+            .collect();
+        for dir in Self::model_dirs() {
+            for filename in &known {
+                let path = dir.join(filename);
+                if path.exists() {
+                    return Some(path);
+                }
+            }
+        }
+
+        // 3. Homebrew location (if the user installed whisper-cpp before).
         let homebrew_dir = PathBuf::from("/opt/homebrew/share/whisper-cpp/models");
-
-        // Try quantized model first (faster), then standard
-        let quantized = homebrew_dir.join(format!("ggml-{}-q5_0.bin", model_name));
-        let standard = homebrew_dir.join(format!("ggml-{}.bin", model_name));
-
-        if quantized.exists() {
-            Some(quantized)
-        } else if standard.exists() {
-            Some(standard)
-        } else {
-            // Try fallback to base model
-            let base_quantized = homebrew_dir.join("ggml-base-q5_0.bin");
-            let base_standard = homebrew_dir.join("ggml-base.bin");
-
-            if base_quantized.exists() {
-                Some(base_quantized)
-            } else if base_standard.exists() {
-                Some(base_standard)
-            } else {
-                None
+        for filename in &known {
+            let path = homebrew_dir.join(filename);
+            if path.exists() {
+                return Some(path);
             }
         }
+        for stem in ["ggml-large-v3-turbo", "ggml-medium", "ggml-base"] {
+            let quantized = homebrew_dir.join(format!("{}-q5_0.bin", stem));
+            if quantized.exists() {
+                return Some(quantized);
+            }
+        }
+
+        None
     }
 
     pub fn is_available(&self) -> bool {
@@ -195,13 +227,15 @@ pub(crate) fn download_model_with_window(
         return Err(format!("Failed to create models directory: {}", e));
     }
 
-    let model_path = models_dir.join(MODEL_FILENAME);
+    let model = AppSettings::load().selected_model();
+    let model_path = models_dir.join(model.filename);
+    let model_url = model.url();
     let model_path_for_thread = model_path.clone();
     let handle = window.handle();
     let (tx, rx) = mpsc::channel();
 
     std::thread::spawn(move || {
-        let result = download_model_with_progress(&model_path_for_thread, &handle);
+        let result = download_model_with_progress(&model_path_for_thread, &model_url, &handle);
         let _ = tx.send(result);
         handle.stop_modal();
     });
@@ -224,6 +258,7 @@ pub(crate) fn download_model_with_window(
 
 fn download_model_with_progress(
     model_path: &PathBuf,
+    model_url: &str,
     progress: &native_dialogs::SetupWindowHandle,
 ) -> Result<(), String> {
     use std::process::Stdio;
@@ -234,7 +269,7 @@ fn download_model_with_progress(
             "--progress-bar",
             "-o",
             model_path.to_str().unwrap(),
-            MODEL_URL,
+            model_url,
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

@@ -2078,15 +2078,26 @@ fn cmd_menubar() -> Result<()> {
             if menu_event.id == settings_item_id {
                 logging::log("[menu] Settings selected");
                 popover.hide();
+                let was_available = dictation_manager.is_available();
                 if let Some(new_settings) = settings::window::show_settings() {
                     // Update manual sleep prevention based on settings
                     MANUAL_SLEEP_PREVENTION
                         .store(new_settings.sleep_prevention.enabled, Ordering::SeqCst);
                     menubar_sync_sleep();
                     logging::log(&format!(
-                        "[menu] Settings saved: sleep_enabled={}",
-                        new_settings.sleep_prevention.enabled
+                        "[menu] Settings saved: sleep_enabled={}, model={}",
+                        new_settings.sleep_prevention.enabled, new_settings.speech_to_text.model
                     ));
+
+                    // If the selected dictation model isn't downloaded yet,
+                    // offer to download it now, then pick it up.
+                    dictation::ensure_selected_model_downloaded();
+                    dictation_manager.reload_transcriber();
+                    if !was_available && dictation_manager.is_available() {
+                        if let Err(e) = dictation_manager.start() {
+                            logging::log(&format!("[dictation] Failed to start: {}", e));
+                        }
+                    }
                 }
             } else if menu_event.id == quit_item_id {
                 logging::log("[menu] Quit selected");
@@ -2651,9 +2662,13 @@ fn cmd_settings() -> Result<()> {
 
     if let Some(new_settings) = settings::window::show_settings() {
         logging::log(&format!(
-            "[settings] Settings saved: sleep_enabled={}, language={}",
-            new_settings.sleep_prevention.enabled, new_settings.speech_to_text.language
+            "[settings] Settings saved: sleep_enabled={}, language={}, model={}",
+            new_settings.sleep_prevention.enabled,
+            new_settings.speech_to_text.language,
+            new_settings.speech_to_text.model
         ));
+        // Offer to download the selected model if it isn't present yet.
+        dictation::ensure_selected_model_downloaded();
     } else {
         logging::log("[settings] Settings cancelled");
     }

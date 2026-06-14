@@ -115,6 +115,11 @@ impl SettingsState {
         settings.speech_to_text.language = language;
     }
 
+    fn update_model(&self, model: String) {
+        let mut settings = self.settings.lock().unwrap();
+        settings.speech_to_text.model = model;
+    }
+
     fn update_vocabulary(&self, words: Vec<String>) {
         let mut settings = self.settings.lock().unwrap();
         settings.speech_to_text.vocabulary_words = words;
@@ -167,6 +172,21 @@ extern "C" fn language_changed(this: &Object, _: Sel, sender: Id) {
     }
 }
 
+extern "C" fn model_changed(this: &Object, _: Sel, sender: Id) {
+    unsafe {
+        let state_ptr: *mut c_void = *this.get_ivar("rustState");
+        if !state_ptr.is_null() {
+            let state = &*(state_ptr as *const SettingsState);
+            let selected_index: i64 = msg_send![sender, indexOfSelectedItem];
+            let models = AppSettings::supported_models();
+            if (selected_index as usize) < models.len() {
+                let id = models[selected_index as usize].id;
+                state.update_model(id.to_string());
+            }
+        }
+    }
+}
+
 extern "C" fn window_will_close(this: &Object, _: Sel, _notification: Id) {
     unsafe {
         let state_ptr: *mut c_void = *this.get_ivar("rustState");
@@ -208,6 +228,10 @@ fn settings_target_class() -> &'static objc::runtime::Class {
             decl.add_method(
                 sel!(languageChanged:),
                 language_changed as extern "C" fn(&Object, Sel, Id),
+            );
+            decl.add_method(
+                sel!(modelChanged:),
+                model_changed as extern "C" fn(&Object, Sel, Id),
             );
             decl.add_method(
                 sel!(windowWillClose:),
@@ -361,9 +385,39 @@ impl SettingsWindow {
                     )
                 ];
 
-                // Language selector - at top of tab
+                // Model selector - at top of tab
+                let model_label_frame =
+                    NSRect::new(NSPoint::new(20.0, 232.0), NSSize::new(200.0, 20.0));
+                let model_label = create_label(
+                    "Dictation Model",
+                    model_label_frame,
+                    title_font,
+                    title_color,
+                );
+                let _: () = msg_send![tab2_view, addSubview: model_label];
+
+                let model_popup_frame =
+                    NSRect::new(NSPoint::new(20.0, 206.0), NSSize::new(260.0, 26.0));
+                let model_popup: Id = msg_send![class!(NSPopUpButton), alloc];
+                let model_popup: Id =
+                    msg_send![model_popup, initWithFrame: model_popup_frame pullsDown: false as BOOL];
+
+                let models = AppSettings::supported_models();
+                let mut selected_model_index: i64 = 0;
+                for (i, model) in models.iter().enumerate() {
+                    let _: () = msg_send![model_popup, addItemWithTitle: nsstring(model.label)];
+                    if model.id == settings.speech_to_text.model {
+                        selected_model_index = i as i64;
+                    }
+                }
+                let _: () = msg_send![model_popup, selectItemAtIndex: selected_model_index];
+                let _: () = msg_send![model_popup, setTarget: target];
+                let _: () = msg_send![model_popup, setAction: sel!(modelChanged:)];
+                let _: () = msg_send![tab2_view, addSubview: model_popup];
+
+                // Language selector
                 let lang_label_frame =
-                    NSRect::new(NSPoint::new(20.0, 220.0), NSSize::new(200.0, 20.0));
+                    NSRect::new(NSPoint::new(20.0, 168.0), NSSize::new(200.0, 20.0));
                 let lang_label = create_label(
                     "Dictation Language",
                     lang_label_frame,
@@ -372,7 +426,7 @@ impl SettingsWindow {
                 );
                 let _: () = msg_send![tab2_view, addSubview: lang_label];
 
-                let popup_frame = NSRect::new(NSPoint::new(20.0, 190.0), NSSize::new(200.0, 26.0));
+                let popup_frame = NSRect::new(NSPoint::new(20.0, 142.0), NSSize::new(200.0, 26.0));
                 let popup: Id = msg_send![class!(NSPopUpButton), alloc];
                 let popup: Id =
                     msg_send![popup, initWithFrame: popup_frame pullsDown: false as BOOL];
@@ -392,7 +446,7 @@ impl SettingsWindow {
 
                 // Vocabulary words
                 let vocab_label_frame =
-                    NSRect::new(NSPoint::new(20.0, 150.0), NSSize::new(300.0, 20.0));
+                    NSRect::new(NSPoint::new(20.0, 110.0), NSSize::new(300.0, 20.0));
                 let vocab_label = create_label(
                     "Vocabulary Words",
                     vocab_label_frame,
@@ -402,7 +456,7 @@ impl SettingsWindow {
                 let _: () = msg_send![tab2_view, addSubview: vocab_label];
 
                 let vocab_desc_frame =
-                    NSRect::new(NSPoint::new(20.0, 125.0), NSSize::new(380.0, 20.0));
+                    NSRect::new(NSPoint::new(20.0, 90.0), NSSize::new(380.0, 18.0));
                 let vocab_desc = create_label(
                     "One word per line. These help with transcription accuracy.",
                     vocab_desc_frame,
@@ -411,9 +465,9 @@ impl SettingsWindow {
                 );
                 let _: () = msg_send![tab2_view, addSubview: vocab_desc];
 
-                // Vocabulary text view in scroll view - taller to show more words
+                // Vocabulary text view in scroll view
                 let scroll_frame =
-                    NSRect::new(NSPoint::new(20.0, 15.0), NSSize::new(width - 100.0, 100.0));
+                    NSRect::new(NSPoint::new(20.0, 8.0), NSSize::new(width - 100.0, 78.0));
                 let scroll_view: Id = msg_send![class!(NSScrollView), alloc];
                 let scroll_view: Id = msg_send![scroll_view, initWithFrame: scroll_frame];
                 let _: () = msg_send![scroll_view, setBorderType: 3i64]; // NSBezelBorder

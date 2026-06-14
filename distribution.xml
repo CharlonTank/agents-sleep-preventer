@@ -14,6 +14,6 @@
         <pkg-ref id="com.charlontank.agents-sleep-preventer"/>
     </choice>
 
-    <pkg-ref id="com.charlontank.agents-sleep-preventer-cli" version="4.0.3">AgentsSleepPreventer-cli.pkg</pkg-ref>
-    <pkg-ref id="com.charlontank.agents-sleep-preventer" version="4.0.3">AgentsSleepPreventer-app.pkg</pkg-ref>
+    <pkg-ref id="com.charlontank.agents-sleep-preventer-cli" version="4.1.0">AgentsSleepPreventer-cli.pkg</pkg-ref>
+    <pkg-ref id="com.charlontank.agents-sleep-preventer" version="4.1.0">AgentsSleepPreventer-app.pkg</pkg-ref>
 </installer-gui-script>

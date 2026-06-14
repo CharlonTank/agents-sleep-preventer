@@ -24,6 +24,8 @@ impl Default for SleepPreventionSettings {
 pub struct SpeechToTextSettings {
     #[serde(default = "default_language")]
     pub language: String,
+    #[serde(default = "default_model")]
+    pub model: String,
     #[serde(default)]
     pub vocabulary_words: Vec<String>,
 }
@@ -32,8 +34,30 @@ impl Default for SpeechToTextSettings {
     fn default() -> Self {
         Self {
             language: default_language(),
+            model: default_model(),
             vocabulary_words: Vec::new(),
         }
+    }
+}
+
+/// A downloadable Whisper model the user can choose from.
+#[derive(Debug, Clone, Copy)]
+pub struct WhisperModelChoice {
+    /// Stable identifier persisted in settings.
+    pub id: &'static str,
+    /// Human-readable label shown in the picker.
+    pub label: &'static str,
+    /// GGML file name as published on Hugging Face and stored locally.
+    pub filename: &'static str,
+}
+
+impl WhisperModelChoice {
+    /// Download URL for this model on the whisper.cpp Hugging Face repo.
+    pub fn url(&self) -> String {
+        format!(
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}",
+            self.filename
+        )
     }
 }
 
@@ -52,6 +76,10 @@ fn default_true() -> bool {
 
 fn default_language() -> String {
     "en".to_string()
+}
+
+fn default_model() -> String {
+    "large-v3-turbo-q5_0".to_string()
 }
 
 impl AppSettings {
@@ -118,6 +146,35 @@ impl AppSettings {
             ("ja", "Japanese"),
             ("ko", "Korean"),
         ]
+    }
+
+    /// The Whisper models the user can choose to download, ordered from
+    /// lightest/fastest to highest quality. The first entry is the default.
+    pub fn supported_models() -> Vec<WhisperModelChoice> {
+        vec![
+            WhisperModelChoice {
+                id: "large-v3-turbo-q5_0",
+                label: "Turbo — Faster (574 MB)",
+                filename: "ggml-large-v3-turbo-q5_0.bin",
+            },
+            WhisperModelChoice {
+                id: "large-v3-turbo",
+                label: "Turbo — Higher quality (1.6 GB)",
+                filename: "ggml-large-v3-turbo.bin",
+            },
+        ]
+    }
+
+    /// The currently selected model, falling back to the default (first entry)
+    /// when the stored id is unknown.
+    pub fn selected_model(&self) -> WhisperModelChoice {
+        let id = self.speech_to_text.model.as_str();
+        let models = Self::supported_models();
+        models
+            .iter()
+            .find(|m| m.id == id)
+            .copied()
+            .unwrap_or(models[0])
     }
 }
 

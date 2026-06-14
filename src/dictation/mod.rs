@@ -11,7 +11,7 @@ use audio::{
     MicrophonePermission,
 };
 use globe_key::{GlobeKeyEvent, GlobeKeyManager};
-pub use onboarding::run_onboarding_if_needed;
+pub use onboarding::{ensure_selected_model_downloaded, run_onboarding_if_needed};
 use overlay::{OverlayMode, RecordingOverlay};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -108,6 +108,12 @@ impl DictationManager {
 
     pub fn is_available(&self) -> bool {
         self.transcriber.is_available()
+    }
+
+    /// Re-evaluate which Whisper model is on disk (e.g. after the user changed
+    /// the model in Settings or downloaded one).
+    pub fn reload_transcriber(&mut self) {
+        self.transcriber = WhisperTranscriber::new();
     }
 
     pub fn update(&mut self) {

@@ -223,22 +223,34 @@ fn open_accessibility_settings() {
         .spawn();
 }
 
+/// Ensure the model currently selected in settings is downloaded, prompting the
+/// user if it is missing. Used after the user changes the model in Settings.
+pub fn ensure_selected_model_downloaded() {
+    if WhisperTranscriber::selected_model_downloaded() {
+        return;
+    }
+    let window = native_dialogs::SetupWindow::new("Whisper Model", "Checking model...");
+    setup_whisper_model(&window);
+    window.close();
+}
+
 fn setup_whisper_model(window: &native_dialogs::SetupWindow) {
     window.show_progress(true);
     window.set_progress(66.0);
-    let transcriber = WhisperTranscriber::new();
 
-    if transcriber.setup_status() == DictationSetupStatus::Ready {
-        logging::log("[onboarding] Whisper model already available");
+    if WhisperTranscriber::selected_model_downloaded() {
+        logging::log("[onboarding] Selected Whisper model already available");
         return;
     }
 
-    let message = r#"Dictation uses a local Whisper model (~500 MB).
-
-Download it now?"#;
+    let model_label = crate::settings::AppSettings::load().selected_model().label;
+    let message = format!(
+        "Dictation uses a local Whisper model.\n\n{}\n\nDownload it now?",
+        model_label
+    );
 
     window.set_title("Whisper Model");
-    window.set_message(message);
+    window.set_message(&message);
     window.set_primary_button("Download");
     window.set_secondary_button("Later");
     window.set_secondary_visible(true);

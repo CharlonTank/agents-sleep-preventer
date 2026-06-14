@@ -7,7 +7,7 @@
 
 <br>
 
-[![Download DMG](https://img.shields.io/badge/Download-DMG%20Installer-blue?style=for-the-badge&logo=apple)](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-4.0.3.dmg)
+[![Download DMG](https://img.shields.io/badge/Download-DMG%20Installer-blue?style=for-the-badge&logo=apple)](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-4.1.0.dmg)
 
 <br>
 
@@ -55,7 +55,7 @@ Install this tool. Now your Mac stays awake while your agent works, even with th
 
 ### 🍎 Download DMG (Easiest)
 
-1. [Download the latest DMG](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-4.0.3.dmg)
+1. [Download the latest DMG](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-4.1.0.dmg)
 2. Drag `AgentsSleepPreventer.app` to Applications
 3. Launch the app - it will auto-configure on first run
 4. Restart your coding agents
