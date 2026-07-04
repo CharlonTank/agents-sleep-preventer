@@ -19,6 +19,19 @@ impl Default for SleepPreventionSettings {
     }
 }
 
+/// Agent notification settings (task finished, agent needs attention)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for NotificationSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// Speech-to-text settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpeechToTextSettings {
@@ -28,6 +41,8 @@ pub struct SpeechToTextSettings {
     pub model: String,
     #[serde(default)]
     pub vocabulary_words: Vec<String>,
+    #[serde(default = "default_hotkey")]
+    pub hotkey: String,
 }
 
 impl Default for SpeechToTextSettings {
@@ -36,28 +51,94 @@ impl Default for SpeechToTextSettings {
             language: default_language(),
             model: default_model(),
             vocabulary_words: Vec::new(),
+            hotkey: default_hotkey(),
         }
     }
 }
 
-/// A downloadable Whisper model the user can choose from.
+/// A configurable modifier-key combo held down to start/stop dictation.
 #[derive(Debug, Clone, Copy)]
-pub struct WhisperModelChoice {
+pub struct HotkeyChoice {
     /// Stable identifier persisted in settings.
     pub id: &'static str,
     /// Human-readable label shown in the picker.
     pub label: &'static str,
-    /// GGML file name as published on Hugging Face and stored locally.
-    pub filename: &'static str,
+    /// Bitmask of CGEventFlags modifier bits that must all be held together.
+    pub mask: u64,
 }
 
-impl WhisperModelChoice {
-    /// Download URL for this model on the whisper.cpp Hugging Face repo.
-    pub fn url(&self) -> String {
-        format!(
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}",
-            self.filename
-        )
+// CGEventFlags modifier bits (Core Graphics / Quartz Event Services).
+const CG_FLAG_SHIFT: u64 = 0x00020000;
+const CG_FLAG_CONTROL: u64 = 0x00040000;
+const CG_FLAG_OPTION: u64 = 0x00080000;
+const CG_FLAG_COMMAND: u64 = 0x00100000;
+const CG_FLAG_FN: u64 = 0x00800000;
+
+/// Transcription engine backing a model choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelEngine {
+    /// whisper.cpp via the bundled whisper-cli binary.
+    Whisper,
+    /// Parakeet TDT via in-process ONNX Runtime (transcribe-rs).
+    Parakeet,
+}
+
+/// Files making up the Parakeet ONNX model directory.
+pub const PARAKEET_FILES: [&str; 4] = [
+    "encoder-model.int8.onnx",
+    "decoder_joint-model.int8.onnx",
+    "nemo128.onnx",
+    "vocab.txt",
+];
+
+/// A downloadable transcription model the user can choose from.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelChoice {
+    /// Stable identifier persisted in settings.
+    pub id: &'static str,
+    /// Human-readable label shown in the picker.
+    pub label: &'static str,
+    /// On-disk name under the models dir: a GGML file for Whisper,
+    /// a directory for Parakeet.
+    pub filename: &'static str,
+    pub engine: ModelEngine,
+}
+
+impl ModelChoice {
+    /// Files to download: (url, path relative to the models dir).
+    pub fn download_files(&self) -> Vec<(String, PathBuf)> {
+        match self.engine {
+            ModelEngine::Whisper => vec![(
+                format!(
+                    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}",
+                    self.filename
+                ),
+                PathBuf::from(self.filename),
+            )],
+            ModelEngine::Parakeet => PARAKEET_FILES
+                .iter()
+                .map(|f| {
+                    (
+                        format!(
+                            "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/{}",
+                            f
+                        ),
+                        PathBuf::from(self.filename).join(f),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether this model is fully present under the given models dir.
+    pub fn is_downloaded_in(&self, models_dir: &std::path::Path) -> bool {
+        match self.engine {
+            ModelEngine::Whisper => models_dir.join(self.filename).exists(),
+            ModelEngine::Parakeet => {
+                let dir = models_dir.join(self.filename);
+                PARAKEET_FILES.iter().all(|f| dir.join(f).exists())
+            }
+        }
     }
 }
 
@@ -68,6 +149,8 @@ pub struct AppSettings {
     pub sleep_prevention: SleepPreventionSettings,
     #[serde(default)]
     pub speech_to_text: SpeechToTextSettings,
+    #[serde(default)]
+    pub notifications: NotificationSettings,
 }
 
 fn default_true() -> bool {
@@ -80,6 +163,10 @@ fn default_language() -> String {
 
 fn default_model() -> String {
     "large-v3-turbo-q5_0".to_string()
+}
+
+fn default_hotkey() -> String {
+    "fn_shift".to_string()
 }
 
 impl AppSettings {
@@ -148,26 +235,34 @@ impl AppSettings {
         ]
     }
 
-    /// The Whisper models the user can choose to download, ordered from
-    /// lightest/fastest to highest quality. The first entry is the default.
-    pub fn supported_models() -> Vec<WhisperModelChoice> {
+    /// The transcription models the user can choose to download.
+    /// The first entry is the default.
+    pub fn supported_models() -> Vec<ModelChoice> {
         vec![
-            WhisperModelChoice {
+            ModelChoice {
                 id: "large-v3-turbo-q5_0",
-                label: "Turbo — Faster (574 MB)",
+                label: "Whisper Turbo — Fast (574 MB)",
                 filename: "ggml-large-v3-turbo-q5_0.bin",
+                engine: ModelEngine::Whisper,
             },
-            WhisperModelChoice {
+            ModelChoice {
                 id: "large-v3-turbo",
-                label: "Turbo — Higher quality (1.6 GB)",
+                label: "Whisper Turbo — Best accuracy (1.6 GB)",
                 filename: "ggml-large-v3-turbo.bin",
+                engine: ModelEngine::Whisper,
+            },
+            ModelChoice {
+                id: "parakeet-tdt-0.6b-v3-int8",
+                label: "Parakeet v3 — Fastest (670 MB, EU languages)",
+                filename: "parakeet-tdt-0.6b-v3-int8",
+                engine: ModelEngine::Parakeet,
             },
         ]
     }
 
     /// The currently selected model, falling back to the default (first entry)
     /// when the stored id is unknown.
-    pub fn selected_model(&self) -> WhisperModelChoice {
+    pub fn selected_model(&self) -> ModelChoice {
         let id = self.speech_to_text.model.as_str();
         let models = Self::supported_models();
         models
@@ -175,6 +270,50 @@ impl AppSettings {
             .find(|m| m.id == id)
             .copied()
             .unwrap_or(models[0])
+    }
+
+    /// The modifier-key combos the user can choose to trigger dictation.
+    /// The first entry is the default.
+    pub fn supported_hotkeys() -> Vec<HotkeyChoice> {
+        vec![
+            HotkeyChoice {
+                id: "fn_shift",
+                label: "Fn + Shift",
+                mask: CG_FLAG_FN | CG_FLAG_SHIFT,
+            },
+            HotkeyChoice {
+                id: "fn_control",
+                label: "Fn + Control",
+                mask: CG_FLAG_FN | CG_FLAG_CONTROL,
+            },
+            HotkeyChoice {
+                id: "fn_option",
+                label: "Fn + Option",
+                mask: CG_FLAG_FN | CG_FLAG_OPTION,
+            },
+            HotkeyChoice {
+                id: "control_option",
+                label: "Control + Option",
+                mask: CG_FLAG_CONTROL | CG_FLAG_OPTION,
+            },
+            HotkeyChoice {
+                id: "command_shift",
+                label: "Command + Shift",
+                mask: CG_FLAG_COMMAND | CG_FLAG_SHIFT,
+            },
+        ]
+    }
+
+    /// The currently selected hotkey, falling back to the default (first entry)
+    /// when the stored id is unknown.
+    pub fn selected_hotkey(&self) -> HotkeyChoice {
+        let id = self.speech_to_text.hotkey.as_str();
+        let hotkeys = Self::supported_hotkeys();
+        hotkeys
+            .iter()
+            .find(|h| h.id == id)
+            .copied()
+            .unwrap_or(hotkeys[0])
     }
 }
 
@@ -197,5 +336,32 @@ mod tests {
         assert!(!settings.sleep_prevention.enabled);
         // speech_to_text should have defaults
         assert_eq!(settings.speech_to_text.language, "en");
+    }
+
+    #[test]
+    fn test_model_download_files() {
+        let models = AppSettings::supported_models();
+        let whisper = models.iter().find(|m| m.engine == ModelEngine::Whisper).unwrap();
+        assert_eq!(whisper.download_files().len(), 1);
+
+        let parakeet = models.iter().find(|m| m.engine == ModelEngine::Parakeet).unwrap();
+        let files = parakeet.download_files();
+        assert_eq!(files.len(), 4);
+        for (url, rel) in &files {
+            assert!(url.starts_with("https://huggingface.co/istupakov/"));
+            assert!(rel.starts_with("parakeet-tdt-0.6b-v3-int8"));
+        }
+    }
+
+    #[test]
+    fn test_selected_hotkey_falls_back_to_default_when_unknown() {
+        let mut settings = AppSettings::default();
+        assert_eq!(settings.selected_hotkey().id, "fn_shift");
+
+        settings.speech_to_text.hotkey = "fn_option".to_string();
+        assert_eq!(settings.selected_hotkey().id, "fn_option");
+
+        settings.speech_to_text.hotkey = "bogus".to_string();
+        assert_eq!(settings.selected_hotkey().id, "fn_shift");
     }
 }

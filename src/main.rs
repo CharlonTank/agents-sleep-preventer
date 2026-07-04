@@ -2,6 +2,7 @@ mod authorization;
 mod dictation;
 mod logging;
 mod native_dialogs;
+mod notifications;
 mod objc_utils;
 mod popover;
 mod settings;
@@ -55,6 +56,7 @@ const PIDS_DIR: &str = "/tmp/agents_working_pids";
 const LEGACY_PIDS_DIR: &str = "/tmp/claude_working_pids";
 const IDLE_TIMEOUT_SECS: u64 = 30;
 const IDLE_CPU_THRESHOLD: f32 = 0.5;
+const APP_BUNDLE_PATH: &str = "/Applications/AgentsSleepPreventer.app";
 const APP_BINARY_PATH: &str = "/Applications/AgentsSleepPreventer.app/Contents/MacOS/asp";
 const OWNED_HOOK_MARKERS: [&str; 4] = [
     "AgentsSleepPreventer.app/Contents/MacOS/asp",
@@ -99,6 +101,9 @@ enum Commands {
         #[arg(short, long, default_value = "1")]
         interval: u64,
     },
+    /// Agent needs attention (hook): reads the hook JSON on stdin
+    #[command(hide = true)]
+    Attention,
     /// Run background agent (dictation + permissions, no UI)
     Agent,
     /// Run native menu bar app
@@ -142,6 +147,7 @@ fn main() -> Result<()> {
         Commands::Focus { pid } => cmd_focus(pid)?,
         Commands::Cleanup => cmd_cleanup()?,
         Commands::Daemon { interval } => cmd_daemon(interval)?,
+        Commands::Attention => cmd_attention()?,
         Commands::Agent => cmd_agent()?,
         Commands::Menubar => cmd_menubar()?,
         Commands::Reset => cmd_reset()?,
@@ -520,9 +526,82 @@ fn cmd_stop(pid: Option<u32>) -> Result<()> {
         .unwrap_or_else(std::process::id);
     let pid_file = get_pid_file(agent_pid);
 
+    notify_task_done_if_long(agent_pid, &pid_file);
     let _ = fs::remove_file(&pid_file);
 
     sync_sleep_state("hook-stop", sleep_prevention_enabled_from_settings())
+}
+
+/// Notify when a finished task ran long enough that the user likely
+/// walked away (short tasks mean they are still watching the terminal).
+fn notify_task_done_if_long(agent_pid: u32, pid_file: &Path) {
+    let Ok(created) = fs::metadata(pid_file).and_then(|m| m.created()) else {
+        return;
+    };
+    let Ok(elapsed) = created.elapsed() else {
+        return;
+    };
+    if elapsed.as_secs() < notifications::TASK_DONE_MIN_SECS {
+        return;
+    }
+
+    let agent_name = load_process_table()
+        .iter()
+        .find(|p| p.pid == agent_pid)
+        .and_then(classify_agent_process)
+        .map(agent_kind_name)
+        .unwrap_or("Agent");
+
+    notifications::spool(
+        &format!("{} finished", agent_name),
+        &format!(
+            "Task completed after {}.",
+            notifications::format_duration(elapsed.as_secs())
+        ),
+        Some(agent_pid),
+    );
+}
+
+fn agent_kind_name(kind: AgentKind) -> &'static str {
+    match kind {
+        AgentKind::Claude => "Claude Code",
+        AgentKind::Codex => "Codex",
+        AgentKind::Hermes => "Hermes",
+    }
+}
+
+/// Claude Code "Notification" hook: fired when the agent is waiting for
+/// input or needs a permission. The hook JSON arrives on stdin.
+fn cmd_attention() -> Result<()> {
+    logging::init_quiet();
+
+    let mut input = String::new();
+    use std::io::Read as _;
+    let _ = std::io::stdin().read_to_string(&mut input);
+
+    let message = serde_json::from_str::<serde_json::Value>(&input)
+        .ok()
+        .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| "Waiting for your input.".to_string());
+
+    let agent_pid = find_agent_ancestor();
+    let agent_name = agent_pid
+        .and_then(|pid| {
+            load_process_table()
+                .iter()
+                .find(|p| p.pid == pid)
+                .and_then(classify_agent_process)
+        })
+        .map(agent_kind_name)
+        .unwrap_or("Agent");
+
+    notifications::spool(
+        &format!("{} needs attention", agent_name),
+        &message,
+        agent_pid,
+    );
+    Ok(())
 }
 
 fn get_all_agent_processes() -> Vec<ProcessInfo> {
@@ -1761,7 +1840,10 @@ fn is_codex_hooks_installed(home: &Path) -> bool {
 }
 
 fn is_claude_hooks_installed(home: &Path) -> bool {
+    // agent-attention.sh checked too so upgrades from pre-notification
+    // versions re-run setup and pick up the Notification hook.
     home.join(".claude/hooks/prevent-sleep.sh").exists()
+        && home.join(".claude/hooks/agent-attention.sh").exists()
 }
 
 fn is_installed() -> bool {
@@ -1802,6 +1884,72 @@ Administrator password required.";
     }
 
     Ok(())
+}
+
+/// macOS Gatekeeper "App Translocation" runs a quarantined .app from a
+/// randomized read-only path whenever it's launched from outside
+/// /Applications (straight off a mounted DMG, ~/Downloads, etc). TCC
+/// permission grants (Accessibility, Microphone) are tied to that path,
+/// so every such launch gets a fresh random path and looks like the OS
+/// silently revoked previously-granted permissions. The fix is to move the
+/// bundle into /Applications (a stable path) and relaunch from there.
+fn ensure_running_from_applications() {
+    let Some(bundle_path) = objc_utils::main_bundle_path() else {
+        return;
+    };
+    if !bundle_path.ends_with(".app") || bundle_path == APP_BUNDLE_PATH {
+        return;
+    }
+
+    logging::log(&format!(
+        "[main] App running from non-standard location: {}",
+        bundle_path
+    ));
+
+    let message = format!(
+        "Agents Sleep Preventer is running from:\n{}\n\nmacOS permissions (Accessibility, Microphone) only stay granted reliably when the app runs from /Applications — otherwise they can silently reset and the dictation shortcut stops working.\n\nMove it to /Applications and relaunch now?",
+        bundle_path
+    );
+
+    if !native_dialogs::show_confirm_dialog(
+        &message,
+        "Move to Applications?",
+        "Move & Relaunch",
+        "Not Now",
+    ) {
+        logging::log("[main] User declined moving app to /Applications");
+        return;
+    }
+
+    if Path::new(APP_BUNDLE_PATH).exists() {
+        let _ = fs::remove_dir_all(APP_BUNDLE_PATH);
+    }
+
+    let copied = Command::new("ditto")
+        .args([bundle_path.as_str(), APP_BUNDLE_PATH])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if !copied {
+        logging::log("[main] Failed to copy app to /Applications");
+        native_dialogs::show_dialog(
+            "Couldn't move the app automatically. Please drag AgentsSleepPreventer.app to your Applications folder yourself, then relaunch it.",
+            "Move Failed",
+        );
+        return;
+    }
+
+    let _ = Command::new("xattr")
+        .args(["-dr", "com.apple.quarantine", APP_BUNDLE_PATH])
+        .status();
+
+    logging::log("[main] Moved app to /Applications, relaunching...");
+    match Command::new("open").args(["-n", APP_BUNDLE_PATH]).status() {
+        Ok(status) if status.success() => std::process::exit(0),
+        Ok(status) => logging::log(&format!("[main] Relaunch failed with status: {}", status)),
+        Err(e) => logging::log(&format!("[main] Relaunch failed: {}", e)),
+    }
 }
 
 fn relaunch_app_after_install() {
@@ -1948,6 +2096,8 @@ fn cmd_menubar() -> Result<()> {
     logging::init();
     logging::log("[main] Starting menubar app");
 
+    ensure_running_from_applications();
+
     if !is_installed() {
         run_first_time_setup()?;
         if !is_installed() {
@@ -1969,6 +2119,8 @@ fn cmd_menubar() -> Result<()> {
 
     let initial_instances = get_instance_items();
     let manual_enabled = MANUAL_SLEEP_PREVENTION.load(Ordering::SeqCst);
+
+    notifications::init_click_handler();
 
     // Initialize dictation manager
     let mut dictation_manager = DictationManager::new();
@@ -2093,6 +2245,7 @@ fn cmd_menubar() -> Result<()> {
                     // offer to download it now, then pick it up.
                     dictation::ensure_selected_model_downloaded();
                     dictation_manager.reload_transcriber();
+                    dictation_manager.reload_hotkey();
                     if !was_available && dictation_manager.is_available() {
                         if let Err(e) = dictation_manager.start() {
                             logging::log(&format!("[dictation] Failed to start: {}", e));
@@ -2155,6 +2308,8 @@ fn cmd_menubar() -> Result<()> {
             let manual_enabled = MANUAL_SLEEP_PREVENTION.load(Ordering::SeqCst);
 
             tray.set_title(Some(&create_tray_title(instances.len(), manual_enabled)));
+
+            notifications::drain_and_post();
         }
 
         // Menu events commented out - we use popover instead
@@ -2203,6 +2358,7 @@ fn cmd_agent() -> Result<()> {
     unsafe {
         let _: objc_utils::Id = msg_send![class!(NSApplication), sharedApplication];
     }
+    ensure_running_from_applications();
 
     run_onboarding_if_needed(true);
 
@@ -2215,6 +2371,7 @@ fn cmd_agent() -> Result<()> {
     ));
 
     start_clamshell_notifications();
+    notifications::init_click_handler();
 
     let mut dictation_manager = DictationManager::new();
     let dictation_available = dictation_manager.is_available();
@@ -2237,10 +2394,11 @@ fn cmd_agent() -> Result<()> {
         std::thread::sleep(Duration::from_millis(50));
         tick_counter += 1;
 
-        // Every 1s: cleanup stale PIDs and sync sleep state
+        // Every 1s: cleanup stale PIDs, sync sleep state, post notifications
         if tick_counter % 20 == 0 {
             cleanup_stale_pids();
             menubar_sync_sleep();
+            notifications::drain_and_post();
         }
 
         // Every 3s: thermal check + lid close
@@ -2359,21 +2517,22 @@ fn cmd_install(auto_yes: bool) -> Result<()> {
         "#!/bin/bash\n[ -x \"{}\" ] && \"{}\" stop 2>/dev/null || true\n",
         APP_BINARY_PATH, APP_BINARY_PATH
     );
+    // Forwards the hook JSON (with the "message" field) from stdin.
+    let attention_script = format!(
+        "#!/bin/bash\n[ -x \"{}\" ] && cat | \"{}\" attention 2>/dev/null || true\n",
+        APP_BINARY_PATH, APP_BINARY_PATH
+    );
 
     fs::write(hooks_dir.join("prevent-sleep.sh"), prevent_script)?;
     fs::write(hooks_dir.join("allow-sleep.sh"), allow_script)?;
+    fs::write(hooks_dir.join("agent-attention.sh"), attention_script)?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(
-            hooks_dir.join("prevent-sleep.sh"),
-            fs::Permissions::from_mode(0o755),
-        )?;
-        fs::set_permissions(
-            hooks_dir.join("allow-sleep.sh"),
-            fs::Permissions::from_mode(0o755),
-        )?;
+        for script in ["prevent-sleep.sh", "allow-sleep.sh", "agent-attention.sh"] {
+            fs::set_permissions(hooks_dir.join(script), fs::Permissions::from_mode(0o755))?;
+        }
 
         fix_user_ownership(&hooks_dir);
     }
@@ -2426,15 +2585,18 @@ fn cmd_install(auto_yes: bool) -> Result<()> {
 
     let prevent_path = hooks_dir.join("prevent-sleep.sh");
     let allow_path = hooks_dir.join("allow-sleep.sh");
+    let attention_path = hooks_dir.join("agent-attention.sh");
     let hooks_json = format!(
         r#"{{
     "UserPromptSubmit": [{{ "hooks": [{{ "type": "command", "command": "{prevent}" }}] }}],
     "PreToolUse": [{{ "hooks": [{{ "type": "command", "command": "{prevent}" }}] }}],
     "PreCompact": [{{ "hooks": [{{ "type": "command", "command": "{prevent}" }}] }}],
+    "Notification": [{{ "hooks": [{{ "type": "command", "command": "{attention}" }}] }}],
     "Stop": [{{ "hooks": [{{ "type": "command", "command": "{allow}" }}] }}]
 }}"#,
         prevent = prevent_path.display(),
         allow = allow_path.display(),
+        attention = attention_path.display(),
     );
 
     let hooks: serde_json::Value =
@@ -2540,6 +2702,7 @@ fn cmd_uninstall(keep_model: bool, keep_hooks: bool, keep_data: bool) -> Result<
     if !keep_hooks {
         let _ = fs::remove_file(hooks_dir.join("prevent-sleep.sh"));
         let _ = fs::remove_file(hooks_dir.join("allow-sleep.sh"));
+        let _ = fs::remove_file(hooks_dir.join("agent-attention.sh"));
 
         // Remove hooks from settings.json
         if settings_file.exists() {
@@ -2586,9 +2749,10 @@ fn cmd_uninstall(keep_model: bool, keep_hooks: bool, keep_data: bool) -> Result<
             .output()?;
     }
 
-    // Remove PID tracking directory
+    // Remove PID tracking and notification spool directories
     let _ = fs::remove_dir_all(PIDS_DIR);
     let _ = fs::remove_dir_all(LEGACY_PIDS_DIR);
+    let _ = fs::remove_dir_all("/tmp/asp_notifications");
 
     // Reset sleep settings
     Command::new("sudo")

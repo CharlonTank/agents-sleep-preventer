@@ -7,7 +7,7 @@
 
 <br>
 
-[![Download DMG](https://img.shields.io/badge/Download-DMG%20Installer-blue?style=for-the-badge&logo=apple)](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-4.1.0.dmg)
+[![Download DMG](https://img.shields.io/badge/Download-DMG%20Installer-blue?style=for-the-badge&logo=apple)](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-4.2.0.dmg)
 
 <br>
 
@@ -44,9 +44,10 @@ Install this tool. Now your Mac stays awake while your agent works, even with th
 ## Features
 
 - Sleep prevention while supported coding agents are active
-- Local voice dictation with Fn+Shift
+- Agent notifications: get notified when a long task finishes or when an agent is waiting for your input
+- Local voice dictation with a customizable hotkey (Fn+Shift by default)
+- Two dictation engines: Whisper (best accuracy, custom vocabulary) or Parakeet v3 (near-instant transcription)
 - English transcription by default, with language selection in Settings
-- Custom vocabulary words to improve transcription accuracy
 - Sparkle updates from signed releases
 
 ---
@@ -55,7 +56,7 @@ Install this tool. Now your Mac stays awake while your agent works, even with th
 
 ### 🍎 Download DMG (Easiest)
 
-1. [Download the latest DMG](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-4.1.0.dmg)
+1. [Download the latest DMG](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-4.2.0.dmg)
 2. Drag `AgentsSleepPreventer.app` to Applications
 3. Launch the app - it will auto-configure on first run
 4. Restart your coding agents
@@ -99,11 +100,18 @@ Sleep prevention works automatically after setup.
 
 Agents Sleep Preventer includes local speech-to-text dictation:
 
-1. Open the app and allow Input Monitoring, Microphone, and Accessibility permissions.
+1. Open the app and allow Microphone and Accessibility permissions.
 2. Download the local Whisper model when prompted.
-3. Press and hold Fn+Shift to record, then release to transcribe and insert text.
+3. Press and hold Fn+Shift (default) to record, then release to transcribe and insert text.
 
-Dictation starts in English by default. To change it, open `Settings...`, select the `Dictation` tab, and choose a language or `Auto-detect`.
+Dictation starts in English by default. To change the language, the hotkey, or the engine, open `Settings...` and select the `Dictation` tab.
+
+Two engines are available:
+
+| Model | Best for |
+|---|---|
+| **Whisper Turbo** (574 MB / 1.6 GB) | Best accuracy, 99 languages, custom vocabulary support |
+| **Parakeet v3** (670 MB) | Near-instant transcription, English + 24 European languages |
 
 ---
 

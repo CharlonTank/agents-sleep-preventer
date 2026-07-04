@@ -11,9 +11,9 @@
     <key>CFBundleDisplayName</key>
     <string>Agents Sleep Preventer</string>
     <key>CFBundleVersion</key>
-    <string>4.1.0</string>
+    <string>4.2.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>4.1.0</string>
+    <string>4.2.0</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleIconFile</key>
@@ -35,10 +35,8 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>For local voice dictation with Fn+Shift.</string>
-    <key>NSInputMonitoringUsageDescription</key>
-    <string>To detect the Fn+Shift dictation shortcut.</string>
+    <string>For local voice dictation.</string>
     <key>NSAccessibilityUsageDescription</key>
-    <string>To detect shortcuts and insert transcribed text.</string>
+    <string>To detect the dictation shortcut and insert transcribed text.</string>
 </dict>
 </plist>

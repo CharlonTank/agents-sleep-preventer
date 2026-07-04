@@ -1,8 +1,6 @@
 use crate::logging;
-use crate::objc_utils;
 use core_foundation::base::TCFType;
 use core_foundation::runloop::{kCFRunLoopDefaultMode, CFRunLoop};
-use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -25,8 +23,6 @@ mod ffi {
     pub const K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT: CGEventType = 0xFFFFFFFF;
 
     pub type CGEventFlags = u64;
-    pub const K_CG_EVENT_FLAG_MASK_SECONDARY_FN: CGEventFlags = 0x00800000;
-    pub const K_CG_EVENT_FLAG_MASK_SHIFT: CGEventFlags = 0x00020000;
 
     pub type CGEventTapLocation = u32;
     pub const K_CG_SESSION_EVENT_TAP: CGEventTapLocation = 1;
@@ -78,58 +74,11 @@ mod ffi {
             mode: *const c_void,
         );
 
-        pub fn CFRunLoopRemoveSource(
-            rl: *const c_void,
-            source: CFRunLoopSourceRef,
-            mode: *const c_void,
-        );
-
         pub fn CFRunLoopRunInMode(
             mode: *const c_void,
             seconds: f64,
             return_after_source_handled: bool,
         ) -> i32;
-
-        pub fn CFMachPortInvalidate(port: CFMachPortRef);
-
-        pub fn CFRelease(cf: *const c_void);
-    }
-}
-
-// Minimal IOHIDManager FFI to trigger Input Monitoring prompt on some systems.
-mod hid {
-    use std::ffi::c_void;
-
-    pub type IOHIDManagerRef = *mut c_void;
-    pub type IOOptionBits = u32;
-    pub type IOReturn = i32;
-
-    pub const K_IO_RETURN_SUCCESS: IOReturn = 0;
-
-    #[link(name = "IOKit", kind = "framework")]
-    extern "C" {
-        pub fn IOHIDManagerCreate(
-            allocator: *const c_void,
-            options: IOOptionBits,
-        ) -> IOHIDManagerRef;
-
-        pub fn IOHIDManagerSetDeviceMatching(manager: IOHIDManagerRef, matching: *const c_void);
-
-        pub fn IOHIDManagerOpen(manager: IOHIDManagerRef, options: IOOptionBits) -> IOReturn;
-
-        pub fn IOHIDManagerClose(manager: IOHIDManagerRef, options: IOOptionBits) -> IOReturn;
-
-        pub fn IOHIDManagerScheduleWithRunLoop(
-            manager: IOHIDManagerRef,
-            run_loop: *const c_void,
-            run_loop_mode: *const c_void,
-        );
-
-        pub fn IOHIDManagerUnscheduleFromRunLoop(
-            manager: IOHIDManagerRef,
-            run_loop: *const c_void,
-            run_loop_mode: *const c_void,
-        );
     }
 }
 
@@ -206,6 +155,15 @@ static DISABLED_TIMEOUT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static DISABLED_USER_INPUT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static LAST_FLAGS_RAW: AtomicU64 = AtomicU64::new(0);
 static LAST_KEYCODE: AtomicU64 = AtomicU64::new(u64::MAX);
+// Default: Fn + Shift. Overridden by `set_required_mask` from the user's settings.
+static REQUIRED_MASK: AtomicU64 = AtomicU64::new(0x00800000 | 0x00020000);
+
+/// Set which combination of modifier keys (as a CGEventFlags bitmask) must be
+/// held together to start/stop dictation. Takes effect on the next key event,
+/// no listener restart needed.
+pub fn set_required_mask(mask: u64) {
+    REQUIRED_MASK.store(mask, Ordering::Relaxed);
+}
 
 fn callback_state() -> &'static Mutex<Option<CallbackState>> {
     CALLBACK_STATE.get_or_init(|| Mutex::new(None))
@@ -240,252 +198,7 @@ pub fn take_diagnostics() -> GlobeKeyDiagnostics {
     }
 }
 
-pub fn check_input_monitoring_permission() -> bool {
-    if let Some(granted) = cg_preflight_listen_event_access() {
-        return granted;
-    }
-
-    match iohid_check_access(k_iohid_request_type_listen_event()) {
-        Some(access) => access == k_iohid_access_type_granted(),
-        None => true,
-    }
-}
-
-pub fn request_input_monitoring_permission() -> bool {
-    if check_input_monitoring_permission() {
-        return true;
-    }
-
-    let bundle_id = objc_utils::main_bundle_identifier().unwrap_or_else(|| "unknown".to_string());
-    let bundle_path = objc_utils::main_bundle_path().unwrap_or_else(|| "unknown".to_string());
-    logging::log(&format!(
-        "[input_monitoring] bundle id={}, path={}",
-        bundle_id, bundle_path
-    ));
-
-    logging::log("[input_monitoring] requesting listen access");
-
-    if let Some(granted) = cg_request_listen_event_access() {
-        logging::log(&format!(
-            "[input_monitoring] CGRequestListenEventAccess -> {}",
-            granted
-        ));
-        if granted {
-            return true;
-        }
-    } else {
-        logging::log("[input_monitoring] CGRequestListenEventAccess unavailable");
-    }
-
-    if let Some(granted) = iohid_request_access(k_iohid_request_type_listen_event()) {
-        logging::log(&format!(
-            "[input_monitoring] IOHIDRequestAccess -> {}",
-            granted
-        ));
-        if granted {
-            return true;
-        }
-    } else {
-        logging::log("[input_monitoring] IOHIDRequestAccess unavailable");
-    }
-
-    std::thread::spawn(|| {
-        let probe_ok = probe_input_monitoring_event_tap();
-        logging::log(&format!(
-            "[input_monitoring] probe event tap -> {}",
-            probe_ok
-        ));
-
-        let hid_ok = probe_input_monitoring_iohid_manager();
-        logging::log(&format!(
-            "[input_monitoring] probe IOHIDManager -> {}",
-            hid_ok
-        ));
-
-        let granted = check_input_monitoring_permission();
-        logging::log(&format!(
-            "[input_monitoring] granted after probe -> {}",
-            granted
-        ));
-    });
-
-    false
-}
-
-fn probe_input_monitoring_event_tap() -> bool {
-    let event_mask: ffi::CGEventMask = (1u64 << ffi::K_CG_EVENT_KEY_DOWN)
-        | (1u64 << ffi::K_CG_EVENT_KEY_UP)
-        | (1u64 << ffi::K_CG_EVENT_FLAGS_CHANGED);
-    let tap = unsafe {
-        ffi::CGEventTapCreate(
-            ffi::K_CG_SESSION_EVENT_TAP,
-            ffi::K_CG_HEAD_INSERT_EVENT_TAP,
-            ffi::K_CG_EVENT_TAP_OPTION_LISTEN_ONLY,
-            event_mask,
-            event_tap_probe_callback,
-            std::ptr::null_mut(),
-        )
-    };
-
-    if tap.is_null() {
-        return false;
-    }
-
-    let source = unsafe { ffi::CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0) };
-    if source.is_null() {
-        unsafe {
-            ffi::CFMachPortInvalidate(tap);
-            ffi::CFRelease(tap as *const std::ffi::c_void);
-        }
-        return false;
-    }
-
-    let run_loop = CFRunLoop::get_current();
-    unsafe {
-        ffi::CFRunLoopAddSource(
-            run_loop.as_concrete_TypeRef() as *const _,
-            source,
-            kCFRunLoopDefaultMode as *const _,
-        );
-        ffi::CGEventTapEnable(tap, true);
-    }
-
-    let mut granted = check_input_monitoring_permission();
-    for _ in 0..100 {
-        unsafe {
-            ffi::CFRunLoopRunInMode(kCFRunLoopDefaultMode as *const _, 0.1, true);
-        }
-        granted = check_input_monitoring_permission();
-        if granted {
-            break;
-        }
-    }
-
-    unsafe {
-        ffi::CGEventTapEnable(tap, false);
-        ffi::CFRunLoopRemoveSource(
-            run_loop.as_concrete_TypeRef() as *const _,
-            source,
-            kCFRunLoopDefaultMode as *const _,
-        );
-        ffi::CFRelease(source as *const std::ffi::c_void);
-        ffi::CFMachPortInvalidate(tap);
-        ffi::CFRelease(tap as *const std::ffi::c_void);
-    }
-
-    granted
-}
-
-fn probe_input_monitoring_iohid_manager() -> bool {
-    let manager = unsafe { hid::IOHIDManagerCreate(std::ptr::null(), 0) };
-    if manager.is_null() {
-        return false;
-    }
-
-    unsafe {
-        hid::IOHIDManagerSetDeviceMatching(manager, std::ptr::null());
-    }
-
-    let run_loop = CFRunLoop::get_current();
-    unsafe {
-        hid::IOHIDManagerScheduleWithRunLoop(
-            manager,
-            run_loop.as_concrete_TypeRef() as *const _,
-            kCFRunLoopDefaultMode as *const _,
-        );
-    }
-
-    let open_result = unsafe { hid::IOHIDManagerOpen(manager, 0) };
-    if open_result == hid::K_IO_RETURN_SUCCESS {
-        for _ in 0..30 {
-            unsafe {
-                ffi::CFRunLoopRunInMode(kCFRunLoopDefaultMode as *const _, 0.1, true);
-            }
-            if check_input_monitoring_permission() {
-                break;
-            }
-        }
-    }
-
-    unsafe {
-        hid::IOHIDManagerUnscheduleFromRunLoop(
-            manager,
-            run_loop.as_concrete_TypeRef() as *const _,
-            kCFRunLoopDefaultMode as *const _,
-        );
-    }
-
-    let close_result = unsafe { hid::IOHIDManagerClose(manager, 0) };
-    unsafe {
-        ffi::CFRelease(manager as *const std::ffi::c_void);
-    }
-
-    logging::log(&format!(
-        "[input_monitoring] IOHIDManagerOpen -> {}",
-        open_result
-    ));
-    logging::log(&format!(
-        "[input_monitoring] IOHIDManagerClose -> {}",
-        close_result
-    ));
-
-    open_result == hid::K_IO_RETURN_SUCCESS
-}
-
-type CGPreflightListenEventAccessFn = unsafe extern "C" fn() -> bool;
-type CGRequestListenEventAccessFn = unsafe extern "C" fn() -> bool;
-
-type IOHIDRequestType = i32;
-type IOHIDAccessType = i32;
-
-type IOHIDCheckAccessFn = unsafe extern "C" fn(IOHIDRequestType) -> IOHIDAccessType;
-type IOHIDRequestAccessFn = unsafe extern "C" fn(IOHIDRequestType) -> bool;
-
-fn cg_preflight_listen_event_access() -> Option<bool> {
-    let symbol = resolve_symbol("CGPreflightListenEventAccess")?;
-    let func: CGPreflightListenEventAccessFn = unsafe { std::mem::transmute(symbol) };
-    Some(unsafe { func() })
-}
-
-fn cg_request_listen_event_access() -> Option<bool> {
-    let symbol = resolve_symbol("CGRequestListenEventAccess")?;
-    let func: CGRequestListenEventAccessFn = unsafe { std::mem::transmute(symbol) };
-    Some(unsafe { func() })
-}
-
-fn k_iohid_request_type_listen_event() -> IOHIDRequestType {
-    1
-}
-
-fn k_iohid_access_type_granted() -> IOHIDAccessType {
-    0
-}
-
-fn iohid_check_access(request_type: IOHIDRequestType) -> Option<IOHIDAccessType> {
-    let symbol = resolve_symbol("IOHIDCheckAccess")?;
-    let func: IOHIDCheckAccessFn = unsafe { std::mem::transmute(symbol) };
-    Some(unsafe { func(request_type) })
-}
-
-fn iohid_request_access(request_type: IOHIDRequestType) -> Option<bool> {
-    let symbol = resolve_symbol("IOHIDRequestAccess")?;
-    let func: IOHIDRequestAccessFn = unsafe { std::mem::transmute(symbol) };
-    Some(unsafe { func(request_type) })
-}
-
-fn resolve_symbol(name: &str) -> Option<*mut std::ffi::c_void> {
-    let c_name = CString::new(name).ok()?;
-    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr() as *const libc::c_char) };
-    if symbol.is_null() {
-        None
-    } else {
-        Some(symbol)
-    }
-}
-
 struct CallbackState {
-    fn_down: bool,
-    shift_down: bool,
     is_dictating: bool,
     tx: Sender<GlobeKeyEvent>,
 }
@@ -527,13 +240,8 @@ extern "C" fn event_tap_callback(
             LAST_FLAGS_RAW.store(flags, Ordering::Relaxed);
             LAST_KEYCODE.store(keycode as u64, Ordering::Relaxed);
 
-            let fn_down = (flags & ffi::K_CG_EVENT_FLAG_MASK_SECONDARY_FN) != 0;
-            let shift_down = (flags & ffi::K_CG_EVENT_FLAG_MASK_SHIFT) != 0;
-
-            state.fn_down = fn_down;
-            state.shift_down = shift_down;
-
-            let should_dictate = fn_down && shift_down;
+            let required_mask = REQUIRED_MASK.load(Ordering::Relaxed);
+            let should_dictate = required_mask != 0 && (flags & required_mask) == required_mask;
             let was_dictating = state.is_dictating;
 
             if should_dictate && !was_dictating {
@@ -549,15 +257,6 @@ extern "C" fn event_tap_callback(
     event
 }
 
-extern "C" fn event_tap_probe_callback(
-    _proxy: ffi::CGEventTapProxy,
-    _event_type: ffi::CGEventType,
-    event: ffi::CGEventRef,
-    _user_info: *mut std::ffi::c_void,
-) -> ffi::CGEventRef {
-    event
-}
-
 fn run_event_tap(tx: Sender<GlobeKeyEvent>, stop_flag: Arc<AtomicBool>) {
     logging::log("[globe_key] Starting native CGEventTap...");
 
@@ -565,8 +264,6 @@ fn run_event_tap(tx: Sender<GlobeKeyEvent>, stop_flag: Arc<AtomicBool>) {
     {
         let mut state_guard = callback_state().lock().unwrap();
         *state_guard = Some(CallbackState {
-            fn_down: false,
-            shift_down: false,
             is_dictating: false,
             tx: tx.clone(),
         });
@@ -591,7 +288,7 @@ fn run_event_tap(tx: Sender<GlobeKeyEvent>, stop_flag: Arc<AtomicBool>) {
 
     if tap.is_null() {
         logging::log(
-            "[globe_key] ERROR: Failed to create CGEventTap - Input Monitoring permission required",
+            "[globe_key] ERROR: Failed to create CGEventTap - Accessibility permission required",
         );
         return;
     }
@@ -624,7 +321,7 @@ fn run_event_tap(tx: Sender<GlobeKeyEvent>, stop_flag: Arc<AtomicBool>) {
 
     // Signal ready
     let _ = tx.send(GlobeKeyEvent::Ready);
-    logging::log("[globe_key] Native CGEventTap ready, listening for Fn+Shift...");
+    logging::log("[globe_key] Native CGEventTap ready, listening for configured dictation hotkey...");
 
     // Run the event loop
     while !stop_flag.load(Ordering::SeqCst) {

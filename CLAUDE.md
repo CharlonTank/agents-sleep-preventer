@@ -73,11 +73,30 @@ To publish a new version:
 
 **IMPORTANT**: Sparkle appcast signing prefers the keychain account `"CharlonTank-agents-sleep-preventer"` and falls back to the legacy `"CharlonTank-claude-sleep-preventer"` account while migrating existing developer machines.
 
+## Dictation Engines
+
+Two engines behind the model picker in Settings (`src/settings/mod.rs` `ModelEngine`):
+
+- **Whisper** (whisper.cpp): shells out to the bundled `whisper-cli` with a GGML `.bin` model. Supports language selection and vocabulary prompt.
+- **Parakeet v3** (transcribe-rs crate, feature `onnx`, ONNX Runtime statically linked): in-process transcription, ~10x faster than Whisper, auto language (25 European languages), no vocabulary support. Model = 4 files downloaded from HF `istupakov/parakeet-tdt-0.6b-v3-onnx` into `models/parakeet-tdt-0.6b-v3-int8/`.
+
+Integration test: `cargo test --test parakeet_integration` (skips if the model isn't downloaded). Requires rustc >= 1.88.
+
+## Agent Notifications
+
+Hooks spool JSON to `/tmp/asp_notifications/`; the running app (menubar or agent loop) drains it every ~1-2s and posts via `NSUserNotificationCenter` (`src/notifications.rs`).
+
+- Task finished: `cmd_stop` notifies if the PID file is older than `TASK_DONE_MIN_SECS` (45s) — shorter tasks mean the user is still watching.
+- Needs attention: Claude Code `Notification` hook → `~/.claude/hooks/agent-attention.sh` → `asp attention` (reads hook JSON on stdin, extracts `.message`).
+- Toggle in Settings tab 1 (`notifications.enabled`, default true).
+
 ## macOS Permissions Notes
 
+The app requests only TWO permissions: Microphone and Accessibility.
+
 - **Microphone**: App must call `AVCaptureDevice.requestAccessForMediaType:` to appear in System Preferences list. The system dialog triggers automatically.
-- **Accessibility**: Check with `AXIsProcessTrusted()`. Open preferences with `x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility`
-- **Input Monitoring**: Probe with a listen-only CGEventTap; open preferences with `x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent`
+- **Accessibility**: Check with `AXIsProcessTrusted()`. Request with `AXIsProcessTrustedWithOptions` + `kAXTrustedCheckOptionPrompt` — this shows the system dialog AND auto-adds the app to the Accessibility list (user just flips the switch, no manual "+"). The prompt shows only once per app; later calls are no-ops, so also open `x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility` as fallback.
+- **Input Monitoring is NOT requested**: in TCC, Accessibility is a superset that covers listen-only CGEventTaps (same model as espanso/Hammerspoon). Since text injection via CGEventPost needs Accessibility anyway, Input Monitoring would be redundant. Do not re-add it.
 
 ## AppleScript Gotchas
 

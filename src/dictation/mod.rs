@@ -6,14 +6,19 @@ mod text_injection;
 mod transcription;
 
 use crate::logging;
+use crate::native_dialogs;
+use crate::settings::AppSettings;
 use audio::{
     check_microphone_permission, request_microphone_permission_sync, AudioRecorder,
     MicrophonePermission,
 };
 use globe_key::{GlobeKeyEvent, GlobeKeyManager};
 pub use onboarding::{ensure_selected_model_downloaded, run_onboarding_if_needed};
+use crate::settings::ModelEngine;
 use overlay::{OverlayMode, RecordingOverlay};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use transcription::WhisperTranscriber;
@@ -30,6 +35,13 @@ pub enum DictationResult {
     Error(String),
 }
 
+/// Live Parakeet transcription running while the hotkey is held.
+struct StreamingSession {
+    stop: Arc<AtomicBool>,
+    partial_rx: Receiver<String>,
+    result_rx: Receiver<DictationResult>,
+}
+
 pub struct DictationManager {
     state: DictationState,
     globe_key: GlobeKeyManager,
@@ -37,10 +49,14 @@ pub struct DictationManager {
     transcriber: WhisperTranscriber,
     overlay: RecordingOverlay,
     result_rx: Option<Receiver<DictationResult>>,
+    streaming: Option<StreamingSession>,
     enabled: bool,
     last_diag_log: Instant,
     last_flags_seen: Instant,
     last_no_flags_log: Instant,
+    accessibility_granted: bool,
+    accessibility_alert_shown: bool,
+    last_permission_check: Instant,
 }
 
 impl DictationManager {
@@ -52,10 +68,14 @@ impl DictationManager {
             transcriber: WhisperTranscriber::new(),
             overlay: RecordingOverlay::new(),
             result_rx: None,
+            streaming: None,
             enabled: true,
             last_diag_log: Instant::now(),
             last_flags_seen: Instant::now(),
             last_no_flags_log: Instant::now(),
+            accessibility_granted: false,
+            accessibility_alert_shown: false,
+            last_permission_check: Instant::now(),
         }
     }
 
@@ -67,12 +87,18 @@ impl DictationManager {
             );
         }
 
-        if !globe_key::check_input_monitoring_permission() {
+        // Accessibility covers both the CGEventTap listener (TCC treats it as
+        // a superset of Input Monitoring) and CGEventPost text injection, so
+        // it is the only key-related permission the app needs.
+        self.accessibility_granted = text_injection::check_accessibility_permission();
+        if !self.accessibility_granted {
             logging::log(
-                "[dictation] Input Monitoring not granted; skipping globe key listener start",
+                "[dictation] Accessibility not granted; skipping globe key listener start",
             );
             return Ok(());
         }
+
+        self.reload_hotkey();
 
         // Check/request microphone permission
         let mut mic_permission = check_microphone_permission();
@@ -97,6 +123,9 @@ impl DictationManager {
     }
 
     pub fn stop(&mut self) {
+        if let Some(session) = self.streaming.take() {
+            session.stop.store(true, AtomicOrdering::Relaxed);
+        }
         self.globe_key.stop();
         self.overlay.hide();
         self.state = DictationState::Idle;
@@ -114,6 +143,13 @@ impl DictationManager {
     /// the model in Settings or downloaded one).
     pub fn reload_transcriber(&mut self) {
         self.transcriber = WhisperTranscriber::new();
+    }
+
+    /// Re-read the configured dictation hotkey from settings (e.g. after the
+    /// user changed it in Settings). Takes effect immediately, no restart needed.
+    pub fn reload_hotkey(&mut self) {
+        let mask = AppSettings::load().selected_hotkey().mask;
+        globe_key::set_required_mask(mask);
     }
 
     pub fn update(&mut self) {
@@ -172,8 +208,23 @@ impl DictationManager {
             {
                 self.last_no_flags_log = Instant::now();
                 logging::log(
-                    "[globe_key] No modifier events seen for 15s. Check Input Monitoring permission.",
+                    "[globe_key] No modifier events seen for 15s. Check Accessibility permission.",
                 );
+            }
+        }
+
+        self.recheck_accessibility_permission();
+
+        // Live preview: show the latest partial transcription while recording
+        if self.state == DictationState::Recording {
+            if let Some(session) = &self.streaming {
+                let mut latest = None;
+                while let Ok(text) = session.partial_rx.try_recv() {
+                    latest = Some(text);
+                }
+                if let Some(text) = latest {
+                    self.overlay.set_preview_text(&text);
+                }
             }
         }
 
@@ -210,6 +261,49 @@ impl DictationManager {
         }
     }
 
+    /// Detect Accessibility permission being revoked or granted while the
+    /// app is running (e.g. a macOS update silently resets TCC grants, or the
+    /// user fixes it from the alert below) and react without requiring a
+    /// relaunch: warn once on revoke, auto-(re)start the listener on grant.
+    fn recheck_accessibility_permission(&mut self) {
+        if self.last_permission_check.elapsed() < Duration::from_secs(10) {
+            return;
+        }
+        self.last_permission_check = Instant::now();
+
+        let granted = text_injection::check_accessibility_permission();
+        if granted == self.accessibility_granted {
+            return;
+        }
+        self.accessibility_granted = granted;
+
+        if granted {
+            logging::log("[dictation] Accessibility permission granted, starting listener");
+            self.accessibility_alert_shown = false;
+            if let Err(e) = self.start() {
+                logging::log(&format!(
+                    "[dictation] Failed to start after permission grant: {}",
+                    e
+                ));
+            }
+            return;
+        }
+
+        logging::log("[dictation] Accessibility permission was revoked; dictation shortcut disabled");
+        self.globe_key.stop();
+        if !self.accessibility_alert_shown {
+            self.accessibility_alert_shown = true;
+            if native_dialogs::show_confirm_dialog(
+                "macOS revoked Accessibility access for Agents Sleep Preventer, so the dictation shortcut no longer works.\n\nRe-enable it in System Settings > Privacy & Security > Accessibility.",
+                "Dictation Shortcut Disabled",
+                "Open Settings",
+                "Later",
+            ) {
+                onboarding::open_accessibility_settings();
+            }
+        }
+    }
+
     fn start_recording(&mut self) {
         // Initialize recorder
         match AudioRecorder::new() {
@@ -226,6 +320,30 @@ impl DictationManager {
             }
         }
 
+        // Parakeet streams live: load the model now (while the user speaks)
+        // and re-transcribe the buffer periodically for the preview.
+        if let Some((ModelEngine::Parakeet, model_dir)) = self.transcriber.model_info() {
+            let recorder = self.recorder.as_ref().unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let (partial_tx, partial_rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            transcription::spawn_parakeet_stream(
+                model_dir,
+                recorder.live_buffer(),
+                recorder.channels(),
+                recorder.sample_rate(),
+                stop.clone(),
+                partial_tx,
+                result_tx,
+            );
+            self.streaming = Some(StreamingSession {
+                stop,
+                partial_rx,
+                result_rx,
+            });
+            logging::log("[dictation] Streaming session started (Parakeet)");
+        }
+
         // Show overlay
         self.overlay.show();
         self.state = DictationState::Recording;
@@ -235,6 +353,20 @@ impl DictationManager {
     fn stop_and_transcribe(&mut self) {
         // Switch overlay to transcribing mode (orange)
         self.overlay.set_mode(OverlayMode::Transcribing);
+
+        // Streaming path: the model is already loaded in the streaming
+        // thread; it produces the final transcription on the result channel.
+        if let Some(session) = self.streaming.take() {
+            if let Some(recorder) = self.recorder.as_mut() {
+                recorder.stop_stream();
+            }
+            self.recorder = None;
+            session.stop.store(true, AtomicOrdering::Relaxed);
+            self.result_rx = Some(session.result_rx);
+            self.state = DictationState::Transcribing;
+            logging::log("[dictation] Recording stopped, finalizing stream...");
+            return;
+        }
 
         // Get samples from recorder
         let samples = match self.recorder.as_mut() {

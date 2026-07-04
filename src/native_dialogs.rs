@@ -250,7 +250,6 @@ pub enum SetupAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionToggle {
-    InputMonitoring,
     Microphone,
     Accessibility,
 }
@@ -359,9 +358,8 @@ extern "C" fn permissions_toggle_pressed(this: &Object, _: Sel, sender: Id) {
             let state = &*(state_ptr as *const PermissionsState);
             let tag: i64 = msg_send![sender, tag];
             let toggle = match tag {
-                1 => PermissionToggle::InputMonitoring,
-                2 => PermissionToggle::Microphone,
-                3 => PermissionToggle::Accessibility,
+                1 => PermissionToggle::Microphone,
+                2 => PermissionToggle::Accessibility,
                 _ => return,
             };
             state.set_action(PermissionsAction::Toggle(toggle));
@@ -766,10 +764,8 @@ impl SetupWindow {
 pub struct PermissionsWindowHandle {
     window: SendPtr,
     progress: SendPtr,
-    input_row: SendPtr,
     mic_row: SendPtr,
     accessibility_row: SendPtr,
-    input_toggle: SendPtr,
     mic_toggle: SendPtr,
     accessibility_toggle: SendPtr,
     primary_button: SendPtr,
@@ -817,7 +813,6 @@ impl PermissionsWindowHandle {
     pub fn set_toggle(&self, toggle: PermissionToggle, label: &str, checked: bool) {
         let label = label.to_string();
         let (button, row) = match toggle {
-            PermissionToggle::InputMonitoring => (self.input_toggle, self.input_row),
             PermissionToggle::Microphone => (self.mic_toggle, self.mic_row),
             PermissionToggle::Accessibility => (self.accessibility_toggle, self.accessibility_row),
         };
@@ -859,7 +854,7 @@ impl PermissionsWindow {
             let _: () = msg_send![app, activateIgnoringOtherApps: true];
 
             let width: CGFloat = 560.0;
-            let height: CGFloat = 560.0;
+            let height: CGFloat = 476.0;
             let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height));
             let window: Id = msg_send![borderless_window_class(), alloc];
             let window: Id = msg_send![
@@ -929,30 +924,12 @@ impl PermissionsWindow {
             let row_width = width - 48.0;
             let row_height: CGFloat = 72.0;
             let row_spacing: CGFloat = 12.0;
-            let row3_y: CGFloat = 150.0;
-            let row2_y = row3_y + row_height + row_spacing;
+            let row2_y: CGFloat = 150.0;
             let row1_y = row2_y + row_height + row_spacing;
-
-            let (input_row, input_toggle) = build_permission_row(
-                content_view,
-                NSPoint::new(24.0, row1_y),
-                NSSize::new(row_width, row_height),
-                "Allow Input Monitoring",
-                "Required to detect the Fn+Shift shortcut.",
-                row_title_font,
-                row_desc_font,
-                title_color,
-                desc_color,
-                row_color,
-                "Allow",
-                button_font,
-                target,
-                1,
-            );
 
             let (mic_row, mic_toggle) = build_permission_row(
                 content_view,
-                NSPoint::new(24.0, row2_y),
+                NSPoint::new(24.0, row1_y),
                 NSSize::new(row_width, row_height),
                 "Allow Microphone Access",
                 "Required to capture audio during dictation.",
@@ -964,15 +941,15 @@ impl PermissionsWindow {
                 "Allow",
                 button_font,
                 target,
-                2,
+                1,
             );
 
             let (accessibility_row, accessibility_toggle) = build_permission_row(
                 content_view,
-                NSPoint::new(24.0, row3_y),
+                NSPoint::new(24.0, row2_y),
                 NSSize::new(row_width, row_height),
                 "Allow Accessibility",
-                "Required to insert transcribed text into your apps.",
+                "Required to detect the dictation shortcut and insert transcribed text.",
                 row_title_font,
                 row_desc_font,
                 title_color,
@@ -981,7 +958,7 @@ impl PermissionsWindow {
                 "Allow",
                 button_font,
                 target,
-                3,
+                2,
             );
 
             let secondary_frame =
@@ -1023,10 +1000,8 @@ impl PermissionsWindow {
                 PermissionsWindowHandle {
                     window: SendPtr(window as *mut c_void),
                     progress: SendPtr(progress as *mut c_void),
-                    input_row: SendPtr(input_row as *mut c_void),
                     mic_row: SendPtr(mic_row as *mut c_void),
                     accessibility_row: SendPtr(accessibility_row as *mut c_void),
-                    input_toggle: SendPtr(input_toggle as *mut c_void),
                     mic_toggle: SendPtr(mic_toggle as *mut c_void),
                     accessibility_toggle: SendPtr(accessibility_toggle as *mut c_void),
                     primary_button: SendPtr(primary as *mut c_void),

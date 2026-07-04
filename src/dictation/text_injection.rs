@@ -1,4 +1,7 @@
-use core_foundation::base::{CFIndex, CFRelease};
+use core_foundation::base::{CFIndex, CFRelease, TCFType};
+use core_foundation::boolean::CFBoolean;
+use core_foundation::dictionary::CFDictionary;
+use core_foundation::string::{CFString, CFStringRef};
 use std::ffi::c_void;
 use std::ptr;
 
@@ -7,6 +10,8 @@ use crate::logging;
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXIsProcessTrusted() -> bool;
+    fn AXIsProcessTrustedWithOptions(options: *const c_void) -> bool;
+    static kAXTrustedCheckOptionPrompt: CFStringRef;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -84,4 +89,19 @@ fn inject_via_keystrokes(text: &str) -> Result<(), String> {
 /// Check if accessibility is enabled for this app
 pub fn check_accessibility_permission() -> bool {
     unsafe { AXIsProcessTrusted() }
+}
+
+/// Show the system Accessibility prompt. Crucially, this also adds the app to
+/// the Accessibility list in System Settings (switch off), so the user only
+/// has to flip a switch instead of clicking "+" and hunting for the app.
+/// macOS shows the dialog only once per app; later calls are no-ops.
+pub fn request_accessibility_permission() -> bool {
+    unsafe {
+        let key = CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt);
+        let options = CFDictionary::from_CFType_pairs(&[(
+            key.as_CFType(),
+            CFBoolean::true_value().as_CFType(),
+        )]);
+        AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef() as *const c_void)
+    }
 }

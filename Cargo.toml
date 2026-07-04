@@ -3,7 +3,7 @@ members = [".", "xtask"]
 
 [package]
 name = "agents-sleep-preventer"
-version = "4.1.0"
+version = "4.2.0"
 edition = "2021"
 description = "Keep your Mac awake while coding agents are working"
 license = "MIT"
@@ -31,6 +31,7 @@ libc = "0.2"
 # Dictation feature
 cpal = "0.15"       # Audio recording
 hound = "3.5"       # WAV file writing
+transcribe-rs = { version = "0.3.11", default-features = false, features = ["onnx"] } # Parakeet v3 (ONNX)
 objc = "0.2"        # Objective-C runtime
 block = "0.1"       # Objective-C blocks for completion handlers
 core-graphics = "0.24"  # CGEventTap for key monitoring

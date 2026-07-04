@@ -486,11 +486,11 @@ fn build_dmg(skip_notarize: bool) -> Result<()> {
     println!("=== Building Agents Sleep Preventer v{} DMG ===\n", version);
 
     // Step 1: Build release
-    println!("[1/10] Building release...");
+    println!("[1/9] Building release...");
     run("cargo", &["build", "--release"])?;
 
     // Step 2: Build Swift menubar app
-    println!("[2/10] Building menubar app (Swift)...");
+    println!("[2/9] Building menubar app (Swift)...");
     let menubar_src = Path::new("swift/menubar.swift");
     if !menubar_src.exists() {
         bail!("swift/menubar.swift not found");
@@ -515,29 +515,13 @@ fn build_dmg(skip_notarize: bool) -> Result<()> {
         ],
     )?;
 
-    // Step 3: Build Swift helper (globe-listener)
-    println!("[3/10] Building globe-listener (Swift)...");
-    let globe_listener_src = Path::new("swift/globe-listener.swift");
-    if !globe_listener_src.exists() {
-        bail!("swift/globe-listener.swift not found");
-    }
-    run(
-        "swiftc",
-        &[
-            "swift/globe-listener.swift",
-            "-O",
-            "-o",
-            "target/release/globe-listener",
-        ],
-    )?;
-
-    // Step 4: Ensure whisper-cli
-    println!("[4/10] Ensuring whisper-cli...");
+    // Step 3: Ensure whisper-cli
+    println!("[3/9] Ensuring whisper-cli...");
     ensure_whisper_cli()?;
     let whisper_cli_path = Path::new("/tmp/whisper.cpp/build/bin/whisper-cli");
 
-    // Step 5: Create app bundle
-    println!("[5/10] Creating app bundle...");
+    // Step 4: Create app bundle
+    println!("[4/9] Creating app bundle...");
     let bundle_dir = Path::new("target/release/bundle");
     let app_dir = bundle_dir.join("AgentsSleepPreventer.app");
     let contents_dir = app_dir.join("Contents");
@@ -568,16 +552,11 @@ fn build_dmg(skip_notarize: bool) -> Result<()> {
     )?;
 
     // Copy bundled binaries to Resources
-    fs::copy(
-        "target/release/globe-listener",
-        resources_dir.join("globe-listener"),
-    )?;
     fs::copy(whisper_cli_path, resources_dir.join("whisper-cli"))?;
 
-    // Step 6: Sign bundled binaries and Sparkle before the app bundle itself
-    println!("[6/10] Signing bundled binaries...");
+    // Step 5: Sign bundled binaries and Sparkle before the app bundle itself
+    println!("[5/9] Signing bundled binaries...");
     codesign_runtime(&macos_dir.join("asp"))?;
-    codesign_runtime(&resources_dir.join("globe-listener"))?;
     codesign_runtime(&resources_dir.join("whisper-cli"))?;
     let sparkle_bundle = frameworks_dir.join("Sparkle.framework");
     codesign_runtime(&sparkle_bundle.join("Versions/B/Autoupdate"))?;
@@ -587,11 +566,11 @@ fn build_dmg(skip_notarize: bool) -> Result<()> {
     codesign_runtime(&sparkle_bundle)?;
 
     // Step 7: Sign the app with entitlements
-    println!("[7/10] Signing app with entitlements...");
+    println!("[6/9] Signing app with entitlements...");
     codesign_runtime_with_entitlements(&app_dir, Path::new("Entitlements.plist"))?;
 
     // Step 8: Create DMG staging folder with Applications symlink
-    println!("[8/10] Creating DMG staging folder...");
+    println!("[7/9] Creating DMG staging folder...");
     let staging_dir = Path::new("target/release/dmg-staging");
     if staging_dir.exists() {
         fs::remove_dir_all(staging_dir)?;
@@ -606,7 +585,7 @@ fn build_dmg(skip_notarize: bool) -> Result<()> {
     std::os::unix::fs::symlink("/Applications", staging_dir.join("Applications"))?;
 
     // Step 9: Create DMG
-    println!("[9/10] Creating DMG...");
+    println!("[8/9] Creating DMG...");
     if Path::new(&dmg_name).exists() {
         fs::remove_file(&dmg_name)?;
     }
@@ -1009,16 +988,6 @@ fn replace_app(open_app: bool) -> Result<()> {
             "target/release/AgentsSleepPreventer",
         ],
     )?;
-    run(
-        "swiftc",
-        &[
-            "swift/globe-listener.swift",
-            "-O",
-            "-o",
-            "target/release/globe-listener",
-        ],
-    )?;
-
     let bin_path = app_dir.join("Contents/MacOS/asp");
     let menubar_path = app_dir.join("Contents/MacOS/AgentsSleepPreventer");
     let plist_path = app_dir.join("Contents/Info.plist");
@@ -1028,10 +997,6 @@ fn replace_app(open_app: bool) -> Result<()> {
     fs::copy("target/release/AgentsSleepPreventer", &menubar_path)?;
     fs::create_dir_all(&resources_dir)?;
     fs::create_dir_all(&frameworks_dir)?;
-    fs::copy(
-        "target/release/globe-listener",
-        resources_dir.join("globe-listener"),
-    )?;
     copy_with_ditto(
         &sparkle_framework,
         &frameworks_dir.join("Sparkle.framework"),

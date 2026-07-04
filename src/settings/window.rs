@@ -110,6 +110,11 @@ impl SettingsState {
         settings.sleep_prevention.enabled = enabled;
     }
 
+    fn update_notifications_enabled(&self, enabled: bool) {
+        let mut settings = self.settings.lock().unwrap();
+        settings.notifications.enabled = enabled;
+    }
+
     fn update_language(&self, language: String) {
         let mut settings = self.settings.lock().unwrap();
         settings.speech_to_text.language = language;
@@ -118,6 +123,11 @@ impl SettingsState {
     fn update_model(&self, model: String) {
         let mut settings = self.settings.lock().unwrap();
         settings.speech_to_text.model = model;
+    }
+
+    fn update_hotkey(&self, hotkey: String) {
+        let mut settings = self.settings.lock().unwrap();
+        settings.speech_to_text.hotkey = hotkey;
     }
 
     fn update_vocabulary(&self, words: Vec<String>) {
@@ -157,6 +167,17 @@ extern "C" fn toggle_changed(this: &Object, _: Sel, sender: Id) {
     }
 }
 
+extern "C" fn notifications_toggle_changed(this: &Object, _: Sel, sender: Id) {
+    unsafe {
+        let state_ptr: *mut c_void = *this.get_ivar("rustState");
+        if !state_ptr.is_null() {
+            let state = &*(state_ptr as *const SettingsState);
+            let checkbox_state: i64 = msg_send![sender, state];
+            state.update_notifications_enabled(checkbox_state == 1);
+        }
+    }
+}
+
 extern "C" fn language_changed(this: &Object, _: Sel, sender: Id) {
     unsafe {
         let state_ptr: *mut c_void = *this.get_ivar("rustState");
@@ -182,6 +203,21 @@ extern "C" fn model_changed(this: &Object, _: Sel, sender: Id) {
             if (selected_index as usize) < models.len() {
                 let id = models[selected_index as usize].id;
                 state.update_model(id.to_string());
+            }
+        }
+    }
+}
+
+extern "C" fn hotkey_changed(this: &Object, _: Sel, sender: Id) {
+    unsafe {
+        let state_ptr: *mut c_void = *this.get_ivar("rustState");
+        if !state_ptr.is_null() {
+            let state = &*(state_ptr as *const SettingsState);
+            let selected_index: i64 = msg_send![sender, indexOfSelectedItem];
+            let hotkeys = AppSettings::supported_hotkeys();
+            if (selected_index as usize) < hotkeys.len() {
+                let id = hotkeys[selected_index as usize].id;
+                state.update_hotkey(id.to_string());
             }
         }
     }
@@ -226,12 +262,20 @@ fn settings_target_class() -> &'static objc::runtime::Class {
                 toggle_changed as extern "C" fn(&Object, Sel, Id),
             );
             decl.add_method(
+                sel!(notificationsToggleChanged:),
+                notifications_toggle_changed as extern "C" fn(&Object, Sel, Id),
+            );
+            decl.add_method(
                 sel!(languageChanged:),
                 language_changed as extern "C" fn(&Object, Sel, Id),
             );
             decl.add_method(
                 sel!(modelChanged:),
                 model_changed as extern "C" fn(&Object, Sel, Id),
+            );
+            decl.add_method(
+                sel!(hotkeyChanged:),
+                hotkey_changed as extern "C" fn(&Object, Sel, Id),
             );
             decl.add_method(
                 sel!(windowWillClose:),
@@ -270,7 +314,7 @@ impl SettingsWindow {
                 let _: () = msg_send![app, activateIgnoringOtherApps: true];
 
                 let width: CGFloat = 480.0;
-                let height: CGFloat = 400.0;
+                let height: CGFloat = 460.0;
                 let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height));
                 let style_mask = NS_WINDOW_STYLE_MASK_TITLED | NS_WINDOW_STYLE_MASK_CLOSABLE;
 
@@ -335,7 +379,7 @@ impl SettingsWindow {
 
                 // Sleep prevention toggle - centered vertically in the tab
                 let toggle_label_frame =
-                    NSRect::new(NSPoint::new(20.0, 160.0), NSSize::new(300.0, 20.0));
+                    NSRect::new(NSPoint::new(20.0, 190.0), NSSize::new(300.0, 20.0));
                 let toggle_label = create_label(
                     "Enable Sleep Prevention",
                     toggle_label_frame,
@@ -345,7 +389,7 @@ impl SettingsWindow {
                 let _: () = msg_send![tab1_view, addSubview: toggle_label];
 
                 let toggle_desc_frame =
-                    NSRect::new(NSPoint::new(20.0, 115.0), NSSize::new(380.0, 40.0));
+                    NSRect::new(NSPoint::new(20.0, 145.0), NSSize::new(380.0, 40.0));
                 let toggle_desc = create_label(
                     "When enabled, prevents your Mac from sleeping while coding agents are actively working.",
                     toggle_desc_frame,
@@ -355,7 +399,7 @@ impl SettingsWindow {
                 let _: () = msg_send![tab1_view, addSubview: toggle_desc];
 
                 let checkbox_frame =
-                    NSRect::new(NSPoint::new(20.0, 75.0), NSSize::new(200.0, 24.0));
+                    NSRect::new(NSPoint::new(20.0, 105.0), NSSize::new(200.0, 24.0));
                 let checkbox: Id = msg_send![class!(NSButton), alloc];
                 let checkbox: Id = msg_send![checkbox, initWithFrame: checkbox_frame];
                 let _: () = msg_send![checkbox, setButtonType: 3i64]; // NSButtonTypeSwitch
@@ -367,6 +411,35 @@ impl SettingsWindow {
                 let _: () = msg_send![checkbox, setTarget: target];
                 let _: () = msg_send![checkbox, setAction: sel!(toggleChanged:)];
                 let _: () = msg_send![tab1_view, addSubview: checkbox];
+
+                // Agent notifications
+                let notif_label_frame =
+                    NSRect::new(NSPoint::new(20.0, 65.0), NSSize::new(300.0, 20.0));
+                let notif_label = create_label(
+                    "Agent Notifications",
+                    notif_label_frame,
+                    title_font,
+                    title_color,
+                );
+                let _: () = msg_send![tab1_view, addSubview: notif_label];
+
+                let notif_checkbox_frame =
+                    NSRect::new(NSPoint::new(20.0, 35.0), NSSize::new(380.0, 24.0));
+                let notif_checkbox: Id = msg_send![class!(NSButton), alloc];
+                let notif_checkbox: Id =
+                    msg_send![notif_checkbox, initWithFrame: notif_checkbox_frame];
+                let _: () = msg_send![notif_checkbox, setButtonType: 3i64]; // NSButtonTypeSwitch
+                let _: () = msg_send![
+                    notif_checkbox,
+                    setTitle: nsstring("Notify when an agent finishes or needs attention")
+                ];
+                let _: () = msg_send![
+                    notif_checkbox,
+                    setState: if settings.notifications.enabled { 1i64 } else { 0i64 }
+                ];
+                let _: () = msg_send![notif_checkbox, setTarget: target];
+                let _: () = msg_send![notif_checkbox, setAction: sel!(notificationsToggleChanged:)];
+                let _: () = msg_send![tab1_view, addSubview: notif_checkbox];
 
                 let _: () = msg_send![tab1, setView: tab1_view];
                 let _: () = msg_send![tab_view, addTabViewItem: tab1];
@@ -385,7 +458,39 @@ impl SettingsWindow {
                     )
                 ];
 
-                // Model selector - at top of tab
+                // Hotkey selector - at top of tab
+                let hotkey_label_frame =
+                    NSRect::new(NSPoint::new(20.0, 292.0), NSSize::new(200.0, 20.0));
+                let hotkey_label = create_label(
+                    "Dictation Hotkey",
+                    hotkey_label_frame,
+                    title_font,
+                    title_color,
+                );
+                let _: () = msg_send![tab2_view, addSubview: hotkey_label];
+
+                let hotkey_popup_frame =
+                    NSRect::new(NSPoint::new(20.0, 266.0), NSSize::new(260.0, 26.0));
+                let hotkey_popup: Id = msg_send![class!(NSPopUpButton), alloc];
+                let hotkey_popup: Id = msg_send![
+                    hotkey_popup,
+                    initWithFrame: hotkey_popup_frame pullsDown: false as BOOL
+                ];
+
+                let hotkeys = AppSettings::supported_hotkeys();
+                let mut selected_hotkey_index: i64 = 0;
+                for (i, hotkey) in hotkeys.iter().enumerate() {
+                    let _: () = msg_send![hotkey_popup, addItemWithTitle: nsstring(hotkey.label)];
+                    if hotkey.id == settings.speech_to_text.hotkey {
+                        selected_hotkey_index = i as i64;
+                    }
+                }
+                let _: () = msg_send![hotkey_popup, selectItemAtIndex: selected_hotkey_index];
+                let _: () = msg_send![hotkey_popup, setTarget: target];
+                let _: () = msg_send![hotkey_popup, setAction: sel!(hotkeyChanged:)];
+                let _: () = msg_send![tab2_view, addSubview: hotkey_popup];
+
+                // Model selector
                 let model_label_frame =
                     NSRect::new(NSPoint::new(20.0, 232.0), NSSize::new(200.0, 20.0));
                 let model_label = create_label(

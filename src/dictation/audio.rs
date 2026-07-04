@@ -170,26 +170,51 @@ impl AudioRecorder {
         std::mem::take(&mut *self.samples.lock().unwrap())
     }
 
-    /// Save audio as 16kHz mono WAV (whisper-cpp format)
-    pub fn save_to_wav(&self, samples: &[f32], path: &PathBuf) -> Result<(), String> {
+    /// Stop capturing but leave the recorded samples in the shared buffer
+    /// (used by the streaming path, where the transcription thread owns
+    /// a clone of the buffer Arc).
+    pub fn stop_stream(&mut self) {
+        self.stream = None;
+    }
+
+    /// Shared live sample buffer, for streaming transcription while recording.
+    pub fn live_buffer(&self) -> Arc<Mutex<Vec<f32>>> {
+        self.samples.clone()
+    }
+
+    pub fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// Convert raw interleaved device samples to 16kHz mono.
+    pub fn to_16k_mono(samples: &[f32], channels: u16, sample_rate: u32) -> Vec<f32> {
         const TARGET_SAMPLE_RATE: u32 = 16000;
 
-        // Convert to mono if stereo
-        let mono_samples: Vec<f32> = if self.channels > 1 {
+        let mono_samples: Vec<f32> = if channels > 1 {
             samples
-                .chunks(self.channels as usize)
+                .chunks(channels as usize)
                 .map(|chunk| chunk.iter().sum::<f32>() / chunk.len() as f32)
                 .collect()
         } else {
             samples.to_vec()
         };
 
-        // Resample to 16kHz if needed
-        let resampled = if self.sample_rate != TARGET_SAMPLE_RATE {
-            Self::resample(&mono_samples, self.sample_rate, TARGET_SAMPLE_RATE)
+        if sample_rate != TARGET_SAMPLE_RATE {
+            Self::resample(&mono_samples, sample_rate, TARGET_SAMPLE_RATE)
         } else {
             mono_samples
-        };
+        }
+    }
+
+    /// Save audio as 16kHz mono WAV (whisper-cpp format)
+    pub fn save_to_wav(&self, samples: &[f32], path: &PathBuf) -> Result<(), String> {
+        const TARGET_SAMPLE_RATE: u32 = 16000;
+
+        let resampled = Self::to_16k_mono(samples, self.channels, self.sample_rate);
 
         let spec = WavSpec {
             channels: 1,

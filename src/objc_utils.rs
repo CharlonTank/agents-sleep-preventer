@@ -65,17 +65,6 @@ pub fn nsstring_to_string(value: Id) -> Option<String> {
     }
 }
 
-pub fn main_bundle_identifier() -> Option<String> {
-    unsafe {
-        let bundle: Id = msg_send![class!(NSBundle), mainBundle];
-        if bundle.is_null() {
-            return None;
-        }
-        let identifier: Id = msg_send![bundle, bundleIdentifier];
-        nsstring_to_string(identifier)
-    }
-}
-
 pub fn main_bundle_path() -> Option<String> {
     unsafe {
         let bundle: Id = msg_send![class!(NSBundle), mainBundle];

@@ -13,8 +13,7 @@ use crate::native_dialogs::{
 use super::audio::{
     check_microphone_permission, request_microphone_permission_sync, MicrophonePermission,
 };
-use super::globe_key::{check_input_monitoring_permission, request_input_monitoring_permission};
-use super::text_injection::check_accessibility_permission;
+use super::text_injection::{check_accessibility_permission, request_accessibility_permission};
 use super::transcription::{DictationSetupStatus, WhisperTranscriber};
 
 /// Check if this is the first launch (no preferences file exists)
@@ -93,7 +92,7 @@ Allow these permissions to enable local voice dictation."#;
         }
     }
 
-    let model_window = native_dialogs::SetupWindow::new("Whisper Model", "Checking model...");
+    let model_window = native_dialogs::SetupWindow::new("Dictation Model", "Checking model...");
     setup_whisper_model(&model_window);
 
     if auto_dismiss_final {
@@ -103,14 +102,16 @@ Allow these permissions to enable local voice dictation."#;
         return;
     }
     let final_message = if WhisperTranscriber::new().setup_status() == DictationSetupStatus::Ready {
-        "Setup complete.\n\nPress Fn+Shift to dictate text."
+        let hotkey_label = crate::settings::AppSettings::load().selected_hotkey().label;
+        format!("Setup complete.\n\nPress {} to dictate text.", hotkey_label)
     } else {
-        "Setup complete.\n\nTo enable dictation, open Settings and download the Whisper model."
+        "Setup complete.\n\nTo enable dictation, open Settings and download the dictation model."
+            .to_string()
     };
     model_window.set_title("Ready!");
     model_window.show_progress(true);
     model_window.set_progress(100.0);
-    model_window.set_message(final_message);
+    model_window.set_message(&final_message);
     model_window.set_primary_button("OK");
     model_window.set_secondary_visible(false);
     model_window.wait_for_action();
@@ -129,15 +130,9 @@ fn permission_button_label(granted: bool) -> &'static str {
 }
 
 fn update_permission_toggles(window: &PermissionsWindow) {
-    let input_ok = check_input_monitoring_permission();
     let mic_ok = matches!(check_microphone_permission(), MicrophonePermission::Granted);
     let accessibility_ok = check_accessibility_permission();
 
-    window.set_toggle(
-        PermissionToggle::InputMonitoring,
-        permission_button_label(input_ok),
-        input_ok,
-    );
     window.set_toggle(
         PermissionToggle::Microphone,
         permission_button_label(mic_ok),
@@ -151,15 +146,9 @@ fn update_permission_toggles(window: &PermissionsWindow) {
 }
 
 fn update_permission_toggles_handle(handle: &PermissionsWindowHandle) {
-    let input_ok = check_input_monitoring_permission();
     let mic_ok = matches!(check_microphone_permission(), MicrophonePermission::Granted);
     let accessibility_ok = check_accessibility_permission();
 
-    handle.set_toggle(
-        PermissionToggle::InputMonitoring,
-        permission_button_label(input_ok),
-        input_ok,
-    );
     handle.set_toggle(
         PermissionToggle::Microphone,
         permission_button_label(mic_ok),
@@ -174,17 +163,6 @@ fn update_permission_toggles_handle(handle: &PermissionsWindowHandle) {
 
 fn handle_permission_toggle(toggle: PermissionToggle) {
     match toggle {
-        PermissionToggle::InputMonitoring => {
-            if !check_input_monitoring_permission() {
-                if !request_input_monitoring_permission() {
-                    open_input_monitoring_settings();
-                    native_dialogs::show_dialog(
-                        "In System Settings > Privacy & Security > Input Monitoring,\nclick +, select AgentsSleepPreventer.app in /Applications, then enable the switch.",
-                        "Input Monitoring",
-                    );
-                }
-            }
-        }
         PermissionToggle::Microphone => {
             let mut status = check_microphone_permission();
             if status == MicrophonePermission::NotDetermined {
@@ -200,15 +178,14 @@ fn handle_permission_toggle(toggle: PermissionToggle) {
             }
         }
         PermissionToggle::Accessibility => {
-            open_accessibility_settings();
+            // The prompt auto-adds the app to the Accessibility list; opening
+            // the pane too lands the user right on the switch to flip. On
+            // later clicks the prompt is a no-op and only the pane opens.
+            if !request_accessibility_permission() {
+                open_accessibility_settings();
+            }
         }
     }
-}
-
-fn open_input_monitoring_settings() {
-    let _ = Command::new("open")
-        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
-        .spawn();
 }
 
 fn open_microphone_settings() {
@@ -217,7 +194,7 @@ fn open_microphone_settings() {
         .spawn();
 }
 
-fn open_accessibility_settings() {
+pub(super) fn open_accessibility_settings() {
     let _ = Command::new("open")
         .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
         .spawn();
@@ -229,7 +206,7 @@ pub fn ensure_selected_model_downloaded() {
     if WhisperTranscriber::selected_model_downloaded() {
         return;
     }
-    let window = native_dialogs::SetupWindow::new("Whisper Model", "Checking model...");
+    let window = native_dialogs::SetupWindow::new("Dictation Model", "Checking model...");
     setup_whisper_model(&window);
     window.close();
 }
@@ -239,24 +216,24 @@ fn setup_whisper_model(window: &native_dialogs::SetupWindow) {
     window.set_progress(66.0);
 
     if WhisperTranscriber::selected_model_downloaded() {
-        logging::log("[onboarding] Selected Whisper model already available");
+        logging::log("[onboarding] Selected dictation model already available");
         return;
     }
 
     let model_label = crate::settings::AppSettings::load().selected_model().label;
     let message = format!(
-        "Dictation uses a local Whisper model.\n\n{}\n\nDownload it now?",
+        "Dictation uses a local speech model.\n\n{}\n\nDownload it now?",
         model_label
     );
 
-    window.set_title("Whisper Model");
+    window.set_title("Dictation Model");
     window.set_message(&message);
     window.set_primary_button("Download");
     window.set_secondary_button("Later");
     window.set_secondary_visible(true);
 
     if window.wait_for_action() == native_dialogs::SetupAction::Secondary {
-        logging::log("[onboarding] User skipped Whisper model download");
+        logging::log("[onboarding] User skipped dictation model download");
         return;
     }
 
@@ -265,7 +242,7 @@ fn setup_whisper_model(window: &native_dialogs::SetupWindow) {
             window.set_title("Download Complete");
             window.show_progress(true);
             window.set_progress(100.0);
-            window.set_message("The Whisper model has been downloaded.");
+            window.set_message("The dictation model has been downloaded.");
             window.set_primary_button("Continue");
             window.set_secondary_visible(false);
             window.wait_for_action();
