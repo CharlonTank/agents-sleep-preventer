@@ -24,8 +24,9 @@ use io_kit_sys::types::*;
 use io_kit_sys::*;
 use mach2::port::MACH_PORT_NULL;
 use objc::{class, msg_send, sel, sel_impl};
+use serde::Serialize;
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
@@ -54,6 +55,12 @@ static MANUAL_SLEEP_PREVENTION: AtomicBool = AtomicBool::new(true);
 
 const PIDS_DIR: &str = "/tmp/agents_working_pids";
 const LEGACY_PIDS_DIR: &str = "/tmp/claude_working_pids";
+/// One marker file per agent PID currently waiting for user input.
+const ATTENTION_DIR: &str = "/tmp/asp_attention";
+/// Give Claude Code time to update its session registry after firing a hook.
+const ATTENTION_RECONCILE_GRACE_SECS: u64 = 10;
+/// Fallback for agents without an authoritative session status.
+const ATTENTION_FALLBACK_EXPIRY_SECS: u64 = 6 * 60 * 60;
 const IDLE_TIMEOUT_SECS: u64 = 30;
 const IDLE_CPU_THRESHOLD: f32 = 0.5;
 const APP_BUNDLE_PATH: &str = "/Applications/AgentsSleepPreventer.app";
@@ -180,6 +187,48 @@ struct ProcessInfo {
     args: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum AgentState {
+    Attention,
+    Working,
+    Idle,
+}
+
+impl AgentState {
+    fn priority(self) -> u8 {
+        match self {
+            AgentState::Attention => 0,
+            AgentState::Working => 1,
+            AgentState::Idle => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AgentListItem {
+    pid: u32,
+    kind: String,
+    project: String,
+    branch: String,
+    cwd: String,
+    state: AgentState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    age_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProjectInfo {
+    project: String,
+    branch: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeAttentionStatus {
+    Waiting,
+    NotWaiting,
+}
+
 fn load_process_table() -> Vec<ProcessInfo> {
     Command::new("ps")
         .args(["-eo", "pid=,ppid=,comm=,args="])
@@ -290,6 +339,64 @@ fn classify_agent_process(process: &ProcessInfo) -> Option<AgentKind> {
     None
 }
 
+fn hermes_profile_from_args(args: &str) -> Option<String> {
+    let mut tokens = args.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "--profile" {
+            return tokens
+                .next()
+                .filter(|profile| !profile.is_empty())
+                .map(ToOwned::to_owned);
+        }
+        if let Some(profile) = token.strip_prefix("--profile=") {
+            if !profile.is_empty() {
+                return Some(profile.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn is_hermes_gateway_process(process: &ProcessInfo) -> bool {
+    let tokens = process_tokens(process);
+    tokens
+        .windows(2)
+        .any(|window| window[0] == "gateway" && window[1] == "run")
+}
+
+fn hermes_project_name(process: &ProcessInfo) -> Option<String> {
+    if classify_agent_process(process) != Some(AgentKind::Hermes) {
+        return None;
+    }
+
+    hermes_profile_from_args(&process.args)
+        .or_else(|| is_hermes_gateway_process(process).then(|| "default".to_string()))
+}
+
+fn select_agent_processes(processes: &[ProcessInfo]) -> Vec<ProcessInfo> {
+    let codex_native_parents: HashSet<u32> = processes
+        .iter()
+        .filter(|process| is_codex_native_process(process))
+        .map(|process| process.ppid)
+        .collect();
+    let mut seen_pids = HashSet::new();
+    let mut agents = processes
+        .iter()
+        .filter(|process| match classify_agent_process(process) {
+            Some(AgentKind::Claude) => true,
+            Some(AgentKind::Codex) => {
+                !(is_codex_wrapper_process(process) && codex_native_parents.contains(&process.pid))
+            }
+            Some(AgentKind::Hermes) => true,
+            None => false,
+        })
+        .filter(|process| seen_pids.insert(process.pid))
+        .cloned()
+        .collect::<Vec<_>>();
+    agents.sort_by_key(|process| process.pid);
+    agents
+}
+
 fn find_agent_ancestor() -> Option<u32> {
     let processes = load_process_table();
     let by_pid: HashMap<u32, ProcessInfo> = processes
@@ -322,8 +429,116 @@ fn ensure_pids_dir() -> Result<()> {
     Ok(())
 }
 
+fn set_attention_marker(pid: u32) {
+    if fs::create_dir_all(ATTENTION_DIR).is_ok() {
+        let _ = fs::write(PathBuf::from(ATTENTION_DIR).join(pid.to_string()), "");
+    }
+}
+
+fn clear_attention_marker(pid: u32) {
+    let _ = fs::remove_file(PathBuf::from(ATTENTION_DIR).join(pid.to_string()));
+}
+
+fn parse_claude_attention_status(content: &str) -> Option<ClaudeAttentionStatus> {
+    let status = serde_json::from_str::<serde_json::Value>(content)
+        .ok()?
+        .get("status")?
+        .as_str()?
+        .trim()
+        .to_ascii_lowercase();
+
+    match status.as_str() {
+        "waiting" | "attention" | "needs_attention" | "needs-attention" => {
+            Some(ClaudeAttentionStatus::Waiting)
+        }
+        "busy" | "idle" => Some(ClaudeAttentionStatus::NotWaiting),
+        _ => None,
+    }
+}
+
+fn claude_attention_status(home: &Path, pid: u32) -> Option<ClaudeAttentionStatus> {
+    let session_path = home.join(format!(".claude/sessions/{pid}.json"));
+    fs::read_to_string(session_path)
+        .ok()
+        .and_then(|content| parse_claude_attention_status(&content))
+}
+
+fn should_keep_attention_marker(
+    marker_age_secs: u64,
+    claude_status: Option<ClaudeAttentionStatus>,
+) -> bool {
+    if marker_age_secs <= ATTENTION_RECONCILE_GRACE_SECS {
+        return true;
+    }
+
+    match claude_status {
+        Some(ClaudeAttentionStatus::Waiting) => true,
+        Some(ClaudeAttentionStatus::NotWaiting) => false,
+        None => marker_age_secs < ATTENTION_FALLBACK_EXPIRY_SECS,
+    }
+}
+
+/// PIDs of live agents currently waiting for user input. Claude Code's own
+/// session status wins after a short hook/update grace period; other agents
+/// retain fresh markers but cannot stay stuck indefinitely.
+fn attention_pids(processes: &[ProcessInfo]) -> HashSet<u32> {
+    let mut pids = HashSet::new();
+    let process_by_pid = processes
+        .iter()
+        .map(|process| (process.pid, process))
+        .collect::<HashMap<_, _>>();
+    let home = resolve_user_home().ok();
+
+    if let Ok(entries) = fs::read_dir(ATTENTION_DIR) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            if !is_process_alive(pid) {
+                let _ = fs::remove_file(entry.path());
+                continue;
+            }
+
+            let Some(process) = process_by_pid.get(&pid).copied() else {
+                let _ = fs::remove_file(entry.path());
+                continue;
+            };
+            let Some(kind) = classify_agent_process(process) else {
+                let _ = fs::remove_file(entry.path());
+                continue;
+            };
+
+            let marker_age = get_file_age(&entry.path()).unwrap_or(ATTENTION_FALLBACK_EXPIRY_SECS);
+            let status = (kind == AgentKind::Claude)
+                .then_some(())
+                .and_then(|_| home.as_deref())
+                .and_then(|home| claude_attention_status(home, pid));
+
+            if should_keep_attention_marker(marker_age, status) {
+                pids.insert(pid);
+            } else {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    pids
+}
+
 fn get_pid_file(pid: u32) -> PathBuf {
     PathBuf::from(PIDS_DIR).join(pid.to_string())
+}
+
+fn working_pid_ages() -> HashMap<u32, u64> {
+    let mut working = HashMap::new();
+    if let Ok(entries) = fs::read_dir(PIDS_DIR) {
+        for entry in entries.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            working.insert(pid, get_file_age(&entry.path()).unwrap_or(0));
+        }
+    }
+    working
 }
 
 fn count_active_pids() -> usize {
@@ -480,6 +695,113 @@ fn get_process_cwd(pid: u32) -> Option<String> {
         })
 }
 
+fn parse_lsof_cwds(output: &str) -> HashMap<u32, String> {
+    let mut cwds = HashMap::new();
+    let mut current_pid = None;
+
+    for line in output.lines() {
+        if let Some(pid) = line
+            .strip_prefix('p')
+            .and_then(|value| value.parse::<u32>().ok())
+        {
+            current_pid = Some(pid);
+        } else if let (Some(pid), Some(cwd)) = (current_pid, line.strip_prefix('n')) {
+            if !cwd.is_empty() {
+                cwds.insert(pid, cwd.to_string());
+            }
+        }
+    }
+
+    cwds
+}
+
+fn get_process_cwds(pids: &[u32]) -> HashMap<u32, String> {
+    const LSOF_BATCH_SIZE: usize = 128;
+    let mut cwds = HashMap::new();
+
+    for batch in pids.chunks(LSOF_BATCH_SIZE) {
+        if batch.is_empty() {
+            continue;
+        }
+        let pid_list = batch
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let Some(stdout) = Command::new("lsof")
+            .args(["-a", "-d", "cwd", "-p", &pid_list, "-Fpn"])
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+        else {
+            continue;
+        };
+        cwds.extend(parse_lsof_cwds(&stdout));
+    }
+
+    cwds
+}
+
+fn path_display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+fn resolve_git_dir(repo_root: &Path) -> Option<PathBuf> {
+    let marker = repo_root.join(".git");
+    if marker.is_dir() {
+        return Some(marker);
+    }
+
+    let content = fs::read_to_string(marker).ok()?;
+    let git_dir = content.trim().strip_prefix("gitdir:")?.trim();
+    let git_dir = Path::new(git_dir);
+    Some(if git_dir.is_absolute() {
+        git_dir.to_path_buf()
+    } else {
+        repo_root.join(git_dir)
+    })
+}
+
+fn branch_from_git_head(head: &str) -> String {
+    head.trim()
+        .strip_prefix("ref: refs/heads/")
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn project_info_from_cwd(cwd: &str) -> ProjectInfo {
+    if cwd.is_empty() {
+        return ProjectInfo::default();
+    }
+
+    let cwd_path = Path::new(cwd);
+    let repo_root = cwd_path
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists());
+    let project_path = repo_root.unwrap_or(cwd_path);
+    let branch = repo_root
+        .and_then(resolve_git_dir)
+        .and_then(|git_dir| fs::read_to_string(git_dir.join("HEAD")).ok())
+        .map(|head| branch_from_git_head(&head))
+        .unwrap_or_default();
+
+    ProjectInfo {
+        project: path_display_name(project_path),
+        branch,
+    }
+}
+
+fn format_project_location(project: &str, branch: &str) -> String {
+    if branch.is_empty() {
+        project.to_string()
+    } else {
+        format!("{} git:({})", project, branch)
+    }
+}
+
 fn get_git_branch(path: &str) -> Option<String> {
     Command::new("git")
         .args(["-C", path, "branch", "--show-current"])
@@ -515,6 +837,8 @@ fn cmd_start(pid: Option<u32>) -> Result<()> {
     let pid_file = get_pid_file(agent_pid);
 
     fs::write(&pid_file, "working").context("Failed to write PID file")?;
+    // The agent is working again, so it is no longer waiting on the user.
+    clear_attention_marker(agent_pid);
 
     sync_sleep_state("hook-start", sleep_prevention_enabled_from_settings())
 }
@@ -528,6 +852,7 @@ fn cmd_stop(pid: Option<u32>) -> Result<()> {
 
     notify_task_done_if_long(agent_pid, &pid_file);
     let _ = fs::remove_file(&pid_file);
+    clear_attention_marker(agent_pid);
 
     sync_sleep_state("hook-stop", sleep_prevention_enabled_from_settings())
 }
@@ -596,6 +921,9 @@ fn cmd_attention() -> Result<()> {
         .map(agent_kind_name)
         .unwrap_or("Agent");
 
+    if let Some(pid) = agent_pid {
+        set_attention_marker(pid);
+    }
     notifications::spool(
         &format!("{} needs attention", agent_name),
         &message,
@@ -606,26 +934,7 @@ fn cmd_attention() -> Result<()> {
 
 fn get_all_agent_processes() -> Vec<ProcessInfo> {
     let processes = load_process_table();
-    let codex_native_parents: HashSet<u32> = processes
-        .iter()
-        .filter(|process| is_codex_native_process(process))
-        .map(|process| process.ppid)
-        .collect();
-    let mut seen_pids = HashSet::new();
-    let mut agents = processes
-        .into_iter()
-        .filter(|process| match classify_agent_process(process) {
-            Some(AgentKind::Claude) => true,
-            Some(AgentKind::Codex) => {
-                !(is_codex_wrapper_process(process) && codex_native_parents.contains(&process.pid))
-            }
-            Some(AgentKind::Hermes) => true,
-            None => false,
-        })
-        .filter(|process| seen_pids.insert(process.pid))
-        .collect::<Vec<_>>();
-    agents.sort_by_key(|process| process.pid);
-    agents
+    select_agent_processes(&processes)
 }
 
 fn count_agent_processes() -> usize {
@@ -691,24 +1000,155 @@ fn cmd_status() -> Result<()> {
     Ok(())
 }
 
-fn cmd_list() -> Result<()> {
-    let active = get_instance_items()
+fn agent_state(is_attention: bool, is_working: bool) -> AgentState {
+    if is_attention {
+        AgentState::Attention
+    } else if is_working {
+        AgentState::Working
+    } else {
+        AgentState::Idle
+    }
+}
+
+fn build_agent_list_items(
+    processes: &[ProcessInfo],
+    agent_processes: &[ProcessInfo],
+    working: &HashMap<u32, u64>,
+    attention: &HashSet<u32>,
+    cwds: &HashMap<u32, String>,
+) -> Vec<AgentListItem> {
+    let process_by_pid = processes
+        .iter()
+        .map(|process| (process.pid, process))
+        .collect::<HashMap<_, _>>();
+    let mut all_pids = agent_processes
+        .iter()
+        .map(|process| process.pid)
+        .collect::<BTreeSet<_>>();
+    all_pids.extend(working.keys().copied());
+    all_pids.extend(attention.iter().copied());
+
+    let mut project_cache = HashMap::<String, ProjectInfo>::new();
+    let mut agents = all_pids
         .into_iter()
-        .map(|(pid, age, cpu, location)| {
-            json!({
-                "pid": pid,
-                "age_secs": age,
-                "cpu": cpu,
-                "location": location,
-            })
+        .map(|pid| {
+            let process = process_by_pid.get(&pid).copied();
+            let cwd = cwds.get(&pid).cloned().unwrap_or_default();
+            let mut project_info = project_cache
+                .entry(cwd.clone())
+                .or_insert_with(|| project_info_from_cwd(&cwd))
+                .clone();
+
+            if let Some(project) = process.and_then(hermes_project_name) {
+                project_info.project = project;
+                // A Hermes gateway's own cwd is the Hermes source checkout,
+                // not the configured profile project, so its branch is unrelated.
+                project_info.branch.clear();
+            }
+
+            let state = agent_state(attention.contains(&pid), working.contains_key(&pid));
+            AgentListItem {
+                pid,
+                kind: process
+                    .and_then(|process| classify_agent_process(process))
+                    .map(agent_kind_name)
+                    .unwrap_or("Agent")
+                    .to_string(),
+                project: project_info.project,
+                branch: project_info.branch,
+                cwd,
+                state,
+                age_secs: (state == AgentState::Working)
+                    .then(|| working.get(&pid).copied())
+                    .flatten(),
+            }
         })
         .collect::<Vec<_>>();
-    let inactive = get_inactive_agent_pids();
+
+    agents.sort_by(|left, right| {
+        left.state
+            .priority()
+            .cmp(&right.state.priority())
+            .then_with(|| left.project.cmp(&right.project))
+            .then_with(|| left.pid.cmp(&right.pid))
+    });
+    agents
+}
+
+fn cmd_list() -> Result<()> {
+    let processes = load_process_table();
+    let agent_processes = select_agent_processes(&processes);
+    let working = working_pid_ages();
+    let attention = attention_pids(&processes);
+    let mut all_pids = agent_processes
+        .iter()
+        .map(|process| process.pid)
+        .collect::<BTreeSet<_>>();
+    all_pids.extend(working.keys().copied());
+    all_pids.extend(attention.iter().copied());
+    let cwd_by_pid = get_process_cwds(&all_pids.into_iter().collect::<Vec<_>>());
+    let agents = build_agent_list_items(
+        &processes,
+        &agent_processes,
+        &working,
+        &attention,
+        &cwd_by_pid,
+    );
+    let agent_by_pid = agents
+        .iter()
+        .map(|agent| (agent.pid, agent))
+        .collect::<HashMap<_, _>>();
+
+    let mut working_pids = working.keys().copied().collect::<Vec<_>>();
+    working_pids.sort_unstable();
+
+    let active = working_pids
+        .into_iter()
+        .filter_map(|pid| {
+            let agent = agent_by_pid.get(&pid)?;
+            let location = if agent.project.is_empty() {
+                "unknown".to_string()
+            } else {
+                format_project_location(&agent.project, &agent.branch)
+            };
+            Some(json!({
+                "pid": pid,
+                "age_secs": working.get(&pid).copied().unwrap_or(0),
+                "cpu": get_process_cpu(pid),
+                "location": location,
+                "kind": agent.kind.as_str(),
+                "attention": attention.contains(&pid),
+            }))
+        })
+        .collect::<Vec<_>>();
+
+    let inactive = agent_processes
+        .into_iter()
+        .filter(|process| !working.contains_key(&process.pid))
+        .filter_map(|process| {
+            let agent = agent_by_pid.get(&process.pid)?;
+            let location = if agent.project.is_empty() {
+                "unknown".to_string()
+            } else {
+                format_project_location(&agent.project, &agent.branch)
+            };
+            Some(json!({
+                "pid": process.pid,
+                "location": location,
+                "kind": agent.kind.as_str(),
+                "attention": attention.contains(&process.pid),
+            }))
+        })
+        .collect::<Vec<_>>();
+
     let sleep_disabled = is_sleep_disabled();
     let payload = json!({
+        "agents": agents,
         "active": active,
         "inactive": inactive,
         "sleep_disabled": sleep_disabled,
+        "manual_enabled": sleep_prevention_enabled_from_settings(),
+        "thermal_warning": check_thermal_warning(),
     });
     println!("{}", payload);
     Ok(())
@@ -1605,6 +2045,21 @@ fn remove_hermes_hooks(home: &Path) -> Result<usize> {
 mod tests {
     use super::*;
 
+    fn hermes_process(args: &str) -> ProcessInfo {
+        ProcessInfo {
+            pid: 42,
+            ppid: 1,
+            comm: "Python".to_string(),
+            args: args.to_string(),
+        }
+    }
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("asp-{label}-{}-{id}", std::process::id()))
+    }
+
     #[test]
     fn set_codex_hooks_feature_adds_current_flag() {
         let updated = set_codex_hooks_feature("model = \"gpt-5.5\"\n");
@@ -1681,6 +2136,136 @@ hooks = false
         };
 
         assert_eq!(classify_agent_process(&process), None);
+    }
+
+    #[test]
+    fn hermes_profile_parser_supports_separate_and_equals_forms() {
+        assert_eq!(
+            hermes_profile_from_args(
+                "/usr/bin/python3 -m hermes_cli.main --profile cleemo gateway run"
+            )
+            .as_deref(),
+            Some("cleemo")
+        );
+        assert_eq!(
+            hermes_profile_from_args("hermes --profile=personal-branding gateway run").as_deref(),
+            Some("personal-branding")
+        );
+        assert_eq!(hermes_profile_from_args("hermes gateway run"), None);
+    }
+
+    #[test]
+    fn hermes_project_uses_profile_and_names_default_gateway() {
+        let profiled = hermes_process(
+            "/usr/bin/python3 -m hermes_cli.main --profile agents-sleep-preventer gateway run",
+        );
+        let default = hermes_process("/usr/bin/python3 -m hermes_cli.main gateway run");
+
+        assert_eq!(
+            hermes_project_name(&profiled).as_deref(),
+            Some("agents-sleep-preventer")
+        );
+        assert_eq!(hermes_project_name(&default).as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn parse_lsof_cwds_associates_each_path_with_its_pid() {
+        let output = "p1097\nfcwd\nn/Users/example/.hermes/hermes-agent\np12110\nfcwd\nn/Users/example/projects/cleemo-lamdera\n";
+
+        let parsed = parse_lsof_cwds(output);
+
+        assert_eq!(
+            parsed.get(&1097).map(String::as_str),
+            Some("/Users/example/.hermes/hermes-agent")
+        );
+        assert_eq!(
+            parsed.get(&12110).map(String::as_str),
+            Some("/Users/example/projects/cleemo-lamdera")
+        );
+    }
+
+    #[test]
+    fn project_info_uses_git_root_and_head_branch() {
+        let repo = unique_test_dir("project-info");
+        let nested = repo.join("src/deep");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(repo.join(".git/HEAD"), "ref: refs/heads/feature/menu\n").unwrap();
+
+        let info = project_info_from_cwd(nested.to_str().unwrap());
+
+        assert_eq!(info.project, path_display_name(&repo));
+        assert_eq!(info.branch, "feature/menu");
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn agent_state_prioritizes_attention_over_working() {
+        assert_eq!(agent_state(true, true), AgentState::Attention);
+        assert_eq!(agent_state(false, true), AgentState::Working);
+        assert_eq!(agent_state(false, false), AgentState::Idle);
+    }
+
+    #[test]
+    fn claude_attention_status_recognizes_waiting_busy_and_idle() {
+        assert_eq!(
+            parse_claude_attention_status(r#"{"status":"waiting"}"#),
+            Some(ClaudeAttentionStatus::Waiting)
+        );
+        assert_eq!(
+            parse_claude_attention_status(r#"{"status":"attention"}"#),
+            Some(ClaudeAttentionStatus::Waiting)
+        );
+        assert_eq!(
+            parse_claude_attention_status(r#"{"status":"busy"}"#),
+            Some(ClaudeAttentionStatus::NotWaiting)
+        );
+        assert_eq!(
+            parse_claude_attention_status(r#"{"status":"idle"}"#),
+            Some(ClaudeAttentionStatus::NotWaiting)
+        );
+        assert_eq!(
+            parse_claude_attention_status(r#"{"status":"starting"}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn attention_reconciliation_preserves_fresh_hooks_and_expires_unknown_markers() {
+        assert!(should_keep_attention_marker(
+            ATTENTION_RECONCILE_GRACE_SECS,
+            Some(ClaudeAttentionStatus::NotWaiting)
+        ));
+        assert!(!should_keep_attention_marker(
+            ATTENTION_RECONCILE_GRACE_SECS + 1,
+            Some(ClaudeAttentionStatus::NotWaiting)
+        ));
+        assert!(should_keep_attention_marker(
+            ATTENTION_FALLBACK_EXPIRY_SECS - 1,
+            None
+        ));
+        assert!(!should_keep_attention_marker(
+            ATTENTION_FALLBACK_EXPIRY_SECS,
+            None
+        ));
+        assert!(should_keep_attention_marker(
+            ATTENTION_FALLBACK_EXPIRY_SECS * 2,
+            Some(ClaudeAttentionStatus::Waiting)
+        ));
+    }
+
+    #[test]
+    fn claude_attention_status_reads_pid_session_file() {
+        let home = unique_test_dir("claude-session");
+        let sessions = home.join(".claude/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("42.json"), r#"{"status":"waiting"}"#).unwrap();
+
+        assert_eq!(
+            claude_attention_status(&home, 42),
+            Some(ClaudeAttentionStatus::Waiting)
+        );
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -2753,6 +3338,7 @@ fn cmd_uninstall(keep_model: bool, keep_hooks: bool, keep_data: bool) -> Result<
     let _ = fs::remove_dir_all(PIDS_DIR);
     let _ = fs::remove_dir_all(LEGACY_PIDS_DIR);
     let _ = fs::remove_dir_all("/tmp/asp_notifications");
+    let _ = fs::remove_dir_all(ATTENTION_DIR);
 
     // Reset sleep settings
     Command::new("sudo")

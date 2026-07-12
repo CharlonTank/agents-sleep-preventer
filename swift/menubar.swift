@@ -2,32 +2,630 @@ import Cocoa
 import Carbon
 import Sparkle
 
-struct ActiveInstance {
-    let pid: Int
-    let ageSecs: Int
-    let cpu: Double
-    let location: String
+enum AgentState: String {
+    case attention
+    case working
+    case idle
 }
 
-struct InstanceList {
-    let active: [ActiveInstance]
-    let inactive: [Int]
-    let hooksInstalled: Bool
-    let sleepDisabled: Bool
+struct AgentInstance {
+    let pid: Int
+    let kind: String
+    let project: String
+    let branch: String
+    let cwd: String
+    let state: AgentState
+    let ageSecs: Int?
+}
 
-    static let empty = InstanceList(active: [], inactive: [], hooksInstalled: false, sleepDisabled: false)
+struct AgentGroup {
+    let kind: String
+    let project: String
+    let branch: String
+    let state: AgentState
+    let instances: [AgentInstance]
 
-    var inactiveCount: Int {
-        inactive.count
+    var primaryPid: Int {
+        instances[0].pid
+    }
+
+    var ageSecs: Int? {
+        instances.compactMap(\.ageSecs).max()
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+struct InstanceList {
+    let agents: [AgentInstance]
+    let hooksInstalled: Bool
+    let sleepDisabled: Bool
+    let manualEnabled: Bool
+    let thermalWarning: Bool
+
+    static let empty = InstanceList(
+        agents: [], hooksInstalled: true, sleepDisabled: false,
+        manualEnabled: true, thermalWarning: false)
+
+    func agents(in state: AgentState) -> [AgentInstance] {
+        agents.filter { $0.state == state }
+    }
+
+    func groups(in state: AgentState) -> [AgentGroup] {
+        var order: [String] = []
+        var grouped: [String: [AgentInstance]] = [:]
+
+        for agent in agents(in: state).sorted(by: {
+            let left = ($0.project.lowercased(), $0.kind.lowercased(), $0.branch.lowercased(), $0.pid)
+            let right = ($1.project.lowercased(), $1.kind.lowercased(), $1.branch.lowercased(), $1.pid)
+            return left < right
+        }) {
+            let key = "\(agent.kind)\u{1f}\(agent.project)\u{1f}\(agent.branch)"
+            if grouped[key] == nil {
+                order.append(key)
+            }
+            grouped[key, default: []].append(agent)
+        }
+
+        return order.compactMap { key in
+            guard let instances = grouped[key], let first = instances.first else {
+                return nil
+            }
+            return AgentGroup(
+                kind: first.kind,
+                project: first.project,
+                branch: first.branch,
+                state: state,
+                instances: instances
+            )
+        }
+    }
+}
+
+private final class FlippedView: NSView {
+    override var isFlipped: Bool { true }
+}
+
+private final class AgentRowView: NSControl {
+    var onClick: (() -> Void)?
+    private var trackingAreaRef: NSTrackingArea?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerRadius = 9
+        layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.045).cgColor
+        setAccessibilityRole(.button)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        bounds.contains(point) ? self : nil
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        layer?.backgroundColor = NSColor.selectedControlColor
+            .withAlphaComponent(0.16).cgColor
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        updateBackground(hovered: bounds.contains(convert(event.locationInWindow, from: nil)))
+        if bounds.contains(convert(event.locationInWindow, from: nil)) {
+            activate()
+        }
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 36 || event.keyCode == 49 {
+            activate()
+        } else {
+            super.keyDown(with: event)
+        }
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        activate()
+        return true
+    }
+
+    override func updateTrackingAreas() {
+        if let trackingAreaRef {
+            removeTrackingArea(trackingAreaRef)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingAreaRef = area
+        super.updateTrackingAreas()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        updateBackground(hovered: true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        updateBackground(hovered: false)
+    }
+
+    private func updateBackground(hovered: Bool) {
+        layer?.backgroundColor = hovered
+            ? NSColor.selectedControlColor.withAlphaComponent(0.10).cgColor
+            : NSColor.labelColor.withAlphaComponent(0.045).cgColor
+    }
+
+    private func activate() {
+        onClick?()
+    }
+}
+
+private final class AgentPopoverViewController: NSViewController {
+    var onFocus: ((Int) -> Void)?
+    var onSettings: (() -> Void)?
+    var onInstallHooks: (() -> Void)?
+    var onMore: ((NSButton) -> Void)?
+
+    private var currentList = InstanceList.empty
+    private var showAllIdle = false
+
+    override func loadView() {
+        let effect = NSVisualEffectView()
+        effect.material = .popover
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        view = effect
+        render(.empty)
+    }
+
+    func render(_ list: InstanceList) {
+        currentList = list
+        guard isViewLoaded else { return }
+
+        view.subviews.forEach { $0.removeFromSuperview() }
+
+        let root = NSStackView()
+        root.orientation = .vertical
+        root.alignment = .leading
+        root.spacing = 0
+        root.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(root)
+
+        let header = makeHeader(for: list)
+        root.addArrangedSubview(header)
+        header.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        let topRule = separator()
+        root.addArrangedSubview(topRule)
+        topRule.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        let scrollView = makeAgentList(for: list)
+        root.addArrangedSubview(scrollView)
+        scrollView.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        let bottomRule = separator()
+        root.addArrangedSubview(bottomRule)
+        bottomRule.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        let footer = makeFooter(for: list)
+        root.addArrangedSubview(footer)
+        footer.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            root.topAnchor.constraint(equalTo: view.topAnchor),
+            root.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            header.heightAnchor.constraint(equalToConstant: 76),
+            footer.heightAnchor.constraint(equalToConstant: 50),
+            scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 120),
+        ])
+
+        let rowCount = list.groups(in: .attention).count
+            + list.groups(in: .working).count
+            + min(list.groups(in: .idle).count, showAllIdle ? 8 : 3)
+        let height = min(640, max(330, 180 + (rowCount * 54)))
+        preferredContentSize = NSSize(width: 390, height: height)
+    }
+
+    private func makeHeader(for list: InstanceList) -> NSView {
+        let container = NSView()
+        let title = label("Agents", size: 17, weight: .semibold, color: .labelColor)
+        let summary = label(summaryText(for: list), size: 12, color: .secondaryLabelColor)
+        let textStack = NSStackView(views: [title, summary])
+        textStack.orientation = .vertical
+        textStack.alignment = .leading
+        textStack.spacing = 3
+        textStack.translatesAutoresizingMaskIntoConstraints = false
+
+        let status = statusPill(for: list)
+        status.translatesAutoresizingMaskIntoConstraints = false
+
+        container.addSubview(textStack)
+        container.addSubview(status)
+        NSLayoutConstraint.activate([
+            textStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 18),
+            textStack.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            status.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -18),
+            status.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+        ])
+        return container
+    }
+
+    private func makeAgentList(for list: InstanceList) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .overlay
+
+        let document = FlippedView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 14
+        stack.edgeInsets = NSEdgeInsets(top: 14, left: 16, bottom: 14, right: 16)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(stack)
+        scrollView.documentView = document
+
+        NSLayoutConstraint.activate([
+            document.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
+            stack.leadingAnchor.constraint(equalTo: document.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: document.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: document.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: document.bottomAnchor),
+        ])
+
+        let attention = list.groups(in: .attention)
+        let working = list.groups(in: .working)
+        let idle = list.groups(in: .idle)
+
+        if !attention.isEmpty {
+            let section = makeSection(
+                title: "NEEDS YOU",
+                count: list.agents(in: .attention).count,
+                color: .systemOrange,
+                groups: attention
+            )
+            stack.addArrangedSubview(section)
+            section.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true
+        }
+
+        if !working.isEmpty {
+            let section = makeSection(
+                title: "WORKING",
+                count: list.agents(in: .working).count,
+                color: .systemGreen,
+                groups: working
+            )
+            stack.addArrangedSubview(section)
+            section.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true
+        }
+
+        if attention.isEmpty && working.isEmpty && idle.isEmpty {
+            let empty = makeEmptyState()
+            stack.addArrangedSubview(empty)
+            empty.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true
+        } else if !idle.isEmpty {
+            let visibleIdle = showAllIdle ? idle : Array(idle.prefix(3))
+            let section = makeSection(
+                title: "IDLE",
+                count: list.agents(in: .idle).count,
+                color: .tertiaryLabelColor,
+                groups: visibleIdle
+            )
+            stack.addArrangedSubview(section)
+            section.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true
+
+            if idle.count > 3 {
+                let hiddenCount = idle.count - 3
+                let title = showAllIdle ? "Show less" : "Show \(hiddenCount) more idle projects"
+                let showMore = NSButton(title: title, target: self, action: #selector(toggleIdle))
+                showMore.isBordered = false
+                showMore.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+                showMore.setAccessibilityLabel(title)
+                stack.addArrangedSubview(showMore)
+            }
+        }
+
+        return scrollView
+    }
+
+    private func makeSection(
+        title: String,
+        count: Int,
+        color: NSColor,
+        groups: [AgentGroup]
+    ) -> NSView {
+        let section = NSStackView()
+        section.orientation = .vertical
+        section.alignment = .leading
+        section.spacing = 6
+
+        let heading = label("\(title)  \(count)", size: 10, weight: .semibold, color: color)
+        section.addArrangedSubview(heading)
+
+        for group in groups {
+            let row = makeAgentRow(group)
+            section.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: section.widthAnchor).isActive = true
+            row.heightAnchor.constraint(equalToConstant: 48).isActive = true
+        }
+        return section
+    }
+
+    private func makeAgentRow(_ group: AgentGroup) -> AgentRowView {
+        let row = AgentRowView()
+        row.toolTip = group.instances.first?.cwd
+        row.setAccessibilityLabel("\(group.project), \(group.kind), \(statusText(for: group))")
+        row.onClick = { [weak self] in self?.onFocus?(group.primaryPid) }
+
+        let color = stateColor(group.state)
+        let badge = NSView()
+        badge.wantsLayer = true
+        badge.layer?.cornerRadius = 12
+        badge.layer?.backgroundColor = color.withAlphaComponent(0.14).cgColor
+        badge.translatesAutoresizingMaskIntoConstraints = false
+        let initials = label(agentInitials(group.kind), size: 9, weight: .bold, color: color)
+        initials.alignment = .center
+        initials.translatesAutoresizingMaskIntoConstraints = false
+        badge.addSubview(initials)
+
+        let project = label(group.project, size: 13, weight: .semibold, color: .labelColor)
+        project.lineBreakMode = .byTruncatingMiddle
+        let metadata = label(metadataText(for: group), size: 11, color: .secondaryLabelColor)
+        metadata.lineBreakMode = .byTruncatingTail
+        let textStack = NSStackView(views: [project, metadata])
+        textStack.orientation = .vertical
+        textStack.alignment = .leading
+        textStack.spacing = 2
+        textStack.translatesAutoresizingMaskIntoConstraints = false
+
+        let state = label(statusText(for: group), size: 11, weight: .medium, color: color)
+        state.alignment = .right
+        state.translatesAutoresizingMaskIntoConstraints = false
+        state.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        row.addSubview(badge)
+        row.addSubview(textStack)
+        row.addSubview(state)
+        NSLayoutConstraint.activate([
+            badge.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
+            badge.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            badge.widthAnchor.constraint(equalToConstant: 24),
+            badge.heightAnchor.constraint(equalToConstant: 24),
+            initials.leadingAnchor.constraint(equalTo: badge.leadingAnchor),
+            initials.trailingAnchor.constraint(equalTo: badge.trailingAnchor),
+            initials.centerYAnchor.constraint(equalTo: badge.centerYAnchor),
+            textStack.leadingAnchor.constraint(equalTo: badge.trailingAnchor, constant: 10),
+            textStack.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            state.leadingAnchor.constraint(greaterThanOrEqualTo: textStack.trailingAnchor, constant: 8),
+            state.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -10),
+            state.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+        ])
+        return row
+    }
+
+    private func makeEmptyState() -> NSView {
+        let container = NSView()
+        let title = label("No agents running", size: 13, weight: .semibold, color: .labelColor)
+        let detail = label(
+            "Projects appear here when Claude Code, Codex, or Hermes starts.",
+            size: 11,
+            color: .secondaryLabelColor
+        )
+        detail.maximumNumberOfLines = 2
+        detail.alignment = .center
+        let stack = NSStackView(views: [title, detail])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 5
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(stack)
+        NSLayoutConstraint.activate([
+            container.heightAnchor.constraint(equalToConstant: 110),
+            stack.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            stack.widthAnchor.constraint(lessThanOrEqualTo: container.widthAnchor, constant: -30),
+        ])
+        return container
+    }
+
+    private func makeFooter(for list: InstanceList) -> NSView {
+        let footer = NSView()
+        let settings = NSButton(title: "Settings", target: self, action: #selector(openSettings))
+        settings.isBordered = false
+        settings.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        settings.translatesAutoresizingMaskIntoConstraints = false
+
+        let more = NSButton(title: "•••", target: self, action: #selector(openMore(_:)))
+        more.isBordered = false
+        more.font = NSFont.systemFont(ofSize: 14, weight: .semibold)
+        more.toolTip = "More actions"
+        more.setAccessibilityLabel("More actions")
+        more.translatesAutoresizingMaskIntoConstraints = false
+
+        footer.addSubview(settings)
+        footer.addSubview(more)
+
+        var constraints = [
+            settings.leadingAnchor.constraint(equalTo: footer.leadingAnchor, constant: 12),
+            settings.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+            more.trailingAnchor.constraint(equalTo: footer.trailingAnchor, constant: -12),
+            more.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+        ]
+
+        if !list.hooksInstalled {
+            let hooks = NSButton(
+                title: "Install agent hooks",
+                target: self,
+                action: #selector(installHooks)
+            )
+            hooks.bezelStyle = .rounded
+            hooks.controlSize = .small
+            hooks.translatesAutoresizingMaskIntoConstraints = false
+            footer.addSubview(hooks)
+            constraints += [
+                hooks.centerXAnchor.constraint(equalTo: footer.centerXAnchor),
+                hooks.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+            ]
+        }
+
+        NSLayoutConstraint.activate(constraints)
+        return footer
+    }
+
+    private func statusPill(for list: InstanceList) -> NSView {
+        let text: String
+        let color: NSColor
+        if list.thermalWarning {
+            text = "THERMAL"
+            color = .systemRed
+        } else if list.sleepDisabled {
+            text = "MAC AWAKE"
+            color = .systemGreen
+        } else if !list.manualEnabled {
+            text = "PREVENTION OFF"
+            color = .systemOrange
+        } else {
+            text = "READY"
+            color = .secondaryLabelColor
+        }
+
+        let pill = NSView()
+        pill.wantsLayer = true
+        pill.layer?.cornerRadius = 10
+        pill.layer?.backgroundColor = color.withAlphaComponent(0.13).cgColor
+        let textLabel = label(text, size: 9, weight: .bold, color: color)
+        textLabel.translatesAutoresizingMaskIntoConstraints = false
+        pill.addSubview(textLabel)
+        NSLayoutConstraint.activate([
+            textLabel.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 9),
+            textLabel.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -9),
+            textLabel.topAnchor.constraint(equalTo: pill.topAnchor, constant: 5),
+            textLabel.bottomAnchor.constraint(equalTo: pill.bottomAnchor, constant: -5),
+        ])
+        return pill
+    }
+
+    private func separator() -> NSBox {
+        let rule = NSBox()
+        rule.boxType = .separator
+        return rule
+    }
+
+    private func label(
+        _ text: String,
+        size: CGFloat,
+        weight: NSFont.Weight = .regular,
+        color: NSColor
+    ) -> NSTextField {
+        let field = NSTextField(labelWithString: text)
+        field.font = NSFont.systemFont(ofSize: size, weight: weight)
+        field.textColor = color
+        field.lineBreakMode = .byTruncatingTail
+        field.maximumNumberOfLines = 1
+        return field
+    }
+
+    private func summaryText(for list: InstanceList) -> String {
+        let waiting = list.agents(in: .attention).count
+        let working = list.agents(in: .working).count
+        if waiting > 0 && working > 0 {
+            return "\(waiting) need you  ·  \(working) working"
+        }
+        if waiting > 0 {
+            return "\(waiting) need you"
+        }
+        if working > 0 {
+            return "\(working) working"
+        }
+        return list.agents.isEmpty ? "No agents running" : "All agents idle"
+    }
+
+    private func metadataText(for group: AgentGroup) -> String {
+        var parts = [group.kind]
+        if !group.branch.isEmpty {
+            parts.append(group.branch)
+        }
+        if group.instances.count > 1 {
+            parts.append("\(group.instances.count) sessions")
+        }
+        return parts.joined(separator: "  ·  ")
+    }
+
+    private func statusText(for group: AgentGroup) -> String {
+        if group.instances.count > 1 {
+            switch group.state {
+            case .attention: return "\(group.instances.count) need you"
+            case .working: return "\(group.instances.count) working"
+            case .idle: return "\(group.instances.count) idle"
+            }
+        }
+        switch group.state {
+        case .attention:
+            return "Needs you"
+        case .working:
+            return group.ageSecs.map(shortDuration) ?? "Working"
+        case .idle:
+            return "Idle"
+        }
+    }
+
+    private func shortDuration(_ seconds: Int) -> String {
+        if seconds < 60 { return "\(seconds)s" }
+        if seconds < 3600 { return "\(seconds / 60)m" }
+        return "\(seconds / 3600)h"
+    }
+
+    private func stateColor(_ state: AgentState) -> NSColor {
+        switch state {
+        case .attention: return .systemOrange
+        case .working: return .systemGreen
+        case .idle: return .tertiaryLabelColor
+        }
+    }
+
+    private func agentInitials(_ kind: String) -> String {
+        if kind == "Claude Code" { return "CL" }
+        if kind == "Codex" { return "CX" }
+        if kind == "Hermes" { return "H" }
+        return "AI"
+    }
+
+    @objc private func toggleIdle() {
+        showAllIdle.toggle()
+        render(currentList)
+    }
+
+    @objc private func openSettings() {
+        onSettings?()
+    }
+
+    @objc private func installHooks() {
+        onInstallHooks?()
+    }
+
+    @objc private func openMore(_ sender: NSButton) {
+        onMore?(sender)
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var agentProcess: Process?
-    private let menu = NSMenu()
+    private let popover = NSPopover()
+    private let popoverController = AgentPopoverViewController()
+    private var latestList = InstanceList.empty
     private var isRefreshing = false
-    private var isRefreshingStatus = false
+    private var refreshPopoverOnNextList = false
     private var isInstalling = false
     private var isUninstalling = false
     private var statusRefreshTimer: Timer?
@@ -39,6 +637,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var activeIndex = 0
     private var inactiveIndex = 0
     private let statusRefreshInterval: TimeInterval = 2.0
+    private let isPreview = ProcessInfo.processInfo.environment["ASP_UI_PREVIEW"] == "1"
     private lazy var updaterController = SPUStandardUpdaterController(
         startingUpdater: true,
         updaterDelegate: nil,
@@ -51,14 +650,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = item.button {
-            button.title = "Zz"
+            button.title = "○"
+            button.target = self
+            button.action = #selector(togglePopover(_:))
+            button.sendAction(on: [.leftMouseUp])
+            button.toolTip = "Agents Sleep Preventer"
         }
-
-        menu.delegate = self
-        updateMenu(with: .empty)
-        item.menu = menu
         statusItem = item
 
+        popover.contentViewController = popoverController
+        popover.behavior = isPreview ? .applicationDefined : .transient
+        popover.animates = true
+        popoverController.onFocus = { [weak self] pid in
+            self?.popover.performClose(nil)
+            self?.focusPid(pid)
+        }
+        popoverController.onSettings = { [weak self] in
+            self?.popover.performClose(nil)
+            self?.openSettings()
+        }
+        popoverController.onInstallHooks = { [weak self] in
+            self?.popover.performClose(nil)
+            self?.showInstallDialog()
+        }
+        popoverController.onMore = { [weak self] button in
+            self?.showMoreMenu(from: button)
+        }
+
+        if isPreview {
+            apply(previewList())
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                NSApp.activate(ignoringOtherApps: true)
+                self.showPopover()
+            }
+            return
+        }
+
+        _ = updaterController
         startAgent()
         registerHotKeys()
         refreshMenu()
@@ -68,12 +696,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         statusRefreshTimer?.invalidate()
-        unregisterHotKeys()
-        stopAgent()
+        if !isPreview {
+            unregisterHotKeys()
+            stopAgent()
+        }
     }
 
-    func menuWillOpen(_ menu: NSMenu) {
+    @objc private func togglePopover(_ sender: NSStatusBarButton) {
+        if popover.isShown {
+            popover.performClose(sender)
+            return
+        }
+        showPopover()
         refreshMenu()
+    }
+
+    private func showPopover() {
+        guard let button = statusItem?.button else { return }
+        _ = popoverController.view
+        popoverController.render(latestList)
+        popover.contentSize = popoverController.preferredContentSize
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        popoverController.view.window?.makeFirstResponder(nil)
     }
 
     @objc private func quit() {
@@ -106,10 +750,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.refreshMenu()
             }
         }
-    }
-
-    @objc private func focusInstance(_ sender: NSMenuItem) {
-        focusPid(sender.tag)
     }
 
     private func startAgent() {
@@ -148,7 +788,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         showUninstallDialog()
     }
 
-    private func refreshMenu() {
+    private func refreshMenu(updatePopover: Bool = true) {
+        refreshPopoverOnNextList = refreshPopoverOnNextList || updatePopover
         if isRefreshing {
             return
         }
@@ -156,7 +797,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.global(qos: .background).async {
             let list = self.fetchInstanceList()
             DispatchQueue.main.async {
-                self.updateMenu(with: list)
+                let shouldUpdatePopover = self.refreshPopoverOnNextList
+                self.refreshPopoverOnNextList = false
+                self.apply(list, updatePopover: shouldUpdatePopover)
                 self.isRefreshing = false
             }
         }
@@ -168,23 +811,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             timeInterval: statusRefreshInterval,
             repeats: true
         ) { [weak self] _ in
-            self?.refreshStatusTitle()
+            self?.refreshMenu(updatePopover: false)
         }
         statusRefreshTimer = timer
         RunLoop.main.add(timer, forMode: .common)
     }
 
-    private func refreshStatusTitle() {
-        if isRefreshingStatus {
-            return
-        }
-        isRefreshingStatus = true
-        DispatchQueue.global(qos: .utility).async {
-            let list = self.fetchInstanceList()
-            DispatchQueue.main.async {
-                self.updateStatusTitle(with: list)
-                self.isRefreshingStatus = false
-            }
+    private func apply(_ list: InstanceList, updatePopover: Bool = true) {
+        latestList = list
+        updateStatusTitle(with: list)
+        if updatePopover && popover.isShown {
+            popoverController.render(list)
+            popover.contentSize = popoverController.preferredContentSize
         }
     }
 
@@ -209,130 +847,231 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let hooksInstalled = isHooksInstalled()
 
         guard process.terminationStatus == 0 else {
-            return InstanceList(active: [], inactive: [], hooksInstalled: hooksInstalled, sleepDisabled: false)
+            return InstanceList(
+                agents: [], hooksInstalled: hooksInstalled, sleepDisabled: false,
+                manualEnabled: true, thermalWarning: false)
         }
 
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         guard
             let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
-            return InstanceList(active: [], inactive: [], hooksInstalled: hooksInstalled, sleepDisabled: false)
+            return InstanceList(
+                agents: [], hooksInstalled: hooksInstalled, sleepDisabled: false,
+                manualEnabled: true, thermalWarning: false)
         }
 
-        let activeArray = json["active"] as? [[String: Any]] ?? []
-        var active: [ActiveInstance] = []
-        for item in activeArray {
-            guard
-                let pid = (item["pid"] as? NSNumber)?.intValue,
-                let ageSecs = (item["age_secs"] as? NSNumber)?.intValue,
-                let cpu = (item["cpu"] as? NSNumber)?.doubleValue,
-                let location = item["location"] as? String
-            else {
-                continue
-            }
-            active.append(ActiveInstance(pid: pid, ageSecs: ageSecs, cpu: cpu, location: location))
-        }
+        let agents = parseAgents(from: json)
 
-        let inactiveArray = json["inactive"] as? [Any] ?? []
-        let inactive = inactiveArray.compactMap { ($0 as? NSNumber)?.intValue }
         let sleepDisabled = (json["sleep_disabled"] as? NSNumber)?.boolValue ?? false
+        let manualEnabled = (json["manual_enabled"] as? NSNumber)?.boolValue ?? true
+        let thermalWarning = (json["thermal_warning"] as? NSNumber)?.boolValue ?? false
 
-        return InstanceList(active: active, inactive: inactive, hooksInstalled: hooksInstalled, sleepDisabled: sleepDisabled)
+        return InstanceList(
+            agents: agents, hooksInstalled: hooksInstalled,
+            sleepDisabled: sleepDisabled, manualEnabled: manualEnabled,
+            thermalWarning: thermalWarning)
     }
 
-    private func updateMenu(with list: InstanceList) {
-        updateStatusTitle(with: list)
-        menu.removeAllItems()
+    private func parseAgents(from json: [String: Any]) -> [AgentInstance] {
+        if let array = json["agents"] as? [[String: Any]] {
+            return array.compactMap { item in
+                guard
+                    let pid = (item["pid"] as? NSNumber)?.intValue,
+                    let stateText = item["state"] as? String,
+                    let state = AgentState(rawValue: stateText)
+                else {
+                    return nil
+                }
 
-        menu.addItem(disabledItem("Active Instances"))
-        if list.active.isEmpty {
-            menu.addItem(disabledItem("  No Active Instances"))
-        } else {
-            let maxItems = 6
-            for instance in list.active.prefix(maxItems) {
-                let cpuText = String(format: "%.1f%%", instance.cpu)
-                let title = "\(instance.location) [\(instance.pid)] - \(instance.ageSecs)s - \(cpuText)"
-                let item = NSMenuItem(title: title, action: #selector(focusInstance), keyEquivalent: "")
-                item.target = self
-                item.tag = instance.pid
-                item.indentationLevel = 1
-                menu.addItem(item)
-            }
-            if list.active.count > maxItems {
-                let moreItem = disabledItem("...")
-                moreItem.indentationLevel = 1
-                menu.addItem(moreItem)
-            }
-        }
-
-        if list.inactiveCount > 0 {
-            menu.addItem(NSMenuItem.separator())
-            menu.addItem(disabledItem("Inactive Instances"))
-            let maxInactiveItems = 6
-            for pid in list.inactive.prefix(maxInactiveItems) {
-                let title = "PID \(pid)"
-                let item = NSMenuItem(title: title, action: #selector(focusInstance), keyEquivalent: "")
-                item.target = self
-                item.tag = pid
-                item.indentationLevel = 1
-                menu.addItem(item)
-            }
-            if list.inactiveCount > maxInactiveItems {
-                let moreItem = disabledItem("...")
-                moreItem.indentationLevel = 1
-                menu.addItem(moreItem)
+                let rawProject = (item["project"] as? String ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let project = rawProject.isEmpty || rawProject == "unknown"
+                    ? "Unknown project"
+                    : rawProject
+                return AgentInstance(
+                    pid: pid,
+                    kind: item["kind"] as? String ?? "Agent",
+                    project: project,
+                    branch: item["branch"] as? String ?? "",
+                    cwd: item["cwd"] as? String ?? "",
+                    state: state,
+                    ageSecs: (item["age_secs"] as? NSNumber)?.intValue
+                )
             }
         }
 
-        menu.addItem(NSMenuItem.separator())
+        // Compatibility with 4.2.0 while a newly built Swift app and CLI are
+        // briefly mixed during local testing.
+        var agents: [AgentInstance] = []
+        var seen = Set<Int>()
+        for item in json["active"] as? [[String: Any]] ?? [] {
+            guard let pid = (item["pid"] as? NSNumber)?.intValue, seen.insert(pid).inserted else {
+                continue
+            }
+            let identity = projectIdentity(from: item["location"] as? String ?? "")
+            let attention = (item["attention"] as? NSNumber)?.boolValue ?? false
+            agents.append(AgentInstance(
+                pid: pid,
+                kind: item["kind"] as? String ?? "Agent",
+                project: identity.project,
+                branch: identity.branch,
+                cwd: "",
+                state: attention ? .attention : .working,
+                ageSecs: (item["age_secs"] as? NSNumber)?.intValue
+            ))
+        }
+        for item in json["inactive"] as? [[String: Any]] ?? [] {
+            guard let pid = (item["pid"] as? NSNumber)?.intValue, seen.insert(pid).inserted else {
+                continue
+            }
+            let identity = projectIdentity(from: item["location"] as? String ?? "")
+            let attention = (item["attention"] as? NSNumber)?.boolValue ?? false
+            agents.append(AgentInstance(
+                pid: pid,
+                kind: item["kind"] as? String ?? "Agent",
+                project: identity.project,
+                branch: identity.branch,
+                cwd: "",
+                state: attention ? .attention : .idle,
+                ageSecs: nil
+            ))
+        }
+        for value in json["inactive"] as? [NSNumber] ?? [] {
+            let pid = value.intValue
+            guard seen.insert(pid).inserted else { continue }
+            agents.append(AgentInstance(
+                pid: pid,
+                kind: "Agent",
+                project: "Unknown project",
+                branch: "",
+                cwd: "",
+                state: .idle,
+                ageSecs: nil
+            ))
+        }
+        return agents
+    }
 
-        let sleepStatus = list.sleepDisabled ? "disablesleep = 1 (sleep blocked)" : "disablesleep = 0 (sleep allowed)"
-        menu.addItem(disabledItem(sleepStatus))
-
-        menu.addItem(NSMenuItem.separator())
-
-        menu.addItem(disabledItem("Agent Hooks"))
-        let hooksStatus = list.hooksInstalled ? "  Installed" : "  Not installed"
-        menu.addItem(disabledItem(hooksStatus))
-        let hooksTitle = list.hooksInstalled ? "Reinstall Agent Hooks..." : "Install Agent Hooks..."
-        let hooksItem = NSMenuItem(title: hooksTitle, action: #selector(installHooksAction), keyEquivalent: "i")
-        hooksItem.target = self
-        menu.addItem(hooksItem)
-
-        menu.addItem(NSMenuItem.separator())
-        let checkForUpdatesItem = NSMenuItem(
-            title: "Check for Updates...",
-            action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)),
-            keyEquivalent: ""
-        )
-        checkForUpdatesItem.target = updaterController
-        menu.addItem(checkForUpdatesItem)
-
-        menu.addItem(NSMenuItem.separator())
-
-        let settingsItem = NSMenuItem(title: "Settings...", action: #selector(openSettings), keyEquivalent: ",")
-        settingsItem.target = self
-        let logsItem = NSMenuItem(title: "Open Logs", action: #selector(openLogs), keyEquivalent: "l")
-        logsItem.target = self
-        let uninstallItem = NSMenuItem(title: "Uninstall...", action: #selector(uninstallAction), keyEquivalent: "")
-        uninstallItem.target = self
-        let quitItem = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
-        quitItem.target = self
-        menu.addItem(settingsItem)
-        menu.addItem(logsItem)
-        menu.addItem(uninstallItem)
-        menu.addItem(quitItem)
+    private func projectIdentity(from location: String) -> (project: String, branch: String) {
+        let marker = " git:("
+        if let markerRange = location.range(of: marker), location.hasSuffix(")") {
+            let project = String(location[..<markerRange.lowerBound])
+            let branchStart = markerRange.upperBound
+            let branch = String(location[branchStart..<location.index(before: location.endIndex)])
+            return (project.isEmpty ? "Unknown project" : project, branch)
+        }
+        let project = location.isEmpty || location == "unknown" ? "Unknown project" : location
+        return (project, "")
     }
 
     private func updateStatusTitle(with list: InstanceList) {
         guard let button = statusItem?.button else {
             return
         }
-        if list.active.isEmpty {
-            button.title = "Zz"
+        button.image = nil
+        let waitingCount = list.agents(in: .attention).count
+        let workingCount = list.agents(in: .working).count
+        if list.thermalWarning {
+            button.title = "▲"
+            button.setAccessibilityLabel("Thermal warning; sleep prevention paused")
+        } else if waitingCount > 0 {
+            button.title = "⌛︎ \(waitingCount)"
+            button.setAccessibilityLabel("\(waitingCount) agents need your attention")
+        } else if workingCount > 0 {
+            button.title = "● \(workingCount)"
+            button.setAccessibilityLabel("\(workingCount) agents working")
         } else {
-            button.title = "ON \(list.active.count)"
+            button.title = "○"
+            button.setAccessibilityLabel("No agents working")
         }
+    }
+
+    private func showMoreMenu(from button: NSButton) {
+        let menu = NSMenu()
+        let hooksTitle = latestList.hooksInstalled
+            ? "Reinstall Agent Hooks..."
+            : "Install Agent Hooks..."
+        let hooks = NSMenuItem(
+            title: hooksTitle,
+            action: #selector(installHooksAction),
+            keyEquivalent: "i"
+        )
+        hooks.target = self
+        menu.addItem(hooks)
+
+        let updates = NSMenuItem(
+            title: "Check for Updates...",
+            action: #selector(checkForUpdates(_:)),
+            keyEquivalent: ""
+        )
+        updates.target = self
+        menu.addItem(updates)
+        menu.addItem(.separator())
+
+        let logs = NSMenuItem(title: "Open Logs", action: #selector(openLogs), keyEquivalent: "l")
+        logs.target = self
+        menu.addItem(logs)
+        let uninstall = NSMenuItem(
+            title: "Uninstall...",
+            action: #selector(uninstallAction),
+            keyEquivalent: ""
+        )
+        uninstall.target = self
+        menu.addItem(uninstall)
+        menu.addItem(.separator())
+
+        let quitItem = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.maxY + 4), in: button)
+    }
+
+    @objc private func checkForUpdates(_ sender: Any?) {
+        popover.performClose(nil)
+        updaterController.checkForUpdates(sender)
+    }
+
+    private func previewList() -> InstanceList {
+        func agent(
+            _ pid: Int,
+            _ kind: String,
+            _ project: String,
+            _ state: AgentState,
+            branch: String = "main",
+            age: Int? = nil
+        ) -> AgentInstance {
+            AgentInstance(
+                pid: pid,
+                kind: kind,
+                project: project,
+                branch: branch,
+                cwd: "/Users/charles-andreassus/projects/\(project)",
+                state: state,
+                ageSecs: age
+            )
+        }
+
+        return InstanceList(
+            agents: [
+                agent(12110, "Claude Code", "cleemo-lamdera", .attention),
+                agent(16599, "Claude Code", "cleemo-lamdera", .attention),
+                agent(14433, "Claude Code", "webhealth", .attention),
+                agent(18206, "Claude Code", "capitole-immo-vision", .attention),
+                agent(19729, "Claude Code", "thai-chess", .attention),
+                agent(19959, "Claude Code", "archiscale", .attention),
+                agent(25799, "Codex", "agents-sleep-preventer", .working, age: 34),
+                agent(30101, "Hermes", "personal-branding", .idle),
+                agent(30102, "Hermes", "declarimmo", .idle),
+                agent(30103, "Hermes", "cleemo", .idle),
+                agent(30104, "Hermes", "default", .idle, branch: ""),
+                agent(30105, "Claude Code", "evo-hub", .idle),
+            ],
+            hooksInstalled: true,
+            sleepDisabled: true,
+            manualEnabled: true,
+            thermalWarning: false
+        )
     }
 
     private func registerHotKeys() {
@@ -426,24 +1165,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func cycleActiveInstance() {
         hotKeyQueue.async {
             let list = self.fetchInstanceList()
-            guard !list.active.isEmpty else {
+            let agents = list.agents.filter { $0.state != .idle }
+            guard !agents.isEmpty else {
                 return
             }
-            let idx = self.activeIndex % list.active.count
-            self.activeIndex = (self.activeIndex + 1) % list.active.count
-            self.focusPid(list.active[idx].pid)
+            let idx = self.activeIndex % agents.count
+            self.activeIndex = (self.activeIndex + 1) % agents.count
+            self.focusPid(agents[idx].pid)
         }
     }
 
     private func cycleInactiveInstance() {
         hotKeyQueue.async {
             let list = self.fetchInstanceList()
-            guard !list.inactive.isEmpty else {
+            let agents = list.agents(in: .idle)
+            guard !agents.isEmpty else {
                 return
             }
-            let idx = self.inactiveIndex % list.inactive.count
-            self.inactiveIndex = (self.inactiveIndex + 1) % list.inactive.count
-            self.focusPid(list.inactive[idx])
+            let idx = self.inactiveIndex % agents.count
+            self.inactiveIndex = (self.inactiveIndex + 1) % agents.count
+            self.focusPid(agents[idx].pid)
         }
     }
 
@@ -468,12 +1209,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 NSLog("Failed to focus instance pid=\(pid): \(error)")
             }
         }
-    }
-
-    private func disabledItem(_ title: String) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        item.isEnabled = false
-        return item
     }
 
     private func isHooksInstalled() -> Bool {

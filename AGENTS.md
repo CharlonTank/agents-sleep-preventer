@@ -51,6 +51,11 @@ This removes:
 - `cargo xtask release X.Y.Z` (bump, build DMG, notarize, generate signed appcast)
 - `cargo xtask release X.Y.Z --upload` (only after committing/pushing the version bump; creates/updates GitHub release, marks it latest, uploads DMG + appcast, verifies Sparkle feed)
 
+## Menu UI preview
+
+- `ASP_UI_PREVIEW=1` makes the Swift menu bar executable show deterministic fixture data and skips the agent process, hooks prompt, hotkeys, refresh timer, and updater startup.
+- Use this mode for visual checks without replacing the app in `/Applications` or changing system configuration.
+
 ## Uninstall
 
 - `asp uninstall` removes app data by default; use `-k`/`--keep-model` to preserve Whisper models (~500 MB).
