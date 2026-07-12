@@ -154,7 +154,7 @@ impl PopoverWindow {
 
         // Active instances list
         for (pid, age, cpu, location) in &state.instances {
-            let text = format!("  ☕ {} [{}] - {}s - {:.1}%", location, pid, age, cpu);
+            let text = format!("  {} [{}] - {}s - {:.1}%", location, pid, age, cpu);
             let label = ui::create_label(&text, 20.0, y, 240.0, 18.0, false);
             let _: () = msg_send![content_view, addSubview: label];
             y -= 20.0;

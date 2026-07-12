@@ -1406,9 +1406,9 @@ fn cmd_daemon(interval: u64) -> Result<()> {
 
 fn create_tray_title(count: usize, manual_enabled: bool) -> String {
     if manual_enabled && count > 0 {
-        format!("☕ {}", count)
+        format!("ON {}", count)
     } else {
-        "😴".to_string()
+        "Zz".to_string()
     }
 }
 

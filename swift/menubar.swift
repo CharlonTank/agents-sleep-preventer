@@ -36,13 +36,14 @@ struct AgentGroup {
 
 struct InstanceList {
     let agents: [AgentInstance]
+    let activeCount: Int
     let hooksInstalled: Bool
     let sleepDisabled: Bool
     let manualEnabled: Bool
     let thermalWarning: Bool
 
     static let empty = InstanceList(
-        agents: [], hooksInstalled: true, sleepDisabled: false,
+        agents: [], activeCount: 0, hooksInstalled: true, sleepDisabled: false,
         manualEnabled: true, thermalWarning: false)
 
     func agents(in state: AgentState) -> [AgentInstance] {
@@ -650,7 +651,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = item.button {
-            button.title = "○"
+            button.title = "Zz"
             button.target = self
             button.action = #selector(togglePopover(_:))
             button.sendAction(on: [.leftMouseUp])
@@ -848,7 +849,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard process.terminationStatus == 0 else {
             return InstanceList(
-                agents: [], hooksInstalled: hooksInstalled, sleepDisabled: false,
+                agents: [], activeCount: 0, hooksInstalled: hooksInstalled, sleepDisabled: false,
                 manualEnabled: true, thermalWarning: false)
         }
 
@@ -857,18 +858,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
             return InstanceList(
-                agents: [], hooksInstalled: hooksInstalled, sleepDisabled: false,
+                agents: [], activeCount: 0, hooksInstalled: hooksInstalled, sleepDisabled: false,
                 manualEnabled: true, thermalWarning: false)
         }
 
         let agents = parseAgents(from: json)
+        let activeCount = (json["active"] as? [Any])?.count
+            ?? agents.filter { $0.state == .working }.count
 
         let sleepDisabled = (json["sleep_disabled"] as? NSNumber)?.boolValue ?? false
         let manualEnabled = (json["manual_enabled"] as? NSNumber)?.boolValue ?? true
         let thermalWarning = (json["thermal_warning"] as? NSNumber)?.boolValue ?? false
 
         return InstanceList(
-            agents: agents, hooksInstalled: hooksInstalled,
+            agents: agents, activeCount: activeCount, hooksInstalled: hooksInstalled,
             sleepDisabled: sleepDisabled, manualEnabled: manualEnabled,
             thermalWarning: thermalWarning)
     }
@@ -970,20 +973,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         button.image = nil
-        let waitingCount = list.agents(in: .attention).count
-        let workingCount = list.agents(in: .working).count
-        if list.thermalWarning {
-            button.title = "▲"
-            button.setAccessibilityLabel("Thermal warning; sleep prevention paused")
-        } else if waitingCount > 0 {
-            button.title = "⌛︎ \(waitingCount)"
-            button.setAccessibilityLabel("\(waitingCount) agents need your attention")
-        } else if workingCount > 0 {
-            button.title = "● \(workingCount)"
-            button.setAccessibilityLabel("\(workingCount) agents working")
+        if list.sleepDisabled {
+            let count = max(list.activeCount, 1)
+            button.title = "ON \(count)"
+            let noun = count == 1 ? "agent" : "agents"
+            button.setAccessibilityLabel("\(count) \(noun) keeping the Mac awake")
         } else {
-            button.title = "○"
-            button.setAccessibilityLabel("No agents working")
+            button.title = "Zz"
+            button.setAccessibilityLabel("No agents keeping the Mac awake")
         }
     }
 
@@ -1067,6 +1064,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 agent(30104, "Hermes", "default", .idle, branch: ""),
                 agent(30105, "Claude Code", "evo-hub", .idle),
             ],
+            activeCount: 1,
             hooksInstalled: true,
             sleepDisabled: true,
             manualEnabled: true,
