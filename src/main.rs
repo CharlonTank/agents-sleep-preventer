@@ -1415,29 +1415,55 @@ fn create_tray_title(count: usize, manual_enabled: bool) -> String {
     }
 }
 
-fn resolve_user_home() -> Result<PathBuf> {
+fn real_user_from_console() -> Option<String> {
+    let output = Command::new("stat")
+        .args(["-f", "%Su", "/dev/console"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let user = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!user.is_empty() && user != "root").then_some(user)
+}
+
+/// The human the install/uninstall is for, even when running elevated.
+/// GUI-admin runs (osascript "with administrator privileges") and the pkg
+/// postinstall execute as root WITHOUT SUDO_USER set; there the console
+/// user is the real user.
+fn resolve_real_user() -> Option<String> {
     if let Ok(sudo_user) = std::env::var("SUDO_USER") {
         let sudo_user = sudo_user.trim();
         if !sudo_user.is_empty() && sudo_user != "root" {
-            let user_record = format!("/Users/{}", sudo_user);
-            if let Ok(output) = Command::new("dscl")
-                .args([".", "-read", &user_record, "NFSHomeDirectory"])
-                .output()
-            {
-                if output.status.success() {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    for line in stdout.lines() {
-                        if let Some(home) = line.trim().strip_prefix("NFSHomeDirectory:") {
-                            let home = home.trim();
-                            if !home.is_empty() {
-                                return Ok(PathBuf::from(home));
-                            }
+            return Some(sudo_user.to_string());
+        }
+    }
+    if unsafe { libc::geteuid() } == 0 {
+        return real_user_from_console();
+    }
+    None
+}
+
+fn resolve_user_home() -> Result<PathBuf> {
+    if let Some(user) = resolve_real_user() {
+        let user_record = format!("/Users/{}", user);
+        if let Ok(output) = Command::new("dscl")
+            .args([".", "-read", &user_record, "NFSHomeDirectory"])
+            .output()
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    if let Some(home) = line.trim().strip_prefix("NFSHomeDirectory:") {
+                        let home = home.trim();
+                        if !home.is_empty() {
+                            return Ok(PathBuf::from(home));
                         }
                     }
                 }
             }
-            return Ok(PathBuf::from(user_record));
         }
+        return Ok(PathBuf::from(user_record));
     }
 
     dirs::home_dir().context("Could not find home directory")
@@ -1445,17 +1471,13 @@ fn resolve_user_home() -> Result<PathBuf> {
 
 #[cfg(unix)]
 fn fix_user_ownership(path: &Path) {
-    let Ok(sudo_user) = std::env::var("SUDO_USER") else {
+    let Some(user) = resolve_real_user() else {
         return;
     };
-    let sudo_user = sudo_user.trim();
-    if sudo_user.is_empty() || sudo_user == "root" {
-        return;
-    }
     let Some(path) = path.to_str() else {
         return;
     };
-    let _ = Command::new("chown").args(["-R", sudo_user, path]).status();
+    let _ = Command::new("chown").args(["-R", &user, path]).status();
 }
 
 fn toml_section_name(line: &str) -> Option<&str> {
@@ -3159,10 +3181,10 @@ fn cmd_install(auto_yes: bool) -> Result<()> {
     }
 
     println!("Setting up passwordless sudo for pmset...");
-    // Get the real user (not root) for sudoers entry
-    let real_user = std::env::var("SUDO_USER")
-        .or_else(|_| std::env::var("USER"))
-        .unwrap_or_default();
+    // Get the real user (not root) for the sudoers entry
+    let real_user = resolve_real_user()
+        .or_else(|| std::env::var("USER").ok().filter(|user| user != "root"))
+        .context("Could not determine which user should receive passwordless pmset access")?;
     // Restricted to the exact pmset command lines the app runs; anything else
     // still requires a password.
     let sudoers_content = format!(
