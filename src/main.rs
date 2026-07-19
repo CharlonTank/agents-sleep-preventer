@@ -65,11 +65,14 @@ const IDLE_TIMEOUT_SECS: u64 = 30;
 const IDLE_CPU_THRESHOLD: f32 = 0.5;
 const APP_BUNDLE_PATH: &str = "/Applications/AgentsSleepPreventer.app";
 const APP_BINARY_PATH: &str = "/Applications/AgentsSleepPreventer.app/Contents/MacOS/asp";
-const OWNED_HOOK_MARKERS: [&str; 4] = [
+const OWNED_HOOK_MARKERS: [&str; 7] = [
     "AgentsSleepPreventer.app/Contents/MacOS/asp",
     "/usr/local/bin/asp",
     "/usr/local/bin/agents-sleep-preventer",
     "claude-sleep-preventer",
+    ".claude/hooks/prevent-sleep.sh",
+    ".claude/hooks/allow-sleep.sh",
+    ".claude/hooks/agent-attention.sh",
 ];
 
 #[derive(Parser)]
@@ -1648,7 +1651,7 @@ fn command_hook_group(command: &str, matcher: Option<&str>) -> serde_json::Value
     group
 }
 
-fn append_codex_hook_group(
+fn append_hook_group(
     hooks: &mut serde_json::Map<String, serde_json::Value>,
     event_name: &str,
     group: serde_json::Value,
@@ -1707,22 +1710,22 @@ fn install_codex_hooks(home: &Path, app_binary: &str) -> Result<()> {
         .get_mut("hooks")
         .and_then(serde_json::Value::as_object_mut)
         .context("Failed to prepare Codex hooks object")?;
-    append_codex_hook_group(
+    append_hook_group(
         hooks,
         "UserPromptSubmit",
         command_hook_group(&start_command, None),
     );
-    append_codex_hook_group(
+    append_hook_group(
         hooks,
         "PreToolUse",
         command_hook_group(&start_command, Some("*")),
     );
-    append_codex_hook_group(
+    append_hook_group(
         hooks,
         "PostToolUse",
         command_hook_group(&start_command, Some("*")),
     );
-    append_codex_hook_group(hooks, "Stop", command_hook_group(&stop_command, None));
+    append_hook_group(hooks, "Stop", command_hook_group(&stop_command, None));
 
     fs::write(&hooks_file, serde_json::to_string_pretty(&hooks_json)?)
         .with_context(|| format!("Failed to write {}", hooks_file.display()))?;
@@ -2058,6 +2061,39 @@ mod tests {
         static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("asp-{label}-{}-{id}", std::process::id()))
+    }
+
+    #[test]
+    fn remove_owned_hook_groups_keeps_user_claude_hooks() {
+        let mut hooks = json!({
+            "PreToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [{ "type": "command", "command": "/Users/x/scripts/my-lint.sh" }]
+                },
+                {
+                    "hooks": [{ "type": "command", "command": "/Users/x/.claude/hooks/prevent-sleep.sh" }]
+                }
+            ],
+            "Stop": [
+                { "hooks": [{ "type": "command", "command": "/Users/x/.claude/hooks/allow-sleep.sh" }] }
+            ],
+            "Notification": [
+                { "hooks": [{ "type": "command", "command": "/Users/x/.claude/hooks/agent-attention.sh" }] }
+            ]
+        });
+
+        assert!(remove_owned_hook_groups(&mut hooks));
+        prune_empty_hook_events(&mut hooks);
+
+        let pre_tool_use = hooks["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_tool_use.len(), 1);
+        assert_eq!(
+            pre_tool_use[0]["hooks"][0]["command"],
+            "/Users/x/scripts/my-lint.sh"
+        );
+        assert!(hooks.get("Stop").is_none());
+        assert!(hooks.get("Notification").is_none());
     }
 
     #[test]
@@ -3127,7 +3163,12 @@ fn cmd_install(auto_yes: bool) -> Result<()> {
     let real_user = std::env::var("SUDO_USER")
         .or_else(|_| std::env::var("USER"))
         .unwrap_or_default();
-    let sudoers_content = format!("{} ALL=(ALL) NOPASSWD: /usr/bin/pmset\n", real_user);
+    // Restricted to the exact pmset command lines the app runs; anything else
+    // still requires a password.
+    let sudoers_content = format!(
+        "{} ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset -a sleep 5, /usr/bin/pmset sleepnow\n",
+        real_user
+    );
 
     // Write directly if we're root, otherwise use sudo
     let is_root = unsafe { libc::geteuid() == 0 };
@@ -3166,42 +3207,89 @@ fn cmd_install(auto_yes: bool) -> Result<()> {
             .output();
     }
 
+    // A malformed sudoers file can break sudo system-wide; validate and roll
+    // back rather than leave a bad file behind.
+    let visudo_args = ["/usr/sbin/visudo", "-c", "-f", "/etc/sudoers.d/agents-pmset"];
+    let visudo = if is_root {
+        Command::new(visudo_args[0]).args(&visudo_args[1..]).output()?
+    } else {
+        Command::new("sudo").args(visudo_args).output()?
+    };
+    if !visudo.status.success() {
+        if is_root {
+            let _ = Command::new("rm")
+                .args(["-f", "/etc/sudoers.d/agents-pmset"])
+                .output();
+        } else {
+            let _ = Command::new("sudo")
+                .args(["rm", "-f", "/etc/sudoers.d/agents-pmset"])
+                .output();
+        }
+        anyhow::bail!(
+            "Generated sudoers file failed visudo validation and was removed: {}",
+            String::from_utf8_lossy(&visudo.stderr).trim()
+        );
+    }
+
     println!("Configuring coding agent hooks...");
 
     let prevent_path = hooks_dir.join("prevent-sleep.sh");
     let allow_path = hooks_dir.join("allow-sleep.sh");
     let attention_path = hooks_dir.join("agent-attention.sh");
-    let hooks_json = format!(
-        r#"{{
-    "UserPromptSubmit": [{{ "hooks": [{{ "type": "command", "command": "{prevent}" }}] }}],
-    "PreToolUse": [{{ "hooks": [{{ "type": "command", "command": "{prevent}" }}] }}],
-    "PreCompact": [{{ "hooks": [{{ "type": "command", "command": "{prevent}" }}] }}],
-    "Notification": [{{ "hooks": [{{ "type": "command", "command": "{attention}" }}] }}],
-    "Stop": [{{ "hooks": [{{ "type": "command", "command": "{allow}" }}] }}]
-}}"#,
-        prevent = prevent_path.display(),
-        allow = allow_path.display(),
-        attention = attention_path.display(),
-    );
+    let claude_hook_events = [
+        ("UserPromptSubmit", &prevent_path),
+        ("PreToolUse", &prevent_path),
+        ("PreCompact", &prevent_path),
+        ("Notification", &attention_path),
+        ("Stop", &allow_path),
+    ];
 
-    let hooks: serde_json::Value =
-        serde_json::from_str(&hooks_json).context("Failed to parse hooks JSON")?;
-
-    if settings_file.exists() {
+    let settings_existed = settings_file.exists();
+    let mut json: serde_json::Value = if settings_existed {
         let content = fs::read_to_string(&settings_file)
             .with_context(|| format!("Failed to read {}", settings_file.display()))?;
-        let mut json: serde_json::Value = serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse {}", settings_file.display()))?;
-        json["hooks"] = hooks;
-        fs::write(&settings_file, serde_json::to_string_pretty(&json)?)
-            .with_context(|| format!("Failed to write {}", settings_file.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse {}", settings_file.display()))?
+    } else {
+        json!({})
+    };
+    if !json.is_object() {
+        anyhow::bail!("{} is not a JSON object", settings_file.display());
+    }
+    if !json
+        .get("hooks")
+        .map(serde_json::Value::is_object)
+        .unwrap_or(false)
+    {
+        json["hooks"] = json!({});
+    }
+
+    // Merge: drop only previously-installed ASP entries, keep the user's own
+    // hooks untouched, then append ours.
+    if let Some(hooks) = json.get_mut("hooks") {
+        remove_owned_hook_groups(hooks);
+        prune_empty_hook_events(hooks);
+    }
+    let hooks = json
+        .get_mut("hooks")
+        .and_then(serde_json::Value::as_object_mut)
+        .context("Failed to prepare Claude Code hooks object")?;
+    for (event, script) in claude_hook_events {
+        append_hook_group(
+            hooks,
+            event,
+            json!({
+                "hooks": [{ "type": "command", "command": script.display().to_string() }]
+            }),
+        );
+    }
+
+    fs::create_dir_all(settings_file.parent().unwrap())?;
+    fs::write(&settings_file, serde_json::to_string_pretty(&json)?)
+        .with_context(|| format!("Failed to write {}", settings_file.display()))?;
+    if settings_existed {
         println!("  Updated {}", settings_file.display());
     } else {
-        fs::create_dir_all(settings_file.parent().unwrap())?;
-        let mut json = serde_json::json!({});
-        json["hooks"] = hooks;
-        fs::write(&settings_file, serde_json::to_string_pretty(&json)?)
-            .with_context(|| format!("Failed to write {}", settings_file.display()))?;
         println!("  Created {}", settings_file.display());
     }
 
@@ -3289,15 +3377,29 @@ fn cmd_uninstall(keep_model: bool, keep_hooks: bool, keep_data: bool) -> Result<
         let _ = fs::remove_file(hooks_dir.join("allow-sleep.sh"));
         let _ = fs::remove_file(hooks_dir.join("agent-attention.sh"));
 
-        // Remove hooks from settings.json
+        // Remove only ASP-owned hooks from settings.json; the user's own hooks stay.
         if settings_file.exists() {
             if let Ok(content) = fs::read_to_string(&settings_file) {
                 if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if json.get("hooks").is_some() {
-                        json.as_object_mut().unwrap().remove("hooks");
+                    let changed = json
+                        .get_mut("hooks")
+                        .map(remove_owned_hook_groups)
+                        .unwrap_or(false);
+                    if changed {
+                        if let Some(hooks) = json.get_mut("hooks") {
+                            prune_empty_hook_events(hooks);
+                        }
+                        let hooks_empty = json
+                            .get("hooks")
+                            .and_then(serde_json::Value::as_object)
+                            .map(|hooks| hooks.is_empty())
+                            .unwrap_or(false);
+                        if hooks_empty {
+                            json.as_object_mut().unwrap().remove("hooks");
+                        }
                         let _ =
                             fs::write(&settings_file, serde_json::to_string_pretty(&json).unwrap());
-                        println!("Removed hooks from settings.json");
+                        println!("Removed Agents Sleep Preventer hooks from settings.json");
                     }
                 }
             }
