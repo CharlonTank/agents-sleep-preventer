@@ -706,6 +706,66 @@ fn prune_empty_hook_events(hooks: &mut serde_json::Value) {
     }
 }
 
+/// Substrings identifying ASP-owned hook entries in ~/.claude/settings.json.
+const CLAUDE_HOOK_MARKERS: [&str; 4] = [
+    ".claude/hooks/prevent-sleep.sh",
+    ".claude/hooks/refresh-sleep.sh",
+    ".claude/hooks/allow-sleep.sh",
+    ".claude/hooks/agent-attention.sh",
+];
+
+fn hook_value_contains_asp_command(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => OWNED_HOOK_MARKERS
+            .iter()
+            .chain(CLAUDE_HOOK_MARKERS.iter())
+            .any(|marker| text.contains(marker)),
+        serde_json::Value::Array(values) => values.iter().any(hook_value_contains_asp_command),
+        serde_json::Value::Object(map) => map.values().any(hook_value_contains_asp_command),
+        _ => false,
+    }
+}
+
+/// Remove ASP-owned hook groups from a Claude settings.json "hooks" object,
+/// dropping events left empty. User hooks are preserved. Returns true when
+/// something was removed.
+fn remove_asp_hook_groups(hooks: &mut serde_json::Value) -> bool {
+    let Some(events) = hooks.as_object_mut() else {
+        return false;
+    };
+
+    let mut changed = false;
+    for groups in events.values_mut() {
+        let Some(groups) = groups.as_array_mut() else {
+            continue;
+        };
+
+        for group in groups.iter_mut() {
+            if let Some(group_hooks) = group
+                .get_mut("hooks")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                let before = group_hooks.len();
+                group_hooks.retain(|hook| !hook_value_contains_asp_command(hook));
+                changed |= before != group_hooks.len();
+            }
+        }
+
+        let before = groups.len();
+        groups.retain(|group| {
+            group
+                .get("hooks")
+                .and_then(serde_json::Value::as_array)
+                .map(|hooks| !hooks.is_empty())
+                .unwrap_or(true)
+        });
+        changed |= before != groups.len();
+    }
+
+    prune_empty_hook_events(hooks);
+    changed
+}
+
 fn clean_codex_hooks(home: &Path) -> Result<()> {
     let hooks_file = home.join(".codex/hooks.json");
     if !hooks_file.exists() {
@@ -830,34 +890,57 @@ fn clean(keep_model: bool) -> Result<()> {
             }
         }
 
-        // Remove Claude Code hooks (may be owned by root from old installations)
+        // Remove ASP's Claude Code hook scripts only — the hooks dir may hold
+        // user scripts (may be owned by root from old installations)
         println!("Removing Claude Code hooks...");
         let hooks_dir = home.join(".claude/hooks");
-        if hooks_dir.exists() {
-            // Try without sudo first
-            if fs::remove_dir_all(&hooks_dir).is_err() {
-                // If that fails (owned by root), use osascript with admin privileges
-                let cmd = format!("rm -rf '{}'", hooks_dir.display());
-                let applescript = format!(
-                    "do shell script \"{}\" with administrator privileges",
-                    cmd.replace("\"", "\\\"")
-                );
-                let _ = Command::new("osascript")
-                    .args(["-e", &applescript])
-                    .status();
+        let asp_scripts = [
+            "prevent-sleep.sh",
+            "refresh-sleep.sh",
+            "allow-sleep.sh",
+            "agent-attention.sh",
+        ];
+        let mut needs_sudo = false;
+        for script in asp_scripts {
+            let path = hooks_dir.join(script);
+            if path.exists() && fs::remove_file(&path).is_err() {
+                needs_sudo = true;
             }
         }
+        if needs_sudo {
+            // Owned by root: remove with admin privileges
+            let cmd = asp_scripts
+                .iter()
+                .map(|script| format!("rm -f '{}'", hooks_dir.join(script).display()))
+                .collect::<Vec<_>>()
+                .join(" && ");
+            let applescript = format!(
+                "do shell script \"{}\" with administrator privileges",
+                cmd.replace("\"", "\\\"")
+            );
+            let _ = Command::new("osascript")
+                .args(["-e", &applescript])
+                .status();
+        }
 
-        // Clean hooks from settings.json
+        // Strip ASP-owned hook entries from settings.json, preserving user hooks
         let settings_path = home.join(".claude/settings.json");
         if settings_path.exists() {
             println!("Cleaning settings.json...");
             if let Ok(content) = fs::read_to_string(&settings_path) {
                 if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if json.get("hooks").is_some() {
-                        json.as_object_mut().unwrap().remove("hooks");
-                        let _ = fs::write(&settings_path, serde_json::to_string_pretty(&json)?);
-                        println!("  Removed hooks from settings.json");
+                    if let Some(hooks) = json.get_mut("hooks") {
+                        if remove_asp_hook_groups(hooks) {
+                            let hooks_empty = hooks
+                                .as_object()
+                                .map(|events| events.is_empty())
+                                .unwrap_or(false);
+                            if hooks_empty {
+                                json.as_object_mut().unwrap().remove("hooks");
+                            }
+                            let _ = fs::write(&settings_path, serde_json::to_string_pretty(&json)?);
+                            println!("  Removed ASP hooks from settings.json");
+                        }
                     }
                 }
             }
@@ -1003,6 +1086,9 @@ fn replace_app(open_app: bool) -> Result<()> {
     )?;
     fs::copy("Info.plist", &plist_path)?;
 
+    // Sign with the stable Developer ID (not ad hoc): TCC grants
+    // (Accessibility/Microphone) are tied to the signing identity, and an
+    // ad hoc signature changes every build, silently killing dictation.
     println!("Signing app...");
     run(
         "codesign",
@@ -1010,7 +1096,7 @@ fn replace_app(open_app: bool) -> Result<()> {
             "--force",
             "--deep",
             "--sign",
-            "-",
+            SIGNING_IDENTITY,
             app_dir.to_str().unwrap(),
         ],
     )?;

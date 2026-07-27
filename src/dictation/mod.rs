@@ -148,8 +148,9 @@ impl DictationManager {
     /// Re-read the configured dictation hotkey from settings (e.g. after the
     /// user changed it in Settings). Takes effect immediately, no restart needed.
     pub fn reload_hotkey(&mut self) {
-        let mask = AppSettings::load().selected_hotkey().mask;
-        globe_key::set_required_mask(mask);
+        let hotkey = AppSettings::load().resolved_hotkey();
+        globe_key::set_required_mask(hotkey.mask);
+        globe_key::set_required_keycode(hotkey.keycode);
     }
 
     pub fn update(&mut self) {

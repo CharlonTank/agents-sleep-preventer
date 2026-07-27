@@ -5,6 +5,7 @@ use objc::declare::ClassDecl;
 use objc::runtime::{Object, Sel, BOOL};
 use objc::{class, msg_send, sel, sel_impl};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::objc_utils::{
@@ -12,7 +13,10 @@ use crate::objc_utils::{
     NS_BACKING_STORE_BUFFERED,
 };
 
-use super::AppSettings;
+use super::{
+    AppSettings, ResolvedHotkey, CG_FLAG_COMMAND, CG_FLAG_CONTROL, CG_FLAG_FN, CG_FLAG_OPTION,
+    CG_FLAG_SHIFT,
+};
 
 const NS_WINDOW_STYLE_MASK_TITLED: usize = 1 << 0;
 const NS_WINDOW_STYLE_MASK_CLOSABLE: usize = 1 << 1;
@@ -218,8 +222,273 @@ extern "C" fn hotkey_changed(this: &Object, _: Sel, sender: Id) {
             if (selected_index as usize) < hotkeys.len() {
                 let id = hotkeys[selected_index as usize].id;
                 state.update_hotkey(id.to_string());
+                // Picking a preset discards any recorded custom combo.
+                HOTKEY_CAPTURING.store(false, Ordering::SeqCst);
+                set_record_button_title("Record…");
             }
         }
+    }
+}
+
+// ---- Hotkey recording ------------------------------------------------------
+//
+// Clicking "Record…" arms capture mode; the ASPSettingsWindow subclass then
+// intercepts keyDown/flagsChanged. A combo is either modifiers + a regular
+// key (finalized on keyDown) or modifiers only (finalized when they are all
+// released). Escape cancels.
+
+const HOTKEY_MOD_MASK: u64 =
+    CG_FLAG_FN | CG_FLAG_CONTROL | CG_FLAG_OPTION | CG_FLAG_SHIFT | CG_FLAG_COMMAND;
+
+static HOTKEY_CAPTURING: AtomicBool = AtomicBool::new(false);
+/// Modifiers seen held together while capturing a modifiers-only combo.
+static HOTKEY_CAPTURE_SEEN: AtomicU64 = AtomicU64::new(0);
+static HOTKEY_STATE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static HOTKEY_RECORD_BUTTON: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static HOTKEY_POPUP: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+fn hotkey_symbols(mask: u64) -> String {
+    let mut symbols = String::new();
+    if mask & CG_FLAG_FN != 0 {
+        symbols.push_str("fn");
+    }
+    if mask & CG_FLAG_CONTROL != 0 {
+        symbols.push('⌃');
+    }
+    if mask & CG_FLAG_OPTION != 0 {
+        symbols.push('⌥');
+    }
+    if mask & CG_FLAG_SHIFT != 0 {
+        symbols.push('⇧');
+    }
+    if mask & CG_FLAG_COMMAND != 0 {
+        symbols.push('⌘');
+    }
+    symbols
+}
+
+fn special_key_name(keycode: u16) -> Option<&'static str> {
+    Some(match keycode {
+        36 => "Return",
+        48 => "Tab",
+        49 => "Space",
+        51 => "Delete",
+        117 => "⌦",
+        123 => "←",
+        124 => "→",
+        125 => "↓",
+        126 => "↑",
+        115 => "Home",
+        119 => "End",
+        116 => "PgUp",
+        121 => "PgDn",
+        122 => "F1",
+        120 => "F2",
+        99 => "F3",
+        118 => "F4",
+        96 => "F5",
+        97 => "F6",
+        98 => "F7",
+        100 => "F8",
+        101 => "F9",
+        109 => "F10",
+        103 => "F11",
+        111 => "F12",
+        105 => "F13",
+        107 => "F14",
+        113 => "F15",
+        106 => "F16",
+        64 => "F17",
+        79 => "F18",
+        80 => "F19",
+        _ => return None,
+    })
+}
+
+/// Keys usable without any modifier (they don't type text).
+fn is_bare_key_allowed(keycode: u16) -> bool {
+    matches!(special_key_name(keycode), Some(name) if name.starts_with('F'))
+}
+
+fn set_record_button_title(title: &str) {
+    let button = HOTKEY_RECORD_BUTTON.load(Ordering::SeqCst);
+    if !button.is_null() {
+        unsafe {
+            let _: () = msg_send![button as Id, setTitle: nsstring(title)];
+        }
+    }
+}
+
+fn finish_hotkey_capture(hotkey: ResolvedHotkey) {
+    HOTKEY_CAPTURING.store(false, Ordering::SeqCst);
+    HOTKEY_CAPTURE_SEEN.store(0, Ordering::SeqCst);
+
+    let state_ptr = HOTKEY_STATE.load(Ordering::SeqCst);
+    if !state_ptr.is_null() {
+        unsafe {
+            (*(state_ptr as *const SettingsState)).update_hotkey(hotkey.custom_id());
+        }
+    }
+    set_record_button_title(&hotkey.label);
+
+    // A recorded combo replaces any preset selection.
+    let popup = HOTKEY_POPUP.load(Ordering::SeqCst);
+    if !popup.is_null() {
+        unsafe {
+            let _: () = msg_send![popup as Id, selectItemAtIndex: -1i64];
+        }
+    }
+}
+
+fn cancel_hotkey_capture() {
+    HOTKEY_CAPTURING.store(false, Ordering::SeqCst);
+    HOTKEY_CAPTURE_SEEN.store(0, Ordering::SeqCst);
+
+    let state_ptr = HOTKEY_STATE.load(Ordering::SeqCst);
+    let title = if state_ptr.is_null() {
+        "Record…".to_string()
+    } else {
+        let hotkey = unsafe { (*(state_ptr as *const SettingsState)).get_settings() }
+            .speech_to_text
+            .hotkey;
+        ResolvedHotkey::parse_custom(&hotkey)
+            .map(|h| h.label)
+            .unwrap_or_else(|| "Record…".to_string())
+    };
+    set_record_button_title(&title);
+}
+
+unsafe fn captured_key_name(event: Id, keycode: u16) -> String {
+    if let Some(name) = special_key_name(keycode) {
+        return name.to_string();
+    }
+    let chars: Id = msg_send![event, charactersIgnoringModifiers];
+    let text = nsstring_to_string(chars)
+        .unwrap_or_default()
+        .trim()
+        .to_uppercase();
+    if text.is_empty() || text.chars().any(char::is_control) {
+        format!("Key{}", keycode)
+    } else {
+        text
+    }
+}
+
+unsafe fn handle_capture_key_down(event: Id) {
+    let keycode: u16 = msg_send![event, keyCode];
+    if keycode == 53 {
+        // Escape
+        cancel_hotkey_capture();
+        return;
+    }
+    let flags: u64 = msg_send![event, modifierFlags];
+    let mask = flags & HOTKEY_MOD_MASK;
+    if mask == 0 && !is_bare_key_allowed(keycode) {
+        // A bare letter would fire (and be swallowed) on normal typing.
+        set_record_button_title("Add a modifier…");
+        return;
+    }
+    let label = format!("{}{}", hotkey_symbols(mask), captured_key_name(event, keycode));
+    finish_hotkey_capture(ResolvedHotkey {
+        mask,
+        keycode: Some(keycode),
+        label,
+    });
+}
+
+extern "C" fn window_key_down(this: &Object, _: Sel, event: Id) {
+    if !HOTKEY_CAPTURING.load(Ordering::SeqCst) {
+        unsafe {
+            let _: () = msg_send![super(this, class!(NSWindow)), keyDown: event];
+        }
+        return;
+    }
+    unsafe { handle_capture_key_down(event) }
+}
+
+extern "C" fn window_perform_key_equivalent(this: &Object, _: Sel, event: Id) -> BOOL {
+    // ⌘-combos are routed here before keyDown; claim them while capturing.
+    if HOTKEY_CAPTURING.load(Ordering::SeqCst) {
+        unsafe { handle_capture_key_down(event) }
+        return true as BOOL;
+    }
+    unsafe { msg_send![super(this, class!(NSWindow)), performKeyEquivalent: event] }
+}
+
+extern "C" fn window_flags_changed(this: &Object, _: Sel, event: Id) {
+    if !HOTKEY_CAPTURING.load(Ordering::SeqCst) {
+        unsafe {
+            let _: () = msg_send![super(this, class!(NSWindow)), flagsChanged: event];
+        }
+        return;
+    }
+    let flags: u64 = unsafe { msg_send![event, modifierFlags] };
+    let mask = flags & HOTKEY_MOD_MASK;
+
+    if mask != 0 {
+        let seen = HOTKEY_CAPTURE_SEEN.fetch_or(mask, Ordering::SeqCst) | mask;
+        set_record_button_title(&format!("{}…", hotkey_symbols(seen)));
+        return;
+    }
+
+    let seen = HOTKEY_CAPTURE_SEEN.swap(0, Ordering::SeqCst);
+    if seen == 0 {
+        return;
+    }
+    // Modifiers-only combo, finalized on release. Reject a single non-fn
+    // modifier (it would fire on every plain Shift/⌘ press).
+    if seen.count_ones() >= 2 || seen & CG_FLAG_FN != 0 {
+        finish_hotkey_capture(ResolvedHotkey {
+            mask: seen,
+            keycode: None,
+            label: hotkey_symbols(seen),
+        });
+    } else {
+        cancel_hotkey_capture();
+    }
+}
+
+extern "C" fn window_accepts_first_responder(_: &Object, _: Sel) -> BOOL {
+    true as BOOL
+}
+
+fn settings_window_class() -> &'static objc::runtime::Class {
+    static CLASS: OnceLock<ClassPtr> = OnceLock::new();
+    let class_ptr = CLASS.get_or_init(|| {
+        let superclass = class!(NSWindow);
+        let mut decl = ClassDecl::new("ASPSettingsWindow", superclass)
+            .expect("Failed to create ASPSettingsWindow class");
+        unsafe {
+            decl.add_method(
+                sel!(keyDown:),
+                window_key_down as extern "C" fn(&Object, Sel, Id),
+            );
+            decl.add_method(
+                sel!(flagsChanged:),
+                window_flags_changed as extern "C" fn(&Object, Sel, Id),
+            );
+            decl.add_method(
+                sel!(performKeyEquivalent:),
+                window_perform_key_equivalent as extern "C" fn(&Object, Sel, Id) -> BOOL,
+            );
+            decl.add_method(
+                sel!(acceptsFirstResponder),
+                window_accepts_first_responder as extern "C" fn(&Object, Sel) -> BOOL,
+            );
+        }
+        ClassPtr(decl.register() as *const objc::runtime::Class)
+    });
+
+    unsafe { &*class_ptr.0 }
+}
+
+extern "C" fn record_hotkey_pressed(_this: &Object, _: Sel, sender: Id) {
+    HOTKEY_CAPTURING.store(true, Ordering::SeqCst);
+    HOTKEY_CAPTURE_SEEN.store(0, Ordering::SeqCst);
+    set_record_button_title("Press shortcut…");
+    unsafe {
+        let window: Id = msg_send![sender, window];
+        let _: BOOL = msg_send![window, makeFirstResponder: window];
     }
 }
 
@@ -278,6 +547,10 @@ fn settings_target_class() -> &'static objc::runtime::Class {
                 hotkey_changed as extern "C" fn(&Object, Sel, Id),
             );
             decl.add_method(
+                sel!(recordHotkeyPressed:),
+                record_hotkey_pressed as extern "C" fn(&Object, Sel, Id),
+            );
+            decl.add_method(
                 sel!(windowWillClose:),
                 window_will_close as extern "C" fn(&Object, Sel, Id),
             );
@@ -318,7 +591,7 @@ impl SettingsWindow {
                 let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height));
                 let style_mask = NS_WINDOW_STYLE_MASK_TITLED | NS_WINDOW_STYLE_MASK_CLOSABLE;
 
-                let window: Id = msg_send![class!(NSWindow), alloc];
+                let window: Id = msg_send![settings_window_class(), alloc];
                 let window: Id = msg_send![
                     window,
                     initWithContentRect: frame
@@ -470,13 +743,14 @@ impl SettingsWindow {
                 let _: () = msg_send![tab2_view, addSubview: hotkey_label];
 
                 let hotkey_popup_frame =
-                    NSRect::new(NSPoint::new(20.0, 266.0), NSSize::new(260.0, 26.0));
+                    NSRect::new(NSPoint::new(20.0, 266.0), NSSize::new(200.0, 26.0));
                 let hotkey_popup: Id = msg_send![class!(NSPopUpButton), alloc];
                 let hotkey_popup: Id = msg_send![
                     hotkey_popup,
                     initWithFrame: hotkey_popup_frame pullsDown: false as BOOL
                 ];
 
+                let custom_hotkey = ResolvedHotkey::parse_custom(&settings.speech_to_text.hotkey);
                 let hotkeys = AppSettings::supported_hotkeys();
                 let mut selected_hotkey_index: i64 = 0;
                 for (i, hotkey) in hotkeys.iter().enumerate() {
@@ -485,10 +759,34 @@ impl SettingsWindow {
                         selected_hotkey_index = i as i64;
                     }
                 }
+                // A recorded custom combo leaves the preset list deselected.
+                if custom_hotkey.is_some() {
+                    selected_hotkey_index = -1;
+                }
                 let _: () = msg_send![hotkey_popup, selectItemAtIndex: selected_hotkey_index];
                 let _: () = msg_send![hotkey_popup, setTarget: target];
                 let _: () = msg_send![hotkey_popup, setAction: sel!(hotkeyChanged:)];
                 let _: () = msg_send![tab2_view, addSubview: hotkey_popup];
+
+                // "Record…" button: capture any modifier+key combination
+                let record_frame =
+                    NSRect::new(NSPoint::new(228.0, 266.0), NSSize::new(112.0, 26.0));
+                let record_button: Id = msg_send![class!(NSButton), alloc];
+                let record_button: Id = msg_send![record_button, initWithFrame: record_frame];
+                let _: () = msg_send![record_button, setBezelStyle: 1i64];
+                let record_title = custom_hotkey
+                    .as_ref()
+                    .map(|hotkey| hotkey.label.as_str())
+                    .unwrap_or("Record…");
+                let _: () = msg_send![record_button, setTitle: nsstring(record_title)];
+                let _: () = msg_send![record_button, setTarget: target];
+                let _: () = msg_send![record_button, setAction: sel!(recordHotkeyPressed:)];
+                let _: () = msg_send![tab2_view, addSubview: record_button];
+
+                HOTKEY_CAPTURING.store(false, Ordering::SeqCst);
+                HOTKEY_STATE.store(state_ptr_send.into_ptr(), Ordering::SeqCst);
+                HOTKEY_RECORD_BUTTON.store(record_button as *mut c_void, Ordering::SeqCst);
+                HOTKEY_POPUP.store(hotkey_popup as *mut c_void, Ordering::SeqCst);
 
                 // Model selector
                 let model_label_frame =
@@ -713,9 +1011,12 @@ impl SettingsWindow {
 /// Show the settings window and save if user clicks Save
 pub fn show_settings() -> Option<AppSettings> {
     let window = SettingsWindow::new();
-    let result = window.run_modal();
+    let mut result = window.run_modal();
 
-    if let Some(ref settings) = result {
+    if let Some(ref mut settings) = result {
+        // The window doesn't edit the force override; keep whatever the
+        // popover control set while the window was open.
+        settings.sleep_prevention.force = AppSettings::load().sleep_prevention.force;
         if let Err(e) = settings.save() {
             crate::logging::log(&format!("[settings] Failed to save settings: {}", e));
         }

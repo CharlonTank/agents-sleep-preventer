@@ -31,7 +31,9 @@ mod ffi {
     pub const K_CG_HEAD_INSERT_EVENT_TAP: CGEventTapPlacement = 0;
 
     pub type CGEventTapOptions = u32;
-    pub const K_CG_EVENT_TAP_OPTION_LISTEN_ONLY: CGEventTapOptions = 1;
+    /// Active tap: lets the callback swallow the trigger key of a custom
+    /// shortcut so it doesn't leak into the focused app.
+    pub const K_CG_EVENT_TAP_OPTION_DEFAULT: CGEventTapOptions = 0;
 
     pub type CGEventMask = u64;
     pub type CGEventField = u32;
@@ -157,12 +159,23 @@ static LAST_FLAGS_RAW: AtomicU64 = AtomicU64::new(0);
 static LAST_KEYCODE: AtomicU64 = AtomicU64::new(u64::MAX);
 // Default: Fn + Shift. Overridden by `set_required_mask` from the user's settings.
 static REQUIRED_MASK: AtomicU64 = AtomicU64::new(0x00800000 | 0x00020000);
+/// Regular key (CGKeyCode) that must be held along with the modifiers for a
+/// user-recorded shortcut; u64::MAX = modifiers only.
+static REQUIRED_KEYCODE: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Set which combination of modifier keys (as a CGEventFlags bitmask) must be
 /// held together to start/stop dictation. Takes effect on the next key event,
 /// no listener restart needed.
 pub fn set_required_mask(mask: u64) {
     REQUIRED_MASK.store(mask, Ordering::Relaxed);
+}
+
+/// Set the regular key that completes the shortcut (None = modifiers only).
+pub fn set_required_keycode(keycode: Option<u16>) {
+    REQUIRED_KEYCODE.store(
+        keycode.map(u64::from).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
 }
 
 fn callback_state() -> &'static Mutex<Option<CallbackState>> {
@@ -200,7 +213,30 @@ pub fn take_diagnostics() -> GlobeKeyDiagnostics {
 
 struct CallbackState {
     is_dictating: bool,
+    /// Current modifier flags, tracked across flagsChanged events.
+    current_flags: u64,
+    /// Whether the custom shortcut's regular key is currently held.
+    key_down: bool,
     tx: Sender<GlobeKeyEvent>,
+}
+
+impl CallbackState {
+    /// Recompute the dictation state from the held modifiers/key and emit
+    /// start/stop transitions.
+    fn sync(&mut self, required_mask: u64, required_keycode: u64) {
+        let mods_ok = (self.current_flags & required_mask) == required_mask;
+        let key_ok = required_keycode == u64::MAX || self.key_down;
+        let configured = required_mask != 0 || required_keycode != u64::MAX;
+        let should_dictate = configured && mods_ok && key_ok;
+
+        if should_dictate && !self.is_dictating {
+            self.is_dictating = true;
+            let _ = self.tx.send(GlobeKeyEvent::DictateStart);
+        } else if !should_dictate && self.is_dictating {
+            self.is_dictating = false;
+            let _ = self.tx.send(GlobeKeyEvent::DictateStop);
+        }
+    }
 }
 
 extern "C" fn event_tap_callback(
@@ -227,34 +263,53 @@ extern "C" fn event_tap_callback(
         return event;
     }
 
-    if event_type != ffi::K_CG_EVENT_FLAGS_CHANGED {
-        return event;
-    }
+    let required_mask = REQUIRED_MASK.load(Ordering::Relaxed);
+    let required_keycode = REQUIRED_KEYCODE.load(Ordering::Relaxed);
 
     unsafe {
         let mut state_guard = callback_state().lock().unwrap();
-        if let Some(state) = state_guard.as_mut() {
-            let flags = ffi::CGEventGetFlags(event);
-            let keycode = ffi::CGEventGetIntegerValueField(event, ffi::K_CG_KEYBOARD_EVENT_KEYCODE);
-            FLAGS_EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
-            LAST_FLAGS_RAW.store(flags, Ordering::Relaxed);
-            LAST_KEYCODE.store(keycode as u64, Ordering::Relaxed);
+        let Some(state) = state_guard.as_mut() else {
+            return event;
+        };
 
-            let required_mask = REQUIRED_MASK.load(Ordering::Relaxed);
-            let should_dictate = required_mask != 0 && (flags & required_mask) == required_mask;
-            let was_dictating = state.is_dictating;
+        match event_type {
+            ffi::K_CG_EVENT_FLAGS_CHANGED => {
+                let flags = ffi::CGEventGetFlags(event);
+                let keycode =
+                    ffi::CGEventGetIntegerValueField(event, ffi::K_CG_KEYBOARD_EVENT_KEYCODE);
+                FLAGS_EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
+                LAST_FLAGS_RAW.store(flags, Ordering::Relaxed);
+                LAST_KEYCODE.store(keycode as u64, Ordering::Relaxed);
 
-            if should_dictate && !was_dictating {
-                state.is_dictating = true;
-                let _ = state.tx.send(GlobeKeyEvent::DictateStart);
-            } else if !should_dictate && was_dictating {
-                state.is_dictating = false;
-                let _ = state.tx.send(GlobeKeyEvent::DictateStop);
+                state.current_flags = flags;
+                state.sync(required_mask, required_keycode);
+                event
             }
+            ffi::K_CG_EVENT_KEY_DOWN | ffi::K_CG_EVENT_KEY_UP => {
+                if required_keycode == u64::MAX {
+                    return event;
+                }
+                let keycode =
+                    ffi::CGEventGetIntegerValueField(event, ffi::K_CG_KEYBOARD_EVENT_KEYCODE);
+                if keycode as u64 != required_keycode {
+                    return event;
+                }
+
+                let was_active = state.is_dictating;
+                state.key_down = event_type == ffi::K_CG_EVENT_KEY_DOWN;
+                state.sync(required_mask, required_keycode);
+
+                // Swallow the trigger key (including auto-repeats) whenever
+                // it starts, sustains, or ends dictation, so it doesn't leak
+                // a keystroke into the focused app.
+                if state.is_dictating || was_active {
+                    return std::ptr::null_mut();
+                }
+                event
+            }
+            _ => event,
         }
     }
-
-    event
 }
 
 fn run_event_tap(tx: Sender<GlobeKeyEvent>, stop_flag: Arc<AtomicBool>) {
@@ -265,6 +320,8 @@ fn run_event_tap(tx: Sender<GlobeKeyEvent>, stop_flag: Arc<AtomicBool>) {
         let mut state_guard = callback_state().lock().unwrap();
         *state_guard = Some(CallbackState {
             is_dictating: false,
+            current_flags: 0,
+            key_down: false,
             tx: tx.clone(),
         });
     }
@@ -279,7 +336,7 @@ fn run_event_tap(tx: Sender<GlobeKeyEvent>, stop_flag: Arc<AtomicBool>) {
         ffi::CGEventTapCreate(
             ffi::K_CG_SESSION_EVENT_TAP,
             ffi::K_CG_HEAD_INSERT_EVENT_TAP,
-            ffi::K_CG_EVENT_TAP_OPTION_LISTEN_ONLY,
+            ffi::K_CG_EVENT_TAP_OPTION_DEFAULT,
             event_mask,
             event_tap_callback,
             std::ptr::null_mut(),

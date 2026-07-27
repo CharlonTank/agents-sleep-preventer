@@ -1,3 +1,5 @@
+import ApplicationServices
+import AVFoundation
 import Cocoa
 import Carbon
 import Sparkle
@@ -34,17 +36,32 @@ struct AgentGroup {
     }
 }
 
+/// Manual override of the sleep behavior (mirrors the CLI's `asp force`).
+enum SleepOverride: String {
+    case auto
+    case awake
+    case sleep
+}
+
 struct InstanceList {
     let agents: [AgentInstance]
     let activeCount: Int
     let hooksInstalled: Bool
     let sleepDisabled: Bool
     let manualEnabled: Bool
+    let force: SleepOverride
     let thermalWarning: Bool
 
     static let empty = InstanceList(
         agents: [], activeCount: 0, hooksInstalled: true, sleepDisabled: false,
-        manualEnabled: true, thermalWarning: false)
+        manualEnabled: true, force: .auto, thermalWarning: false)
+
+    func withForce(_ value: SleepOverride) -> InstanceList {
+        InstanceList(
+            agents: agents, activeCount: activeCount, hooksInstalled: hooksInstalled,
+            sleepDisabled: sleepDisabled, manualEnabled: manualEnabled,
+            force: value, thermalWarning: thermalWarning)
+    }
 
     func agents(in state: AgentState) -> [AgentInstance] {
         agents.filter { $0.state == state }
@@ -171,6 +188,7 @@ private final class AgentPopoverViewController: NSViewController {
     var onSettings: (() -> Void)?
     var onInstallHooks: (() -> Void)?
     var onMore: ((NSButton) -> Void)?
+    var onSleepOverride: ((SleepOverride) -> Void)?
 
     private var currentList = InstanceList.empty
     private var showAllIdle = false
@@ -213,6 +231,14 @@ private final class AgentPopoverViewController: NSViewController {
         root.addArrangedSubview(bottomRule)
         bottomRule.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
 
+        let forceAwakeRow = makeSleepOverrideRow(for: list)
+        root.addArrangedSubview(forceAwakeRow)
+        forceAwakeRow.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
+        let footerRule = separator()
+        root.addArrangedSubview(footerRule)
+        footerRule.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+
         let footer = makeFooter(for: list)
         root.addArrangedSubview(footer)
         footer.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
@@ -223,6 +249,7 @@ private final class AgentPopoverViewController: NSViewController {
             root.topAnchor.constraint(equalTo: view.topAnchor),
             root.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             header.heightAnchor.constraint(equalToConstant: 76),
+            forceAwakeRow.heightAnchor.constraint(equalToConstant: 46),
             footer.heightAnchor.constraint(equalToConstant: 50),
             scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 120),
         ])
@@ -230,7 +257,7 @@ private final class AgentPopoverViewController: NSViewController {
         let rowCount = list.groups(in: .attention).count
             + list.groups(in: .working).count
             + min(list.groups(in: .idle).count, showAllIdle ? 8 : 3)
-        let height = min(640, max(330, 180 + (rowCount * 54)))
+        let height = min(686, max(376, 226 + (rowCount * 54)))
         preferredContentSize = NSSize(width: 390, height: height)
     }
 
@@ -439,6 +466,34 @@ private final class AgentPopoverViewController: NSViewController {
         return container
     }
 
+    private func makeSleepOverrideRow(for list: InstanceList) -> NSView {
+        let row = NSView()
+
+        let control = NSSegmentedControl(
+            labels: ["Force sleep", "Auto", "Force awake"],
+            trackingMode: .selectOne,
+            target: self,
+            action: #selector(sleepOverrideChanged(_:))
+        )
+        control.controlSize = .small
+        control.segmentDistribution = .fillEqually
+        switch list.force {
+        case .sleep: control.selectedSegment = 0
+        case .auto: control.selectedSegment = 1
+        case .awake: control.selectedSegment = 2
+        }
+        control.setAccessibilityLabel("Sleep override")
+        control.translatesAutoresizingMaskIntoConstraints = false
+
+        row.addSubview(control)
+        NSLayoutConstraint.activate([
+            control.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 18),
+            control.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -18),
+            control.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+        ])
+        return row
+    }
+
     private func makeFooter(for list: InstanceList) -> NSView {
         let footer = NSView()
         let settings = NSButton(title: "Settings", target: self, action: #selector(openSettings))
@@ -489,6 +544,12 @@ private final class AgentPopoverViewController: NSViewController {
         if list.thermalWarning {
             text = "THERMAL"
             color = .systemRed
+        } else if list.force == .awake {
+            text = "FORCED AWAKE"
+            color = .systemIndigo
+        } else if list.force == .sleep {
+            text = "FORCED SLEEP"
+            color = .systemOrange
         } else if list.sleepDisabled {
             text = "MAC AWAKE"
             color = .systemGreen
@@ -610,6 +671,16 @@ private final class AgentPopoverViewController: NSViewController {
         onSettings?()
     }
 
+    @objc private func sleepOverrideChanged(_ sender: NSSegmentedControl) {
+        let mode: SleepOverride
+        switch sender.selectedSegment {
+        case 0: mode = .sleep
+        case 2: mode = .awake
+        default: mode = .auto
+        }
+        onSleepOverride?(mode)
+    }
+
     @objc private func installHooks() {
         onInstallHooks?()
     }
@@ -627,6 +698,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var latestList = InstanceList.empty
     private var isRefreshing = false
     private var refreshPopoverOnNextList = false
+    private var refreshRequestedWhileFetching = false
+    private var pendingForce: SleepOverride?
+    private let forceAwakeQueue = DispatchQueue(label: "asp.forceawake")
+    private var permissionsWindow: NSWindow?
+    private var permissionsTimer: Timer?
+    private var lastAccessibilityGranted = false
     private var isInstalling = false
     private var isUninstalling = false
     private var statusRefreshTimer: Timer?
@@ -677,6 +754,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popoverController.onMore = { [weak self] button in
             self?.showMoreMenu(from: button)
         }
+        popoverController.onSleepOverride = { [weak self] mode in
+            self?.setSleepOverride(mode)
+        }
 
         if isPreview {
             apply(previewList())
@@ -693,10 +773,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshMenu()
         startStatusRefreshTimer()
         promptInstallHooksIfNeeded()
+        if !allPermissionsGranted() {
+            showPermissionsPanel()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         statusRefreshTimer?.invalidate()
+        permissionsTimer?.invalidate()
         if !isPreview {
             unregisterHotKeys()
             stopAgent()
@@ -753,6 +837,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func setSleepOverride(_ mode: SleepOverride) {
+        // Optimistic local update so intermediate renders keep the new state;
+        // apply() overlays pendingForce onto snapshots fetched before the
+        // CLI write lands.
+        latestList = latestList.withForce(mode)
+        pendingForce = mode
+        updateStatusTitle(with: latestList)
+        if isPreview {
+            popoverController.render(latestList)
+            pendingForce = nil
+            return
+        }
+
+        let cliPath = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/MacOS/asp")
+        // Serial queue: rapid clicks must reach the CLI in order, each
+        // load-modify-save finishing before the next starts.
+        forceAwakeQueue.async {
+            let process = Process()
+            process.executableURL = cliPath
+            process.arguments = ["force", mode.rawValue]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            do {
+                try process.run()
+                process.waitUntilExit()
+            } catch {
+                NSLog("Failed to set force mode: \(error)")
+            }
+            DispatchQueue.main.async {
+                // Only the newest click's completion clears the overlay
+                if self.pendingForce == mode {
+                    self.pendingForce = nil
+                }
+                self.refreshMenu()
+            }
+        }
+    }
+
     private func startAgent() {
         guard agentProcess == nil else { return }
         let agentURL = Bundle.main.bundleURL
@@ -792,6 +915,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refreshMenu(updatePopover: Bool = true) {
         refreshPopoverOnNextList = refreshPopoverOnNextList || updatePopover
         if isRefreshing {
+            // Re-fetch once the in-flight fetch lands: its snapshot may
+            // predate the write that motivated this request (e.g. the
+            // force-awake toggle) and must not be the final word.
+            refreshRequestedWhileFetching = true
             return
         }
         isRefreshing = true
@@ -802,6 +929,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.refreshPopoverOnNextList = false
                 self.apply(list, updatePopover: shouldUpdatePopover)
                 self.isRefreshing = false
+                if self.refreshRequestedWhileFetching {
+                    self.refreshRequestedWhileFetching = false
+                    self.refreshMenu(updatePopover: shouldUpdatePopover)
+                }
             }
         }
     }
@@ -819,6 +950,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func apply(_ list: InstanceList, updatePopover: Bool = true) {
+        var list = list
+        if let pending = pendingForce {
+            // A force write is in flight; this snapshot may predate it
+            list = list.withForce(pending)
+        }
         latestList = list
         updateStatusTitle(with: list)
         if updatePopover && popover.isShown {
@@ -850,7 +986,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard process.terminationStatus == 0 else {
             return InstanceList(
                 agents: [], activeCount: 0, hooksInstalled: hooksInstalled, sleepDisabled: false,
-                manualEnabled: true, thermalWarning: false)
+                manualEnabled: true, force: .auto, thermalWarning: false)
         }
 
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
@@ -859,7 +995,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         else {
             return InstanceList(
                 agents: [], activeCount: 0, hooksInstalled: hooksInstalled, sleepDisabled: false,
-                manualEnabled: true, thermalWarning: false)
+                manualEnabled: true, force: .auto, thermalWarning: false)
         }
 
         let agents = parseAgents(from: json)
@@ -868,12 +1004,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let sleepDisabled = (json["sleep_disabled"] as? NSNumber)?.boolValue ?? false
         let manualEnabled = (json["manual_enabled"] as? NSNumber)?.boolValue ?? true
+        let force = (json["force"] as? String).flatMap(SleepOverride.init(rawValue:)) ?? .auto
         let thermalWarning = (json["thermal_warning"] as? NSNumber)?.boolValue ?? false
 
         return InstanceList(
             agents: agents, activeCount: activeCount, hooksInstalled: hooksInstalled,
             sleepDisabled: sleepDisabled, manualEnabled: manualEnabled,
-            thermalWarning: thermalWarning)
+            force: force, thermalWarning: thermalWarning)
     }
 
     private func parseAgents(from json: [String: Any]) -> [AgentInstance] {
@@ -973,7 +1110,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         button.image = nil
-        if list.sleepDisabled {
+        // Under a thermal warning the CLI releases the sleep assertion even
+        // when forced, so the title must not claim the Mac is kept awake.
+        let forcedAwake = list.force == .awake && !list.thermalWarning
+        if forcedAwake && list.activeCount == 0 {
+            button.title = "ON"
+            button.setAccessibilityLabel("Force keep awake enabled")
+        } else if list.sleepDisabled || forcedAwake {
             let count = max(list.activeCount, 1)
             button.title = "ON \(count)"
             let noun = count == 1 ? "agent" : "agents"
@@ -996,6 +1139,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         hooks.target = self
         menu.addItem(hooks)
+
+        let permissions = NSMenuItem(
+            title: "Permissions...",
+            action: #selector(showPermissionsPanelAction),
+            keyEquivalent: ""
+        )
+        permissions.target = self
+        menu.addItem(permissions)
 
         let updates = NSMenuItem(
             title: "Check for Updates...",
@@ -1068,6 +1219,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             hooksInstalled: true,
             sleepDisabled: true,
             manualEnabled: true,
+            force: .auto,
             thermalWarning: false
         )
     }
@@ -1209,11 +1361,217 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: - Permissions panel
+    //
+    // ASP needs exactly two TCC permissions, both for dictation:
+    // Accessibility (hotkey event tap + text insertion) and Microphone.
+    // The panel shows what's missing, deep-links to the right System
+    // Settings pane, and re-checks live; once Accessibility appears the
+    // agent is restarted so the hotkey listener actually starts.
+
+    private func accessibilityGranted() -> Bool {
+        AXIsProcessTrusted()
+    }
+
+    private func allPermissionsGranted() -> Bool {
+        accessibilityGranted()
+            && AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+    }
+
+    @objc private func showPermissionsPanelAction() {
+        popover.performClose(nil)
+        showPermissionsPanel()
+    }
+
+    private func showPermissionsPanel() {
+        if permissionsWindow == nil {
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 430, height: 190),
+                styleMask: [.titled, .closable],
+                backing: .buffered,
+                defer: false
+            )
+            window.title = "ASP Permissions"
+            window.isReleasedWhenClosed = false
+            window.center()
+            permissionsWindow = window
+        }
+        lastAccessibilityGranted = accessibilityGranted()
+        renderPermissions()
+
+        permissionsTimer?.invalidate()
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.permissionsTick()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        permissionsTimer = timer
+
+        NSApp.activate(ignoringOtherApps: true)
+        permissionsWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    private func permissionsTick() {
+        guard let window = permissionsWindow, window.isVisible else {
+            permissionsTimer?.invalidate()
+            permissionsTimer = nil
+            return
+        }
+        let granted = accessibilityGranted()
+        if granted && !lastAccessibilityGranted && !isPreview {
+            // The hotkey listener only starts at agent launch; pick the
+            // fresh grant up immediately.
+            stopAgent()
+            startAgent()
+        }
+        lastAccessibilityGranted = granted
+        renderPermissions()
+    }
+
+    private func renderPermissions() {
+        guard let window = permissionsWindow else { return }
+
+        let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+        let micRow: NSView
+        switch micStatus {
+        case .authorized:
+            micRow = permissionRow(
+                name: "Microphone",
+                caption: "Voice recording for dictation",
+                granted: true, actionTitle: "", action: nil)
+        case .notDetermined:
+            micRow = permissionRow(
+                name: "Microphone",
+                caption: "Voice recording for dictation",
+                granted: false, actionTitle: "Allow…",
+                action: #selector(requestMicAccess))
+        default:
+            micRow = permissionRow(
+                name: "Microphone",
+                caption: "Voice recording for dictation",
+                granted: false, actionTitle: "Open Settings…",
+                action: #selector(openMicSettings))
+        }
+
+        let stack = NSStackView(views: [
+            permissionRow(
+                name: "Accessibility",
+                caption: "Dictation hotkey and text insertion",
+                granted: accessibilityGranted(),
+                actionTitle: "Open Settings…",
+                action: #selector(openAccessibilitySettings)),
+            micRow,
+            {
+                let note = label(
+                    allPermissionsGranted()
+                        ? "Everything is in place."
+                        : "Statuses refresh automatically once granted.",
+                    size: 11,
+                    color: .secondaryLabelColor
+                )
+                return note
+            }(),
+        ])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 16
+        stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 16, right: 20)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let container = NSView()
+        container.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: container.topAnchor),
+        ])
+        window.contentView = container
+        for row in stack.arrangedSubviews where row is NSStackView {
+            row.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
+        }
+    }
+
+    private func permissionRow(
+        name: String,
+        caption: String,
+        granted: Bool,
+        actionTitle: String,
+        action: Selector?
+    ) -> NSView {
+        let dot = label("●", size: 13, color: granted ? .systemGreen : .systemRed)
+
+        let title = label(name, size: 13, weight: .semibold, color: .labelColor)
+        let detail = label(caption, size: 11, color: .secondaryLabelColor)
+        let text = NSStackView(views: [title, detail])
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 2
+        text.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let row = NSStackView(views: [dot, text])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+
+        if granted {
+            row.addArrangedSubview(label("Granted", size: 11, color: .systemGreen))
+        } else if let action {
+            let button = NSButton(title: actionTitle, target: self, action: action)
+            button.bezelStyle = .rounded
+            button.controlSize = .small
+            row.addArrangedSubview(button)
+        }
+        return row
+    }
+
+    /// Reuses the popover's label style for the permissions panel.
+    private func label(
+        _ text: String,
+        size: CGFloat,
+        weight: NSFont.Weight = .regular,
+        color: NSColor
+    ) -> NSTextField {
+        let field = NSTextField(labelWithString: text)
+        field.font = NSFont.systemFont(ofSize: size, weight: weight)
+        field.textColor = color
+        field.lineBreakMode = .byTruncatingTail
+        field.maximumNumberOfLines = 1
+        return field
+    }
+
+    @objc private func openAccessibilitySettings() {
+        // Prompts (once per app) and auto-adds ASP to the Accessibility list
+        let options =
+            [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        AXIsProcessTrustedWithOptions(options)
+        if let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        ) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc private func requestMicAccess() {
+        AVCaptureDevice.requestAccess(for: .audio) { _ in
+            DispatchQueue.main.async {
+                self.renderPermissions()
+            }
+        }
+    }
+
+    @objc private func openMicSettings() {
+        if let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+        ) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     private func isHooksInstalled() -> Bool {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let claudeHooksPath = home
             .appendingPathComponent(".claude/hooks/prevent-sleep.sh")
         let hasClaudeHooks = FileManager.default.fileExists(atPath: claudeHooksPath.path)
+            && claudeSubagentHookInstalled(home)
 
         let codexHooksPath = home.appendingPathComponent(".codex/hooks.json")
         guard
@@ -1227,6 +1585,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             || hooksText.contains("/usr/local/bin/asp")
             || hooksText.contains("/usr/local/bin/agents-sleep-preventer")
         return hasClaudeHooks && hasCodexHooks
+    }
+
+    /// Mirrors the CLI's is_claude_hooks_installed: upgrades from
+    /// pre-subagent versions must re-run setup to pick up the
+    /// SubagentStart/SubagentStop/PostToolUse keep-awake hooks.
+    private func claudeSubagentHookInstalled(_ home: URL) -> Bool {
+        let settingsPath = home.appendingPathComponent(".claude/settings.json")
+        guard let data = try? Data(contentsOf: settingsPath) else {
+            return false // missing file: setup can create it
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            // Unparseable settings.json: `asp install` would fail on the same
+            // parse, so prompting setup could never succeed. Fail open like
+            // the CLI and run with the existing script-based hooks.
+            return true
+        }
+        guard
+            let hooks = json["hooks"] as? [String: Any],
+            let groups = hooks["SubagentStop"],
+            let groupsData = try? JSONSerialization.data(withJSONObject: groups),
+            let groupsText = String(data: groupsData, encoding: .utf8)
+        else {
+            return false
+        }
+        return groupsText.contains("refresh-sleep.sh")
     }
 
     private func promptInstallHooksIfNeeded() {

@@ -6,16 +6,45 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// Manual override of the sleep behavior (popover tri-state control).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SleepOverride {
+    /// Prevent sleep while agents are working (normal behavior).
+    #[default]
+    Auto,
+    /// Keep the Mac awake even when no agent is working.
+    ForceAwake,
+    /// Never prevent sleep, even while agents are working.
+    ForceSleep,
+}
+
+impl SleepOverride {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::ForceAwake => "awake",
+            Self::ForceSleep => "sleep",
+        }
+    }
+}
+
 /// Sleep prevention settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SleepPreventionSettings {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Manual override: force-awake / force-sleep / auto.
+    #[serde(default)]
+    pub force: SleepOverride,
 }
 
 impl Default for SleepPreventionSettings {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            force: SleepOverride::Auto,
+        }
     }
 }
 
@@ -67,12 +96,62 @@ pub struct HotkeyChoice {
     pub mask: u64,
 }
 
+/// The dictation shortcut actually in effect: either a preset modifier combo
+/// or a user-recorded one (`custom:<mask-hex>:<keycode|none>:<label>`),
+/// which may include a regular key on top of the modifiers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedHotkey {
+    /// CGEventFlags modifier bits that must all be held.
+    pub mask: u64,
+    /// Regular key (CGKeyCode) that must be held too, if any.
+    pub keycode: Option<u16>,
+    /// Human-readable label.
+    pub label: String,
+}
+
+impl ResolvedHotkey {
+    /// Persisted id for a user-recorded shortcut.
+    pub fn custom_id(&self) -> String {
+        format!(
+            "custom:{:x}:{}:{}",
+            self.mask,
+            self.keycode
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            self.label
+        )
+    }
+
+    /// Parse a `custom:` id; None when it is not one or is malformed.
+    pub fn parse_custom(id: &str) -> Option<Self> {
+        let rest = id.strip_prefix("custom:")?;
+        let mut parts = rest.splitn(3, ':');
+        let mask = u64::from_str_radix(parts.next()?, 16).ok()?;
+        let key_part = parts.next()?;
+        let keycode = if key_part == "none" {
+            None
+        } else {
+            Some(key_part.parse().ok()?)
+        };
+        let label = parts.next().unwrap_or("Custom").to_string();
+        if mask == 0 && keycode.is_none() {
+            return None;
+        }
+        Some(Self {
+            mask,
+            keycode,
+            label,
+        })
+    }
+}
+
 // CGEventFlags modifier bits (Core Graphics / Quartz Event Services).
-const CG_FLAG_SHIFT: u64 = 0x00020000;
-const CG_FLAG_CONTROL: u64 = 0x00040000;
-const CG_FLAG_OPTION: u64 = 0x00080000;
-const CG_FLAG_COMMAND: u64 = 0x00100000;
-const CG_FLAG_FN: u64 = 0x00800000;
+// Same values as the NSEvent device-independent modifier flags.
+pub const CG_FLAG_SHIFT: u64 = 0x00020000;
+pub const CG_FLAG_CONTROL: u64 = 0x00040000;
+pub const CG_FLAG_OPTION: u64 = 0x00080000;
+pub const CG_FLAG_COMMAND: u64 = 0x00100000;
+pub const CG_FLAG_FN: u64 = 0x00800000;
 
 /// Transcription engine backing a model choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,7 +295,12 @@ impl AppSettings {
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize settings: {}", e))?;
 
-        fs::write(&path, content).map_err(|e| format!("Failed to write settings: {}", e))
+        // Atomic tmp+rename: other asp processes read this file every sync,
+        // and a raced truncate-then-write would deserialize as defaults. The
+        // pid suffix keeps two concurrent short-lived writers apart.
+        let tmp = path.with_file_name(format!("settings.json.{}.tmp", std::process::id()));
+        fs::write(&tmp, content).map_err(|e| format!("Failed to write settings: {}", e))?;
+        fs::rename(&tmp, &path).map_err(|e| format!("Failed to persist settings: {}", e))
     }
 
     /// Get the list of supported languages for speech-to-text
@@ -315,6 +399,20 @@ impl AppSettings {
             .copied()
             .unwrap_or(hotkeys[0])
     }
+
+    /// The dictation shortcut in effect: a user-recorded `custom:` combo
+    /// wins, otherwise the selected preset (with its usual fallback).
+    pub fn resolved_hotkey(&self) -> ResolvedHotkey {
+        if let Some(custom) = ResolvedHotkey::parse_custom(&self.speech_to_text.hotkey) {
+            return custom;
+        }
+        let preset = self.selected_hotkey();
+        ResolvedHotkey {
+            mask: preset.mask,
+            keycode: None,
+            label: preset.label.to_string(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -334,6 +432,8 @@ mod tests {
         let json = r#"{"sleep_prevention": {"enabled": false}}"#;
         let settings: AppSettings = serde_json::from_str(json).unwrap();
         assert!(!settings.sleep_prevention.enabled);
+        // Fields absent from older settings files get their defaults
+        assert_eq!(settings.sleep_prevention.force, SleepOverride::Auto);
         // speech_to_text should have defaults
         assert_eq!(settings.speech_to_text.language, "en");
     }
@@ -363,5 +463,38 @@ mod tests {
 
         settings.speech_to_text.hotkey = "bogus".to_string();
         assert_eq!(settings.selected_hotkey().id, "fn_shift");
+    }
+
+    #[test]
+    fn test_custom_hotkey_roundtrip_and_resolution() {
+        let custom = ResolvedHotkey {
+            mask: CG_FLAG_COMMAND | CG_FLAG_OPTION,
+            keycode: Some(49),
+            label: "⌥⌘Space".to_string(),
+        };
+        let parsed = ResolvedHotkey::parse_custom(&custom.custom_id()).unwrap();
+        assert_eq!(parsed, custom);
+
+        let mut settings = AppSettings::default();
+        settings.speech_to_text.hotkey = custom.custom_id();
+        assert_eq!(settings.resolved_hotkey(), custom);
+
+        // Preset ids resolve through the preset table
+        settings.speech_to_text.hotkey = "fn_shift".to_string();
+        let resolved = settings.resolved_hotkey();
+        assert_eq!(resolved.mask, CG_FLAG_FN | CG_FLAG_SHIFT);
+        assert_eq!(resolved.keycode, None);
+
+        // Malformed / degenerate customs fall back to the preset default
+        assert!(ResolvedHotkey::parse_custom("custom:0:none:Nothing").is_none());
+        assert!(ResolvedHotkey::parse_custom("custom:zz:12:Bad").is_none());
+
+        // Labels containing ':' survive the roundtrip
+        let weird = ResolvedHotkey {
+            mask: CG_FLAG_CONTROL,
+            keycode: Some(41),
+            label: "⌃:".to_string(),
+        };
+        assert_eq!(ResolvedHotkey::parse_custom(&weird.custom_id()).unwrap(), weird);
     }
 }

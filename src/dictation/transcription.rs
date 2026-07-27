@@ -241,12 +241,63 @@ impl WhisperTranscriber {
     }
 }
 
-/// Spawn the Parakeet streaming thread: loads the model once, re-transcribes
-/// the live buffer periodically for the preview, then produces the final text
-/// when `stop` is set (model already loaded, so the final pass is instant).
-// ponytail: partials re-transcribe the whole buffer each pass; latency grows
-// with dictation length — window the preview audio if minute-long dictations
-// ever feel laggy.
+/// Commit the transcript in chunks while recording so the hotkey release
+/// only has to transcribe the last few seconds, never the whole recording.
+const COMMIT_TARGET_SECS: usize = 15;
+/// Search for the quietest cut point this far back from the commit target,
+/// so chunks split on a natural pause instead of mid-word.
+const COMMIT_SEARCH_SECS: usize = 5;
+/// Silence padding around each transcribed snippet to soften edge effects.
+const SNIPPET_PAD_SECS: f32 = 0.2;
+
+/// Quietest 30ms-frame boundary in `raw[from..to]` (channel-aligned).
+fn quietest_cut(raw: &[f32], channels: u16, sample_rate: u32, from: usize, to: usize) -> usize {
+    let channels = channels.max(1) as usize;
+    let frame = ((sample_rate as usize * 30 / 1000) * channels).max(channels);
+    let from = from - (from % channels);
+    let to = to.min(raw.len());
+
+    let mut best = to - (to % channels);
+    let mut best_rms = f32::MAX;
+    let mut offset = from;
+    while offset + frame <= to {
+        let rms = raw[offset..offset + frame]
+            .iter()
+            .map(|s| s * s)
+            .sum::<f32>()
+            / frame as f32;
+        if rms < best_rms {
+            best_rms = rms;
+            best = offset + frame;
+        }
+        offset += frame;
+    }
+    best
+}
+
+/// Transcribe a 16k-mono snippet padded with a little silence; None when
+/// empty or failed.
+fn transcribe_snippet(model: &mut ParakeetModel, samples: &[f32]) -> Option<String> {
+    if samples.is_empty() {
+        return None;
+    }
+    let pad = (SNIPPET_PAD_SECS * 16_000.0) as usize;
+    let mut padded = vec![0.0f32; pad];
+    padded.extend_from_slice(samples);
+    padded.resize(padded.len() + pad, 0.0);
+    model
+        .transcribe_with(&padded, &ParakeetParams::default())
+        .ok()
+        .map(|result| result.text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+/// Spawn the Parakeet streaming thread: loads the model once, then keeps a
+/// running transcript while recording — audio older than ~15s is committed
+/// in chunks cut at natural pauses, and only the uncommitted tail is
+/// re-transcribed for the live preview. On `stop` the final text is the
+/// committed chunks plus one last pass over the tail, so the release is
+/// near-instant regardless of dictation length.
 pub(crate) fn spawn_parakeet_stream(
     model_dir: PathBuf,
     buffer: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
@@ -282,11 +333,20 @@ pub(crate) fn spawn_parakeet_stream(
 
         let snapshot_16k = |raw: &[f32]| super::audio::AudioRecorder::to_16k_mono(raw, channels, sample_rate);
 
+        let commit_target = COMMIT_TARGET_SECS * sample_rate as usize * channels.max(1) as usize;
+        let search_span = COMMIT_SEARCH_SECS * sample_rate as usize * channels.max(1) as usize;
+        let mut committed: Vec<String> = Vec::new();
+        let mut committed_len = 0usize; // raw-domain index of committed audio
+
         let mut last_len = 0usize;
-        while !stop.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(300));
-            if stop.load(Ordering::Relaxed) {
-                break;
+        'stream: while !stop.load(Ordering::Relaxed) {
+            // Sleep in short slices so a hotkey release moves on to the
+            // final pass without waiting out the full interval.
+            for _ in 0..6 {
+                std::thread::sleep(Duration::from_millis(50));
+                if stop.load(Ordering::Relaxed) {
+                    break 'stream;
+                }
             }
             let raw = buffer.lock().unwrap().clone();
             // Skip when no new audio or less than ~0.5s captured.
@@ -294,33 +354,50 @@ pub(crate) fn spawn_parakeet_stream(
                 continue;
             }
             last_len = raw.len();
-            let samples = snapshot_16k(&raw);
-            if let Ok(result) = model.transcribe_with(&samples, &ParakeetParams::default()) {
-                let text = result.text.trim().to_string();
-                if !text.is_empty() {
-                    let _ = partial_tx.send(text);
+
+            // Commit a chunk once the uncommitted tail is long enough, cut
+            // at the quietest frame so words stay whole. One bounded pass
+            // every ~15s of speech; the release never re-pays for it.
+            if raw.len() - committed_len > commit_target {
+                let target = committed_len + commit_target;
+                let cut = quietest_cut(&raw, channels, sample_rate, target - search_span, target);
+                if cut > committed_len {
+                    let chunk = snapshot_16k(&raw[committed_len..cut]);
+                    if let Some(text) = transcribe_snippet(&mut model, &chunk) {
+                        committed.push(text);
+                    }
+                    committed_len = cut;
                 }
+            }
+
+            // Preview = committed transcript + a fresh pass on the tail.
+            let tail = snapshot_16k(&raw[committed_len..]);
+            if let Some(text) = transcribe_snippet(&mut model, &tail) {
+                let preview = committed
+                    .iter()
+                    .map(String::as_str)
+                    .chain(std::iter::once(text.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let _ = partial_tx.send(preview);
             }
         }
 
-        // Final pass on the complete recording.
+        // Final: committed chunks + one last pass over the short tail only.
         let raw = buffer.lock().unwrap().clone();
-        let samples = snapshot_16k(&raw);
-        let outcome = if samples.len() < 1600 {
+        let tail = snapshot_16k(&raw[committed_len.min(raw.len())..]);
+        let outcome = if committed.is_empty() && tail.len() < 1600 {
             super::DictationResult::Error("No audio recorded".to_string())
         } else {
-            match model.transcribe_with(&samples, &ParakeetParams::default()) {
-                Ok(result) => {
-                    let text = result.text.trim().to_string();
-                    if text.is_empty() {
-                        super::DictationResult::Error("No speech detected".to_string())
-                    } else {
-                        super::DictationResult::Transcribed(text)
-                    }
-                }
-                Err(e) => {
-                    super::DictationResult::Error(format!("Parakeet transcription failed: {}", e))
-                }
+            let mut parts = committed;
+            if let Some(text) = transcribe_snippet(&mut model, &tail) {
+                parts.push(text);
+            }
+            let text = parts.join(" ").trim().to_string();
+            if text.is_empty() {
+                super::DictationResult::Error("No speech detected".to_string())
+            } else {
+                super::DictationResult::Transcribed(text)
             }
         };
         let _ = result_tx.send(outcome);

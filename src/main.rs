@@ -63,6 +63,15 @@ const ATTENTION_RECONCILE_GRACE_SECS: u64 = 10;
 const ATTENTION_FALLBACK_EXPIRY_SECS: u64 = 6 * 60 * 60;
 const IDLE_TIMEOUT_SECS: u64 = 30;
 const IDLE_CPU_THRESHOLD: f32 = 0.5;
+/// %CPU above which a descendant of an agent process (build, test run,
+/// spawned tool) counts as still-working for staleness decisions. Higher
+/// than IDLE_CPU_THRESHOLD so idle MCP-server children don't pin the marker.
+const DESCENDANT_BUSY_CPU: f32 = 5.0;
+/// Hard cap on tree-busy retention: a marker whose mtime no hook event has
+/// refreshed for this long is removed even if a descendant still burns CPU
+/// (idle-but-hot Chromium/MCP helpers, leftover dev servers). Genuinely
+/// working agents keep refreshing the marker via the hook events.
+const TREE_BUSY_MAX_AGE_SECS: u64 = 30 * 60;
 const APP_BUNDLE_PATH: &str = "/Applications/AgentsSleepPreventer.app";
 const APP_BINARY_PATH: &str = "/Applications/AgentsSleepPreventer.app/Contents/MacOS/asp";
 const OWNED_HOOK_MARKERS: [&str; 4] = [
@@ -70,6 +79,26 @@ const OWNED_HOOK_MARKERS: [&str; 4] = [
     "/usr/local/bin/asp",
     "/usr/local/bin/agents-sleep-preventer",
     "claude-sleep-preventer",
+];
+/// Substrings identifying ASP-owned hook entries in ~/.claude/settings.json.
+const CLAUDE_HOOK_MARKERS: [&str; 4] = [
+    ".claude/hooks/prevent-sleep.sh",
+    ".claude/hooks/refresh-sleep.sh",
+    ".claude/hooks/allow-sleep.sh",
+    ".claude/hooks/agent-attention.sh",
+];
+/// Claude Code events that refresh the working marker without resetting the
+/// turn state (`asp refresh`). SubagentStart and SubagentStop fire in the
+/// main session while (background) subagents run, so multi-agent
+/// orchestration keeps refreshing the marker after the turn-level Stop hook
+/// has already fired — without clearing its deferred-notification flag.
+/// Only UserPromptSubmit runs `asp start` (a new turn resets the task clock).
+const CLAUDE_REFRESH_EVENTS: [&str; 5] = [
+    "PreToolUse",
+    "PostToolUse",
+    "PreCompact",
+    "SubagentStart",
+    "SubagentStop",
 ];
 
 #[derive(Parser)]
@@ -95,6 +124,13 @@ enum Commands {
         #[arg(long, hide = true)]
         pid: Option<u32>,
     },
+    /// Refresh the working marker without resetting turn state (hook)
+    #[command(hide = true)]
+    Refresh {
+        /// Explicit agent PID for managed heartbeat hooks
+        #[arg(long, hide = true)]
+        pid: Option<u32>,
+    },
     /// Show current status
     Status,
     /// List active/inactive instances as JSON
@@ -115,6 +151,12 @@ enum Commands {
     Agent,
     /// Run native menu bar app
     Menubar,
+    /// Override sleep behavior: awake | sleep | auto
+    Force {
+        /// awake (always prevent sleep) | sleep (never prevent) | auto
+        /// (prints the current mode when omitted)
+        mode: Option<String>,
+    },
     /// Force reset: clear all PIDs and re-enable sleep
     Reset,
     /// Check thermal state
@@ -149,6 +191,7 @@ fn main() -> Result<()> {
     match cli.command.unwrap_or(Commands::Menubar) {
         Commands::Start { pid } => cmd_start(pid)?,
         Commands::Stop { pid } => cmd_stop(pid)?,
+        Commands::Refresh { pid } => cmd_refresh(pid)?,
         Commands::Status => cmd_status()?,
         Commands::List => cmd_list()?,
         Commands::Focus { pid } => cmd_focus(pid)?,
@@ -157,6 +200,7 @@ fn main() -> Result<()> {
         Commands::Attention => cmd_attention()?,
         Commands::Agent => cmd_agent()?,
         Commands::Menubar => cmd_menubar()?,
+        Commands::Force { mode } => cmd_force(mode)?,
         Commands::Reset => cmd_reset()?,
         Commands::Thermal => cmd_thermal()?,
         Commands::Install { yes } => cmd_install(yes)?,
@@ -568,20 +612,45 @@ fn sleep_prevention_enabled_from_settings() -> bool {
     settings::AppSettings::load().sleep_prevention.enabled
 }
 
+/// Read fresh on every sync so the popover control takes effect instantly in
+/// every asp process (hooks, agent loop, menubar) without a settings reload.
+fn sleep_override_from_settings() -> settings::SleepOverride {
+    settings::AppSettings::load().sleep_prevention.force
+}
+
 fn sync_sleep_state(source: &str, manual_enabled: bool) -> Result<()> {
+    sync_sleep_state_impl(source, manual_enabled, false)
+}
+
+/// `interactive`: the sync was triggered by a direct user action (popover
+/// toggle), where lid-closed does NOT mean "user walked away" — a docked
+/// clamshell Mac must not be force-slept mid-click.
+fn sync_sleep_state_impl(source: &str, manual_enabled: bool, interactive: bool) -> Result<()> {
     let active = count_active_pids();
     let sleep_disabled = is_sleep_disabled();
     let thermal_warning = check_thermal_warning();
-    let should_prevent = manual_enabled && active > 0 && !thermal_warning;
+    let force = sleep_override_from_settings();
+    let should_prevent = !thermal_warning
+        && match force {
+            settings::SleepOverride::ForceAwake => true,
+            settings::SleepOverride::ForceSleep => false,
+            settings::SleepOverride::Auto => manual_enabled && active > 0,
+        };
 
     if should_prevent && !sleep_disabled {
         set_sleep_disabled(true)?;
         logging::log(&format!(
-            "[{}] Sleep disabled (active PIDs: {})",
-            source, active
+            "[{}] Sleep disabled (active PIDs: {}, force: {})",
+            source,
+            active,
+            force.as_str()
         ));
     } else if !should_prevent && sleep_disabled {
-        enable_sleep_and_trigger_if_lid_closed()?;
+        if interactive {
+            set_sleep_disabled(false)?;
+        } else {
+            enable_sleep_and_trigger_if_lid_closed()?;
+        }
         logging::log(&format!("[{}] Sleep re-enabled", source));
     }
 
@@ -593,6 +662,96 @@ fn menubar_sync_sleep() {
     let _ = sync_sleep_state("sync", manual_enabled);
 }
 
+/// PIDs of every descendant of `pid` in the process table.
+fn descendant_pids(processes: &[ProcessInfo], pid: u32) -> Vec<u32> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for process in processes {
+        if process.pid != process.ppid {
+            children.entry(process.ppid).or_default().push(process.pid);
+        }
+    }
+
+    let mut stack = vec![pid];
+    let mut descendants = Vec::new();
+    while let Some(current) = stack.pop() {
+        if let Some(kids) = children.get(&current) {
+            descendants.extend(kids.iter().copied());
+            stack.extend(kids.iter().copied());
+        }
+    }
+    descendants
+}
+
+/// %CPU per PID in a single ps call.
+fn process_cpu_by_pid(pids: &[u32]) -> HashMap<u32, f32> {
+    if pids.is_empty() {
+        return HashMap::new();
+    }
+    let list = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    Command::new("ps")
+        .args(["-o", "pid=,%cpu=", "-p", &list])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| {
+            s.lines()
+                .filter_map(|line| {
+                    let mut parts = line.split_whitespace();
+                    let pid = parts.next()?.parse().ok()?;
+                    let cpu = parts.next()?.parse().ok()?;
+                    Some((pid, cpu))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether the agent process tree is still actively working: the agent
+/// itself above the idle threshold, or a descendant (build process, spawned
+/// tool) clearly burning CPU. `excluded` removes asp's own hook-invocation
+/// chain so the hook shells never count as agent activity.
+fn process_tree_is_busy(processes: &[ProcessInfo], pid: u32, excluded: &HashSet<u32>) -> bool {
+    if get_process_cpu(pid) >= IDLE_CPU_THRESHOLD {
+        return true;
+    }
+    let descendants = descendant_pids(processes, pid)
+        .into_iter()
+        .filter(|descendant| !excluded.contains(descendant))
+        .collect::<Vec<_>>();
+    process_cpu_by_pid(&descendants)
+        .values()
+        .any(|&cpu| cpu >= DESCENDANT_BUSY_CPU)
+}
+
+/// asp's own PID plus the hook shells between asp and the agent process.
+fn own_call_chain(processes: &[ProcessInfo], agent_pid: u32) -> HashSet<u32> {
+    let by_pid: HashMap<u32, &ProcessInfo> = processes
+        .iter()
+        .map(|process| (process.pid, process))
+        .collect();
+    let mut chain = HashSet::new();
+    let mut current = std::process::id();
+
+    for _ in 0..20 {
+        if current == agent_pid {
+            break;
+        }
+        chain.insert(current);
+        let Some(process) = by_pid.get(&current) else {
+            break;
+        };
+        if process.ppid == 0 || process.ppid == current {
+            break;
+        }
+        current = process.ppid;
+    }
+    chain
+}
+
 fn cleanup_stale_pids() {
     let entries = match fs::read_dir(PIDS_DIR) {
         Ok(e) => e,
@@ -601,6 +760,8 @@ fn cleanup_stale_pids() {
 
     let mut removed = 0;
     let mut total = 0;
+    // Loaded lazily: only needed when a marker has aged past the timeout.
+    let mut process_table: Option<Vec<ProcessInfo>> = None;
 
     for entry in entries.filter_map(|e| e.ok()) {
         let pid: u32 = match entry.file_name().to_string_lossy().parse() {
@@ -612,18 +773,41 @@ fn cleanup_stale_pids() {
         let path = entry.path();
 
         if !is_process_alive(pid) {
+            let stopped = marker_is_stopped(&path);
+            let elapsed = marker_elapsed_secs(&path);
             if fs::remove_file(&path).is_ok() {
                 removed += 1;
+                // The turn had finished (deferred notify) and the agent then
+                // exited: still deliver the completion notification. Crashed
+                // mid-turn ("working") stays silent.
+                if stopped {
+                    if let Some(elapsed) = elapsed {
+                        spool_task_done(pid, elapsed);
+                    }
+                }
             }
             continue;
         }
 
         let age = get_file_age(&path).unwrap_or(0);
         if age >= IDLE_TIMEOUT_SECS {
-            let cpu = get_process_cpu(pid);
-            if cpu < IDLE_CPU_THRESHOLD {
+            let processes = process_table.get_or_insert_with(load_process_table);
+            let busy = process_tree_is_busy(processes, pid, &HashSet::new());
+            if !busy || age >= TREE_BUSY_MAX_AGE_SECS {
+                let stopped = marker_is_stopped(&path);
+                let elapsed = marker_elapsed_secs(&path);
+                // Claim by removal before notifying so concurrent cleanup
+                // passes (agent loop + daemon) can't double-notify.
                 if fs::remove_file(&path).is_ok() {
                     removed += 1;
+                    // A "stopped" marker is a deferred end-of-turn: notify
+                    // only when the tree really quieted down, not when the
+                    // age cap evicts a still-busy one.
+                    if stopped && !busy {
+                        if let Some(elapsed) = elapsed {
+                            spool_task_done(pid, elapsed);
+                        }
+                    }
                 }
             }
         }
@@ -836,11 +1020,35 @@ fn cmd_start(pid: Option<u32>) -> Result<()> {
         .unwrap_or_else(std::process::id);
     let pid_file = get_pid_file(agent_pid);
 
+    // A marker left in the "stopped" state belongs to the previous turn;
+    // recreate it so the task clock (file birthtime) restarts.
+    if marker_is_stopped(&pid_file) {
+        let _ = fs::remove_file(&pid_file);
+    }
     fs::write(&pid_file, "working").context("Failed to write PID file")?;
     // The agent is working again, so it is no longer waiting on the user.
     clear_attention_marker(agent_pid);
 
     sync_sleep_state("hook-start", sleep_prevention_enabled_from_settings())
+}
+
+/// Mid-turn / post-Stop keep-awake hook: bump the marker's mtime while
+/// preserving its content ("stopped" stays armed for the deferred
+/// notification) and its inode (the file birthtime is the task clock).
+/// Unlike cmd_start it does not clear the attention marker — a background
+/// SubagentStop must not wipe a pending "needs you" state.
+fn cmd_refresh(pid: Option<u32>) -> Result<()> {
+    logging::init_quiet();
+    ensure_pids_dir()?;
+    let agent_pid = pid
+        .or_else(find_agent_ancestor)
+        .unwrap_or_else(std::process::id);
+    let pid_file = get_pid_file(agent_pid);
+
+    let content = fs::read_to_string(&pid_file).unwrap_or_else(|_| "working".to_string());
+    fs::write(&pid_file, content).context("Failed to write PID file")?;
+
+    sync_sleep_state("hook-refresh", sleep_prevention_enabled_from_settings())
 }
 
 fn cmd_stop(pid: Option<u32>) -> Result<()> {
@@ -850,23 +1058,56 @@ fn cmd_stop(pid: Option<u32>) -> Result<()> {
         .unwrap_or_else(std::process::id);
     let pid_file = get_pid_file(agent_pid);
 
-    notify_task_done_if_long(agent_pid, &pid_file);
-    let _ = fs::remove_file(&pid_file);
+    // A Stop hook fires at end-of-turn even while background work (subagent
+    // workflows, long builds) is still running in the agent's process tree.
+    // Keep the marker (flagged "stopped") while the tree is busy; the stale
+    // cleanup removes it — and fires the task-done notification — once the
+    // tree quiets down.
+    let processes = load_process_table();
+    let excluded = own_call_chain(&processes, agent_pid);
+    if pid_file.exists() && process_tree_is_busy(&processes, agent_pid, &excluded) {
+        let _ = fs::write(&pid_file, "stopped");
+        logging::log(&format!(
+            "[hook-stop] Kept PID {} (process tree still busy)",
+            agent_pid
+        ));
+    } else {
+        // Claim by removal before notifying so a concurrent cleanup pass
+        // can't deliver the same notification twice.
+        let elapsed = marker_elapsed_secs(&pid_file);
+        if fs::remove_file(&pid_file).is_ok() {
+            if let Some(elapsed) = elapsed {
+                spool_task_done(agent_pid, elapsed);
+            }
+        }
+    }
     clear_attention_marker(agent_pid);
 
     sync_sleep_state("hook-stop", sleep_prevention_enabled_from_settings())
 }
 
+/// Whether a marker was flagged end-of-turn by cmd_stop while its process
+/// tree was still busy.
+fn marker_is_stopped(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .map(|content| content == "stopped")
+        .unwrap_or(false)
+}
+
+/// Age of the task clock: seconds since the marker file was created.
+fn marker_elapsed_secs(pid_file: &Path) -> Option<u64> {
+    fs::metadata(pid_file)
+        .and_then(|m| m.created())
+        .ok()?
+        .elapsed()
+        .ok()
+        .map(|d| d.as_secs())
+}
+
 /// Notify when a finished task ran long enough that the user likely
 /// walked away (short tasks mean they are still watching the terminal).
-fn notify_task_done_if_long(agent_pid: u32, pid_file: &Path) {
-    let Ok(created) = fs::metadata(pid_file).and_then(|m| m.created()) else {
-        return;
-    };
-    let Ok(elapsed) = created.elapsed() else {
-        return;
-    };
-    if elapsed.as_secs() < notifications::TASK_DONE_MIN_SECS {
+fn spool_task_done(agent_pid: u32, elapsed_secs: u64) {
+    if elapsed_secs < notifications::TASK_DONE_MIN_SECS {
         return;
     }
 
@@ -881,7 +1122,7 @@ fn notify_task_done_if_long(agent_pid: u32, pid_file: &Path) {
         &format!("{} finished", agent_name),
         &format!(
             "Task completed after {}.",
-            notifications::format_duration(elapsed.as_secs())
+            notifications::format_duration(elapsed_secs)
         ),
         Some(agent_pid),
     );
@@ -1148,6 +1389,7 @@ fn cmd_list() -> Result<()> {
         "inactive": inactive,
         "sleep_disabled": sleep_disabled,
         "manual_enabled": sleep_prevention_enabled_from_settings(),
+        "force": sleep_override_from_settings().as_str(),
         "thermal_warning": check_thermal_warning(),
     });
     println!("{}", payload);
@@ -1321,47 +1563,54 @@ fn start_clamshell_notifications() {
 }
 
 fn cmd_cleanup() -> Result<()> {
-    if let Ok(entries) = fs::read_dir(PIDS_DIR) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let pid: u32 = match entry.file_name().to_string_lossy().parse() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
+    cleanup_stale_pids();
+    sync_sleep_state("cleanup", sleep_prevention_enabled_from_settings())
+}
 
-            let path = entry.path();
+fn cmd_force(mode: Option<String>) -> Result<()> {
+    logging::init_quiet();
+    let mut app_settings = settings::AppSettings::load();
 
-            if !is_process_alive(pid) {
-                let _ = fs::remove_file(&path);
-                continue;
-            }
-
-            let age = get_file_age(&path).unwrap_or(0);
-            if age >= IDLE_TIMEOUT_SECS {
-                let cpu = get_process_cpu(pid);
-                if cpu < IDLE_CPU_THRESHOLD {
-                    let _ = fs::remove_file(&path);
-                }
-            }
+    let new_mode = match mode.as_deref() {
+        None => {
+            println!("force: {}", app_settings.sleep_prevention.force.as_str());
+            return Ok(());
         }
-    }
+        Some("awake") => settings::SleepOverride::ForceAwake,
+        Some("sleep") => settings::SleepOverride::ForceSleep,
+        Some("auto") => settings::SleepOverride::Auto,
+        Some(other) => anyhow::bail!("Invalid mode '{}': use awake, sleep, or auto", other),
+    };
 
-    // Fix sleep state
-    let active = count_active_pids();
-    let sleep_disabled = is_sleep_disabled();
+    app_settings.sleep_prevention.force = new_mode;
+    app_settings.save().map_err(anyhow::Error::msg)?;
+    logging::log(&format!("[force] mode set to {}", new_mode.as_str()));
 
-    if active > 0 && !sleep_disabled {
-        set_sleep_disabled(true)?;
-    } else if active == 0 && sleep_disabled {
-        enable_sleep_and_trigger_if_lid_closed()?;
-    }
-
+    sync_sleep_state_impl("force", app_settings.sleep_prevention.enabled, true)?;
+    println!("force: {}", new_mode.as_str());
     Ok(())
 }
 
-fn cmd_reset() -> Result<()> {
+/// Thermal recovery: clear the working markers and re-enable sleep, but keep
+/// force_awake — thermal is a temporary override that sync_sleep_state
+/// already suppresses; force resumes once the warning clears.
+fn reset_markers_and_enable_sleep() -> Result<()> {
     let _ = fs::remove_dir_all(PIDS_DIR);
     let _ = fs::create_dir_all(PIDS_DIR);
-    enable_sleep_and_trigger_if_lid_closed()?;
+    enable_sleep_and_trigger_if_lid_closed()
+}
+
+fn cmd_reset() -> Result<()> {
+    // A user-invoked reset is an explicit "back to normal, let it sleep" —
+    // drop any force override too, otherwise the next sync would immediately
+    // re-apply it.
+    let mut app_settings = settings::AppSettings::load();
+    if app_settings.sleep_prevention.force != settings::SleepOverride::Auto {
+        app_settings.sleep_prevention.force = settings::SleepOverride::Auto;
+        let _ = app_settings.save();
+        logging::log("[reset] force override cleared");
+    }
+    reset_markers_and_enable_sleep()?;
     println!("Reset complete. Sleep re-enabled.");
     Ok(())
 }
@@ -1370,8 +1619,8 @@ fn cmd_thermal() -> Result<()> {
     let warning = check_thermal_warning();
     if warning {
         println!("THERMAL WARNING DETECTED!");
-        // Force reset if thermal warning
-        cmd_reset()?;
+        // Force reset if thermal warning (keeps the force_awake toggle)
+        reset_markers_and_enable_sleep()?;
     } else {
         println!("Thermal state: OK");
     }
@@ -1396,7 +1645,7 @@ fn cmd_daemon(interval: u64) -> Result<()> {
             thermal_counter = 0;
             if check_thermal_warning() {
                 eprintln!("Thermal warning! Forcing sleep re-enable.");
-                let _ = cmd_reset();
+                let _ = reset_markers_and_enable_sleep();
             }
         }
 
@@ -1566,18 +1815,24 @@ fn enable_codex_hooks_feature(config_file: &Path) -> Result<()> {
     Ok(())
 }
 
-fn hook_value_contains_owned_command(value: &serde_json::Value) -> bool {
+fn hook_value_contains_marker(value: &serde_json::Value, markers: &[&str]) -> bool {
     match value {
-        serde_json::Value::String(text) => OWNED_HOOK_MARKERS
+        serde_json::Value::String(text) => markers.iter().any(|marker| text.contains(marker)),
+        serde_json::Value::Array(values) => values
             .iter()
-            .any(|marker| text.contains(marker)),
-        serde_json::Value::Array(values) => values.iter().any(hook_value_contains_owned_command),
-        serde_json::Value::Object(map) => map.values().any(hook_value_contains_owned_command),
+            .any(|value| hook_value_contains_marker(value, markers)),
+        serde_json::Value::Object(map) => map
+            .values()
+            .any(|value| hook_value_contains_marker(value, markers)),
         _ => false,
     }
 }
 
-fn remove_owned_hooks_from_group(group: &mut serde_json::Value) -> bool {
+fn hook_value_contains_owned_command(value: &serde_json::Value) -> bool {
+    hook_value_contains_marker(value, &OWNED_HOOK_MARKERS)
+}
+
+fn remove_owned_hooks_from_group(group: &mut serde_json::Value, markers: &[&str]) -> bool {
     let Some(hooks) = group
         .get_mut("hooks")
         .and_then(serde_json::Value::as_array_mut)
@@ -1586,11 +1841,11 @@ fn remove_owned_hooks_from_group(group: &mut serde_json::Value) -> bool {
     };
 
     let before = hooks.len();
-    hooks.retain(|hook| !hook_value_contains_owned_command(hook));
+    hooks.retain(|hook| !hook_value_contains_marker(hook, markers));
     before != hooks.len()
 }
 
-fn remove_owned_hook_groups(hooks: &mut serde_json::Value) -> bool {
+fn remove_owned_hook_groups(hooks: &mut serde_json::Value, markers: &[&str]) -> bool {
     let Some(events) = hooks.as_object_mut() else {
         return false;
     };
@@ -1602,7 +1857,7 @@ fn remove_owned_hook_groups(hooks: &mut serde_json::Value) -> bool {
         };
 
         for group in groups.iter_mut() {
-            if remove_owned_hooks_from_group(group) {
+            if remove_owned_hooks_from_group(group, markers) {
                 changed = true;
             }
         }
@@ -1619,6 +1874,15 @@ fn remove_owned_hook_groups(hooks: &mut serde_json::Value) -> bool {
     }
 
     changed
+}
+
+/// Every marker identifying ASP-owned hook entries in Claude settings files.
+fn claude_owned_markers() -> Vec<&'static str> {
+    CLAUDE_HOOK_MARKERS
+        .iter()
+        .chain(OWNED_HOOK_MARKERS.iter())
+        .copied()
+        .collect()
 }
 
 fn prune_empty_hook_events(hooks: &mut serde_json::Value) {
@@ -1648,7 +1912,7 @@ fn command_hook_group(command: &str, matcher: Option<&str>) -> serde_json::Value
     group
 }
 
-fn append_codex_hook_group(
+fn append_hook_group(
     hooks: &mut serde_json::Map<String, serde_json::Value>,
     event_name: &str,
     group: serde_json::Value,
@@ -1662,6 +1926,70 @@ fn append_codex_hook_group(
     if let Some(groups) = event.as_array_mut() {
         groups.push(group);
     }
+}
+
+fn claude_hook_group(script: &Path) -> serde_json::Value {
+    json!({
+        "hooks": [
+            {
+                "type": "command",
+                "command": script.display().to_string()
+            }
+        ]
+    })
+}
+
+/// Merge ASP's hooks into ~/.claude/settings.json, preserving any hooks the
+/// user configured themselves: prune ASP-owned groups by marker, then append
+/// fresh ones per event.
+fn install_claude_hooks(settings_file: &Path, hooks_dir: &Path) -> Result<()> {
+    let mut json = if settings_file.exists() {
+        let content = fs::read_to_string(settings_file)
+            .with_context(|| format!("Failed to read {}", settings_file.display()))?;
+        serde_json::from_str::<serde_json::Value>(&content)
+            .with_context(|| format!("Failed to parse {}", settings_file.display()))?
+    } else {
+        json!({})
+    };
+
+    if !json.is_object() {
+        json = json!({});
+    }
+    if !json
+        .get("hooks")
+        .map(serde_json::Value::is_object)
+        .unwrap_or(false)
+    {
+        json["hooks"] = json!({});
+    }
+
+    let hooks = json
+        .get_mut("hooks")
+        .expect("hooks object was just ensured");
+    remove_owned_hook_groups(hooks, &claude_owned_markers());
+    prune_empty_hook_events(hooks);
+
+    let prevent_path = hooks_dir.join("prevent-sleep.sh");
+    let refresh_path = hooks_dir.join("refresh-sleep.sh");
+    let allow_path = hooks_dir.join("allow-sleep.sh");
+    let attention_path = hooks_dir.join("agent-attention.sh");
+
+    let hooks = hooks
+        .as_object_mut()
+        .context("Failed to prepare Claude hooks object")?;
+    append_hook_group(hooks, "UserPromptSubmit", claude_hook_group(&prevent_path));
+    for event in CLAUDE_REFRESH_EVENTS {
+        append_hook_group(hooks, event, claude_hook_group(&refresh_path));
+    }
+    append_hook_group(hooks, "Notification", claude_hook_group(&attention_path));
+    append_hook_group(hooks, "Stop", claude_hook_group(&allow_path));
+
+    fs::create_dir_all(settings_file.parent().unwrap())?;
+    fs::write(settings_file, serde_json::to_string_pretty(&json)?)
+        .with_context(|| format!("Failed to write {}", settings_file.display()))?;
+    println!("  Updated {}", settings_file.display());
+
+    Ok(())
 }
 
 fn install_codex_hooks(home: &Path, app_binary: &str) -> Result<()> {
@@ -1694,12 +2022,14 @@ fn install_codex_hooks(home: &Path, app_binary: &str) -> Result<()> {
     }
 
     if let Some(hooks) = hooks_json.get_mut("hooks") {
-        remove_owned_hook_groups(hooks);
+        remove_owned_hook_groups(hooks, &OWNED_HOOK_MARKERS);
         prune_empty_hook_events(hooks);
     }
 
     let start_command =
         format!("[ -x \"{app_binary}\" ] && \"{app_binary}\" start 2>/dev/null || true");
+    let refresh_command =
+        format!("[ -x \"{app_binary}\" ] && \"{app_binary}\" refresh 2>/dev/null || true");
     let stop_command =
         format!("[ -x \"{app_binary}\" ] && \"{app_binary}\" stop 2>/dev/null || true");
 
@@ -1707,22 +2037,22 @@ fn install_codex_hooks(home: &Path, app_binary: &str) -> Result<()> {
         .get_mut("hooks")
         .and_then(serde_json::Value::as_object_mut)
         .context("Failed to prepare Codex hooks object")?;
-    append_codex_hook_group(
+    append_hook_group(
         hooks,
         "UserPromptSubmit",
         command_hook_group(&start_command, None),
     );
-    append_codex_hook_group(
+    append_hook_group(
         hooks,
         "PreToolUse",
-        command_hook_group(&start_command, Some("*")),
+        command_hook_group(&refresh_command, Some("*")),
     );
-    append_codex_hook_group(
+    append_hook_group(
         hooks,
         "PostToolUse",
-        command_hook_group(&start_command, Some("*")),
+        command_hook_group(&refresh_command, Some("*")),
     );
-    append_codex_hook_group(hooks, "Stop", command_hook_group(&stop_command, None));
+    append_hook_group(hooks, "Stop", command_hook_group(&stop_command, None));
 
     fs::write(&hooks_file, serde_json::to_string_pretty(&hooks_json)?)
         .with_context(|| format!("Failed to write {}", hooks_file.display()))?;
@@ -2100,6 +2430,70 @@ hooks = false
     }
 
     #[test]
+    fn install_claude_hooks_preserves_user_hooks_and_adds_subagent_events() {
+        let dir = unique_test_dir("claude-hooks");
+        let hooks_dir = dir.join(".claude/hooks");
+        let settings_file = dir.join(".claude/settings.json");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        fs::write(
+            &settings_file,
+            r#"{
+                "model": "opus",
+                "hooks": {
+                    "PostToolUse": [
+                        { "matcher": "Write|Edit",
+                          "hooks": [{ "type": "command", "command": "/Users/me/.claude/hooks/wikillm-memory-sync.sh" }] }
+                    ],
+                    "Stop": [
+                        { "hooks": [{ "type": "command", "command": "/Users/me/.claude/hooks/allow-sleep.sh" }] }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        install_claude_hooks(&settings_file, &hooks_dir).unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_file).unwrap()).unwrap();
+        assert_eq!(json["model"], "opus");
+        let hooks = &json["hooks"];
+        // User hook preserved alongside the appended ASP group
+        assert!(hook_value_contains_marker(
+            &hooks["PostToolUse"],
+            &["wikillm-memory-sync.sh"]
+        ));
+        assert!(hook_value_contains_marker(
+            &hooks["PostToolUse"],
+            &["refresh-sleep.sh"]
+        ));
+        assert_eq!(hooks["PostToolUse"].as_array().unwrap().len(), 2);
+        // Old ASP Stop group replaced, not duplicated
+        assert_eq!(hooks["Stop"].as_array().unwrap().len(), 1);
+        // New turns reset the task clock; everything else only refreshes
+        assert!(hook_value_contains_marker(
+            &hooks["UserPromptSubmit"],
+            &["prevent-sleep.sh"]
+        ));
+        for event in ["SubagentStart", "SubagentStop"] {
+            assert!(hook_value_contains_marker(
+                &hooks[event],
+                &["refresh-sleep.sh"]
+            ));
+        }
+
+        // Idempotent: a second install must not duplicate ASP groups
+        install_claude_hooks(&settings_file, &hooks_dir).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_file).unwrap()).unwrap();
+        assert_eq!(json["hooks"]["PostToolUse"].as_array().unwrap().len(), 2);
+        assert_eq!(json["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        assert_eq!(json["hooks"]["SubagentStop"].as_array().unwrap().len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn classify_agent_process_detects_hermes_binary() {
         let process = ProcessInfo {
             pid: 42,
@@ -2383,7 +2777,7 @@ fn remove_codex_hooks(home: &Path) -> Result<bool> {
 
     let changed = hooks_json
         .get_mut("hooks")
-        .map(remove_owned_hook_groups)
+        .map(|hooks| remove_owned_hook_groups(hooks, &OWNED_HOOK_MARKERS))
         .unwrap_or(false);
     if !changed {
         return Ok(false);
@@ -2417,18 +2811,42 @@ fn remove_codex_hooks(home: &Path) -> Result<bool> {
 
 fn is_codex_hooks_installed(home: &Path) -> bool {
     let hooks_file = home.join(".codex/hooks.json");
-    fs::read_to_string(hooks_file)
-        .ok()
-        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-        .map(|hooks_json| hook_value_contains_owned_command(&hooks_json))
-        .unwrap_or(false)
+    let Ok(content) = fs::read_to_string(hooks_file) else {
+        return false; // missing file: setup can create it
+    };
+    let Ok(hooks_json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        // Unparseable hooks.json: install would fail on the same parse, so
+        // gating here would make every launch prompt-and-exit. Fail open.
+        return true;
+    };
+    hook_value_contains_owned_command(&hooks_json)
 }
 
 fn is_claude_hooks_installed(home: &Path) -> bool {
     // agent-attention.sh checked too so upgrades from pre-notification
     // versions re-run setup and pick up the Notification hook.
-    home.join(".claude/hooks/prevent-sleep.sh").exists()
-        && home.join(".claude/hooks/agent-attention.sh").exists()
+    if !home.join(".claude/hooks/prevent-sleep.sh").exists()
+        || !home.join(".claude/hooks/agent-attention.sh").exists()
+    {
+        return false;
+    }
+
+    // The SubagentStop keep-awake hook is required so upgrades from
+    // pre-subagent versions re-run setup and pick up the subagent +
+    // PostToolUse events.
+    let Ok(content) = fs::read_to_string(home.join(".claude/settings.json")) else {
+        return false; // missing file: setup can create it
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        // Unparseable settings.json: install would fail on the same parse
+        // error, so gating here would make every launch prompt-and-exit.
+        // Run with the existing (script-based) hooks instead.
+        return true;
+    };
+    json.get("hooks")
+        .and_then(|hooks| hooks.get("SubagentStop"))
+        .map(|groups| hook_value_contains_marker(groups, &[".claude/hooks/refresh-sleep.sh"]))
+        .unwrap_or(false)
 }
 
 fn is_installed() -> bool {
@@ -2817,10 +3235,16 @@ fn cmd_menubar() -> Result<()> {
                 popover.hide();
                 let was_available = dictation_manager.is_available();
                 if let Some(new_settings) = settings::window::show_settings() {
-                    // Update manual sleep prevention based on settings
+                    // Update manual sleep prevention based on settings.
+                    // Interactive: the user just clicked Save, never
+                    // force-sleep a lid-closed (docked) Mac from here.
                     MANUAL_SLEEP_PREVENTION
                         .store(new_settings.sleep_prevention.enabled, Ordering::SeqCst);
-                    menubar_sync_sleep();
+                    let _ = sync_sleep_state_impl(
+                        "settings",
+                        new_settings.sleep_prevention.enabled,
+                        true,
+                    );
                     logging::log(&format!(
                         "[menu] Settings saved: sleep_enabled={}, model={}",
                         new_settings.sleep_prevention.enabled, new_settings.speech_to_text.model
@@ -3098,6 +3522,10 @@ fn cmd_install(auto_yes: bool) -> Result<()> {
         "#!/bin/bash\n[ -x \"{}\" ] && \"{}\" start 2>/dev/null || true\n",
         APP_BINARY_PATH, APP_BINARY_PATH
     );
+    let refresh_script = format!(
+        "#!/bin/bash\n[ -x \"{}\" ] && \"{}\" refresh 2>/dev/null || true\n",
+        APP_BINARY_PATH, APP_BINARY_PATH
+    );
     let allow_script = format!(
         "#!/bin/bash\n[ -x \"{}\" ] && \"{}\" stop 2>/dev/null || true\n",
         APP_BINARY_PATH, APP_BINARY_PATH
@@ -3109,13 +3537,19 @@ fn cmd_install(auto_yes: bool) -> Result<()> {
     );
 
     fs::write(hooks_dir.join("prevent-sleep.sh"), prevent_script)?;
+    fs::write(hooks_dir.join("refresh-sleep.sh"), refresh_script)?;
     fs::write(hooks_dir.join("allow-sleep.sh"), allow_script)?;
     fs::write(hooks_dir.join("agent-attention.sh"), attention_script)?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        for script in ["prevent-sleep.sh", "allow-sleep.sh", "agent-attention.sh"] {
+        for script in [
+            "prevent-sleep.sh",
+            "refresh-sleep.sh",
+            "allow-sleep.sh",
+            "agent-attention.sh",
+        ] {
             fs::set_permissions(hooks_dir.join(script), fs::Permissions::from_mode(0o755))?;
         }
 
@@ -3168,42 +3602,7 @@ fn cmd_install(auto_yes: bool) -> Result<()> {
 
     println!("Configuring coding agent hooks...");
 
-    let prevent_path = hooks_dir.join("prevent-sleep.sh");
-    let allow_path = hooks_dir.join("allow-sleep.sh");
-    let attention_path = hooks_dir.join("agent-attention.sh");
-    let hooks_json = format!(
-        r#"{{
-    "UserPromptSubmit": [{{ "hooks": [{{ "type": "command", "command": "{prevent}" }}] }}],
-    "PreToolUse": [{{ "hooks": [{{ "type": "command", "command": "{prevent}" }}] }}],
-    "PreCompact": [{{ "hooks": [{{ "type": "command", "command": "{prevent}" }}] }}],
-    "Notification": [{{ "hooks": [{{ "type": "command", "command": "{attention}" }}] }}],
-    "Stop": [{{ "hooks": [{{ "type": "command", "command": "{allow}" }}] }}]
-}}"#,
-        prevent = prevent_path.display(),
-        allow = allow_path.display(),
-        attention = attention_path.display(),
-    );
-
-    let hooks: serde_json::Value =
-        serde_json::from_str(&hooks_json).context("Failed to parse hooks JSON")?;
-
-    if settings_file.exists() {
-        let content = fs::read_to_string(&settings_file)
-            .with_context(|| format!("Failed to read {}", settings_file.display()))?;
-        let mut json: serde_json::Value = serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse {}", settings_file.display()))?;
-        json["hooks"] = hooks;
-        fs::write(&settings_file, serde_json::to_string_pretty(&json)?)
-            .with_context(|| format!("Failed to write {}", settings_file.display()))?;
-        println!("  Updated {}", settings_file.display());
-    } else {
-        fs::create_dir_all(settings_file.parent().unwrap())?;
-        let mut json = serde_json::json!({});
-        json["hooks"] = hooks;
-        fs::write(&settings_file, serde_json::to_string_pretty(&json)?)
-            .with_context(|| format!("Failed to write {}", settings_file.display()))?;
-        println!("  Created {}", settings_file.display());
-    }
+    install_claude_hooks(&settings_file, &hooks_dir)?;
 
     #[cfg(unix)]
     fix_user_ownership(&settings_file);
@@ -3286,18 +3685,30 @@ fn cmd_uninstall(keep_model: bool, keep_hooks: bool, keep_data: bool) -> Result<
     // Remove hook scripts (unless keeping hooks)
     if !keep_hooks {
         let _ = fs::remove_file(hooks_dir.join("prevent-sleep.sh"));
+        let _ = fs::remove_file(hooks_dir.join("refresh-sleep.sh"));
         let _ = fs::remove_file(hooks_dir.join("allow-sleep.sh"));
         let _ = fs::remove_file(hooks_dir.join("agent-attention.sh"));
 
-        // Remove hooks from settings.json
+        // Remove ASP-owned hooks from settings.json, preserving user hooks
         if settings_file.exists() {
             if let Ok(content) = fs::read_to_string(&settings_file) {
                 if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if json.get("hooks").is_some() {
-                        json.as_object_mut().unwrap().remove("hooks");
-                        let _ =
-                            fs::write(&settings_file, serde_json::to_string_pretty(&json).unwrap());
-                        println!("Removed hooks from settings.json");
+                    if let Some(hooks) = json.get_mut("hooks") {
+                        if remove_owned_hook_groups(hooks, &claude_owned_markers()) {
+                            prune_empty_hook_events(hooks);
+                            let hooks_empty = hooks
+                                .as_object()
+                                .map(|events| events.is_empty())
+                                .unwrap_or(false);
+                            if hooks_empty {
+                                json.as_object_mut().unwrap().remove("hooks");
+                            }
+                            let _ = fs::write(
+                                &settings_file,
+                                serde_json::to_string_pretty(&json).unwrap(),
+                            );
+                            println!("Removed ASP hooks from settings.json");
+                        }
                     }
                 }
             }
@@ -3417,6 +3828,9 @@ fn cmd_settings() -> Result<()> {
             new_settings.speech_to_text.language,
             new_settings.speech_to_text.model
         ));
+        // Apply immediately; interactive: the user is present, never
+        // force-sleep a lid-closed (docked) Mac from a settings change.
+        let _ = sync_sleep_state_impl("settings", new_settings.sleep_prevention.enabled, true);
         // Offer to download the selected model if it isn't present yet.
         dictation::ensure_selected_model_downloaded();
     } else {

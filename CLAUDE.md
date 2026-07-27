@@ -82,6 +82,13 @@ Two engines behind the model picker in Settings (`src/settings/mod.rs` `ModelEng
 
 Integration test: `cargo test --test parakeet_integration` (skips if the model isn't downloaded). Requires rustc >= 1.88.
 
+## Sleep Prevention Logic
+
+- `sync_sleep_state`: `should_prevent = !thermal && match force { awake => true, sleep => false, auto => manual_enabled && active_pids > 0 }`. The force override (popover tri-state, `asp force awake|sleep|auto`) is stored in `settings.json` and read fresh on every sync so all asp processes react instantly. `asp reset` clears it back to auto.
+- Stop hooks fire at end-of-turn even while background work (Claude Workflow/ultracode, Codex /ultra subagents — both in-process) continues. `cmd_stop` therefore keeps the PID marker while the agent's process tree is busy (self ≥ 0.5% CPU or any descendant ≥ 5%); `cleanup_stale_pids` removes it once the tree is quiet for 30s.
+- Claude Code keep-awake hook events: UserPromptSubmit, PreToolUse, PostToolUse, PreCompact, SubagentStart, SubagentStop (the subagent events refresh the marker during multi-agent orchestration).
+- `asp install` MERGES into `~/.claude/settings.json` hooks (prunes ASP-owned groups by marker, preserves user hooks). Uninstall/`xtask clean` strip only ASP-owned entries and only ASP's three scripts in `~/.claude/hooks/` — never `rm -rf` the hooks dir (users keep their own scripts there).
+
 ## Agent Notifications
 
 Hooks spool JSON to `/tmp/asp_notifications/`; the running app (menubar or agent loop) drains it every ~1-2s and posts via `NSUserNotificationCenter` (`src/notifications.rs`).
