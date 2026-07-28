@@ -815,6 +815,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(logDir)
     }
 
+    @objc private func openDictationHistory() {
+        popover.performClose(nil)
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/AgentsSleepPreventer")
+        let file = dir.appendingPathComponent("dictation-history.txt")
+        if !FileManager.default.fileExists(atPath: file.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try? "".write(to: file, atomically: true, encoding: .utf8)
+        }
+        NSWorkspace.shared.open(file)
+    }
+
     @objc private func openSettings() {
         let cliPath = Bundle.main.bundleURL
             .appendingPathComponent("Contents/MacOS/asp")
@@ -1139,6 +1151,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         hooks.target = self
         menu.addItem(hooks)
+
+        let history = NSMenuItem(
+            title: "Dictation History",
+            action: #selector(openDictationHistory),
+            keyEquivalent: "h"
+        )
+        history.target = self
+        menu.addItem(history)
 
         let permissions = NSMenuItem(
             title: "Permissions...",

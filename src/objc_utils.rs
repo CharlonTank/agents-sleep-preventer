@@ -87,6 +87,25 @@ extern "C" {
 
 pub fn pump_run_loop_once() {
     unsafe {
+        // Dispatch pending NSEvents first: CFRunLoop alone never delivers
+        // AppKit mouse events, so clicks on agent-owned windows (dictation
+        // fallback popup) would go nowhere.
+        let app: Id = msg_send![class!(NSApplication), sharedApplication];
+        loop {
+            let distant_past: Id = msg_send![class!(NSDate), distantPast];
+            let event: Id = msg_send![
+                app,
+                nextEventMatchingMask: u64::MAX
+                untilDate: distant_past
+                inMode: nsstring("kCFRunLoopDefaultMode")
+                dequeue: objc::runtime::YES
+            ];
+            if event.is_null() {
+                break;
+            }
+            let _: () = msg_send![app, sendEvent: event];
+        }
+
         CFRunLoopRunInMode(kCFRunLoopDefaultMode as *const c_void, 0.0, true);
     }
 }

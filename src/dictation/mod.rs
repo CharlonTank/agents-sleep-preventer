@@ -1,7 +1,9 @@
 mod audio;
 mod globe_key;
+mod history;
 mod onboarding;
 mod overlay;
+mod result_popup;
 mod text_injection;
 mod transcription;
 
@@ -16,6 +18,7 @@ use globe_key::{GlobeKeyEvent, GlobeKeyManager};
 pub use onboarding::{ensure_selected_model_downloaded, run_onboarding_if_needed};
 use crate::settings::ModelEngine;
 use overlay::{OverlayMode, RecordingOverlay};
+use result_popup::ResultPopup;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -48,6 +51,7 @@ pub struct DictationManager {
     recorder: Option<AudioRecorder>,
     transcriber: WhisperTranscriber,
     overlay: RecordingOverlay,
+    result_popup: ResultPopup,
     result_rx: Option<Receiver<DictationResult>>,
     streaming: Option<StreamingSession>,
     enabled: bool,
@@ -67,6 +71,7 @@ impl DictationManager {
             recorder: None,
             transcriber: WhisperTranscriber::new(),
             overlay: RecordingOverlay::new(),
+            result_popup: ResultPopup::new(),
             result_rx: None,
             streaming: None,
             enabled: true,
@@ -167,6 +172,8 @@ impl DictationManager {
                 GlobeKeyEvent::DictateStart => {
                     logging::log("[dictation] DictateStart event received");
                     if self.state == DictationState::Idle {
+                        // A new dictation replaces a lingering fallback popup
+                        self.result_popup.hide();
                         self.start_recording();
                     }
                 }
@@ -215,6 +222,7 @@ impl DictationManager {
         }
 
         self.recheck_accessibility_permission();
+        self.result_popup.tick();
 
         // Live preview: show the latest partial transcription while recording
         if self.state == DictationState::Recording {
@@ -236,8 +244,22 @@ impl DictationManager {
                     Ok(DictationResult::Transcribed(text)) => {
                         logging::log(&format!("[dictation] Transcription: {}", text));
                         self.overlay.hide();
-                        if let Err(e) = text_injection::inject_text(&text) {
-                            logging::log(&format!("[dictation] Failed to inject text: {}", e));
+                        history::append(&text);
+                        let delivered = match text_injection::inject_text(&text) {
+                            Ok(()) => text_injection::has_focused_element(),
+                            Err(e) => {
+                                logging::log(&format!(
+                                    "[dictation] Failed to inject text: {}",
+                                    e
+                                ));
+                                false
+                            }
+                        };
+                        if !delivered {
+                            // Nothing had keyboard focus: the keystrokes went
+                            // nowhere. Offer the text for copy before it only
+                            // lives in the history.
+                            self.result_popup.show(&text);
                         }
                         self.state = DictationState::Idle;
                         self.result_rx = None;

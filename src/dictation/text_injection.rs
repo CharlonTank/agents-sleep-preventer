@@ -12,6 +12,12 @@ extern "C" {
     fn AXIsProcessTrusted() -> bool;
     fn AXIsProcessTrustedWithOptions(options: *const c_void) -> bool;
     static kAXTrustedCheckOptionPrompt: CFStringRef;
+    fn AXUIElementCreateSystemWide() -> *mut c_void;
+    fn AXUIElementCopyAttributeValue(
+        element: *mut c_void,
+        attribute: CFStringRef,
+        value: *mut *const c_void,
+    ) -> i32;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -84,6 +90,36 @@ fn inject_via_keystrokes(text: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Whether some UI element currently has keyboard focus. CGEventPost sends
+/// keystrokes to the focused element; with nothing focused they silently
+/// vanish — that's the "dictation landed nowhere" case. Fails open (true)
+/// when the answer can't be determined, so the fallback popup only shows on
+/// a confident miss.
+pub fn has_focused_element() -> bool {
+    unsafe {
+        if !AXIsProcessTrusted() {
+            return true;
+        }
+        let system = AXUIElementCreateSystemWide();
+        if system.is_null() {
+            return true;
+        }
+        let attribute = CFString::new("AXFocusedUIElement");
+        let mut value: *const c_void = ptr::null();
+        let err = AXUIElementCopyAttributeValue(
+            system,
+            attribute.as_concrete_TypeRef(),
+            &mut value,
+        );
+        let focused = err == 0 && !value.is_null();
+        if !value.is_null() {
+            CFRelease(value);
+        }
+        CFRelease(system as *const c_void);
+        focused
+    }
 }
 
 /// Check if accessibility is enabled for this app
