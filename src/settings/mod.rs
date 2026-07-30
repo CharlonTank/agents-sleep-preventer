@@ -72,6 +72,12 @@ pub struct SpeechToTextSettings {
     pub vocabulary_words: Vec<String>,
     #[serde(default = "default_hotkey")]
     pub hotkey: String,
+    /// Volume of the start/stop dictation cues, 0.0 to 1.0.
+    #[serde(default = "default_sound_volume")]
+    pub sound_volume: f32,
+    /// Mute the start/stop dictation cues without losing the volume setting.
+    #[serde(default)]
+    pub sound_muted: bool,
 }
 
 impl Default for SpeechToTextSettings {
@@ -81,6 +87,8 @@ impl Default for SpeechToTextSettings {
             model: default_model(),
             vocabulary_words: Vec::new(),
             hotkey: default_hotkey(),
+            sound_volume: default_sound_volume(),
+            sound_muted: false,
         }
     }
 }
@@ -246,6 +254,10 @@ fn default_model() -> String {
 
 fn default_hotkey() -> String {
     "fn_shift".to_string()
+}
+
+fn default_sound_volume() -> f32 {
+    0.7
 }
 
 impl AppSettings {

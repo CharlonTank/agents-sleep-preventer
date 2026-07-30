@@ -10,7 +10,8 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use crate::objc_utils::{nsstring, Id};
+use crate::objc_utils::{nsstring, CGFloat, Id};
+use crate::settings::AppSettings;
 
 #[derive(Clone, Copy)]
 pub enum Cue {
@@ -72,8 +73,19 @@ fn sounds() -> &'static Mutex<LoadedSounds> {
     })
 }
 
-/// Play a dictation cue. Silently does nothing when the asset is missing.
+/// Play a dictation cue at the configured volume (0 = muted). Silently does
+/// nothing when the asset is missing.
 pub fn play(cue: Cue) {
+    // Read fresh so a Settings change applies to the next cue.
+    let speech = AppSettings::load().speech_to_text;
+    if speech.sound_muted {
+        return;
+    }
+    let volume = speech.sound_volume.clamp(0.0, 1.0);
+    if volume <= 0.0 {
+        return;
+    }
+
     let guard = sounds().lock().unwrap();
     let sound = match cue {
         Cue::Start => guard.start,
@@ -88,6 +100,7 @@ pub fn play(cue: Cue) {
         if playing == YES {
             let _: BOOL = msg_send![sound, stop];
         }
+        let _: () = msg_send![sound, setVolume: volume as CGFloat];
         let _: BOOL = msg_send![sound, play];
     }
 }

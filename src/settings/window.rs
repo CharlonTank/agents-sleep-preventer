@@ -134,6 +134,16 @@ impl SettingsState {
         settings.speech_to_text.hotkey = hotkey;
     }
 
+    fn update_sound_volume(&self, volume: f32) {
+        let mut settings = self.settings.lock().unwrap();
+        settings.speech_to_text.sound_volume = volume.clamp(0.0, 1.0);
+    }
+
+    fn update_sound_muted(&self, muted: bool) {
+        let mut settings = self.settings.lock().unwrap();
+        settings.speech_to_text.sound_muted = muted;
+    }
+
     fn update_vocabulary(&self, words: Vec<String>) {
         let mut settings = self.settings.lock().unwrap();
         settings.speech_to_text.vocabulary_words = words;
@@ -212,6 +222,36 @@ extern "C" fn model_changed(this: &Object, _: Sel, sender: Id) {
     }
 }
 
+/// Slider tracks live so the volume can be judged against a test cue.
+extern "C" fn sound_volume_changed(this: &Object, _: Sel, sender: Id) {
+    unsafe {
+        let state_ptr: *mut c_void = *this.get_ivar("rustState");
+        if state_ptr.is_null() {
+            return;
+        }
+        let value: f64 = msg_send![sender, doubleValue];
+        (*(state_ptr as *const SettingsState)).update_sound_volume(value as f32 / 100.0);
+    }
+}
+
+extern "C" fn sound_mute_changed(this: &Object, _: Sel, sender: Id) {
+    unsafe {
+        let state_ptr: *mut c_void = *this.get_ivar("rustState");
+        if state_ptr.is_null() {
+            return;
+        }
+        let checked: i64 = msg_send![sender, state];
+        let muted = checked == 1;
+        (*(state_ptr as *const SettingsState)).update_sound_muted(muted);
+
+        // Grey the slider out while muted.
+        let slider = SOUND_VOLUME_SLIDER.load(Ordering::SeqCst);
+        if !slider.is_null() {
+            let _: () = msg_send![slider as Id, setEnabled: (!muted) as BOOL];
+        }
+    }
+}
+
 extern "C" fn hotkey_changed(this: &Object, _: Sel, sender: Id) {
     unsafe {
         let state_ptr: *mut c_void = *this.get_ivar("rustState");
@@ -246,6 +286,8 @@ static HOTKEY_CAPTURE_SEEN: AtomicU64 = AtomicU64::new(0);
 static HOTKEY_STATE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static HOTKEY_RECORD_BUTTON: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static HOTKEY_POPUP: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+/// Disabled while the cues are muted.
+static SOUND_VOLUME_SLIDER: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 fn hotkey_symbols(mask: u64) -> String {
     let mut symbols = String::new();
@@ -551,6 +593,14 @@ fn settings_target_class() -> &'static objc::runtime::Class {
                 record_hotkey_pressed as extern "C" fn(&Object, Sel, Id),
             );
             decl.add_method(
+                sel!(soundVolumeChanged:),
+                sound_volume_changed as extern "C" fn(&Object, Sel, Id),
+            );
+            decl.add_method(
+                sel!(soundMuteChanged:),
+                sound_mute_changed as extern "C" fn(&Object, Sel, Id),
+            );
+            decl.add_method(
                 sel!(windowWillClose:),
                 window_will_close as extern "C" fn(&Object, Sel, Id),
             );
@@ -846,6 +896,45 @@ impl SettingsWindow {
                 let _: () = msg_send![popup, setTarget: target];
                 let _: () = msg_send![popup, setAction: sel!(languageChanged:)];
                 let _: () = msg_send![tab2_view, addSubview: popup];
+
+                // Dictation cue volume (right column, next to the language).
+                // tab2_view is 420 wide, so this column must end by x=400.
+                let sound_label_frame =
+                    NSRect::new(NSPoint::new(240.0, 168.0), NSSize::new(100.0, 20.0));
+                let sound_label = create_label(
+                    "Sound Volume",
+                    sound_label_frame,
+                    title_font,
+                    title_color,
+                );
+                let _: () = msg_send![tab2_view, addSubview: sound_label];
+
+                let mute_frame = NSRect::new(NSPoint::new(342.0, 166.0), NSSize::new(58.0, 22.0));
+                let mute_checkbox: Id = msg_send![class!(NSButton), alloc];
+                let mute_checkbox: Id = msg_send![mute_checkbox, initWithFrame: mute_frame];
+                let _: () = msg_send![mute_checkbox, setButtonType: 3i64]; // NSButtonTypeSwitch
+                let _: () = msg_send![mute_checkbox, setTitle: nsstring("Mute")];
+                let muted = settings.speech_to_text.sound_muted;
+                let _: () = msg_send![mute_checkbox, setState: (muted as i64)];
+                let _: () = msg_send![mute_checkbox, setTarget: target];
+                let _: () = msg_send![mute_checkbox, setAction: sel!(soundMuteChanged:)];
+                let _: () = msg_send![tab2_view, addSubview: mute_checkbox];
+
+                let slider_frame =
+                    NSRect::new(NSPoint::new(240.0, 142.0), NSSize::new(160.0, 24.0));
+                let slider: Id = msg_send![class!(NSSlider), alloc];
+                let slider: Id = msg_send![slider, initWithFrame: slider_frame];
+                let _: () = msg_send![slider, setMinValue: 0.0f64];
+                let _: () = msg_send![slider, setMaxValue: 100.0f64];
+                let _: () = msg_send![
+                    slider,
+                    setDoubleValue: (settings.speech_to_text.sound_volume.clamp(0.0, 1.0) * 100.0) as f64
+                ];
+                let _: () = msg_send![slider, setEnabled: (!muted) as BOOL];
+                let _: () = msg_send![slider, setTarget: target];
+                let _: () = msg_send![slider, setAction: sel!(soundVolumeChanged:)];
+                let _: () = msg_send![tab2_view, addSubview: slider];
+                SOUND_VOLUME_SLIDER.store(slider as *mut c_void, Ordering::SeqCst);
 
                 // Vocabulary words
                 let vocab_label_frame =

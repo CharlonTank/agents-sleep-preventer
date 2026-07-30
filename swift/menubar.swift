@@ -189,9 +189,15 @@ private final class AgentPopoverViewController: NSViewController {
     var onInstallHooks: (() -> Void)?
     var onMore: ((NSButton) -> Void)?
     var onSleepOverride: ((SleepOverride) -> Void)?
+    var onInstallUpdate: (() -> Void)?
 
     private var currentList = InstanceList.empty
     private var showAllIdle = false
+    private var updateAvailable = false
+
+    func setUpdateAvailable(_ available: Bool) {
+        updateAvailable = available
+    }
 
     override func loadView() {
         let effect = NSVisualEffectView()
@@ -518,6 +524,31 @@ private final class AgentPopoverViewController: NSViewController {
             more.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
         ]
 
+        // Shown only while a background check has an update waiting.
+        if updateAvailable {
+            let update = NSButton(
+                title: "",
+                target: self,
+                action: #selector(installUpdate)
+            )
+            update.isBordered = false
+            update.image = NSImage(
+                systemSymbolName: "arrow.down.to.line",
+                accessibilityDescription: "Update Ready!"
+            )?.withSymbolConfiguration(
+                .init(pointSize: 13, weight: .semibold)
+            )
+            update.contentTintColor = .systemGreen
+            update.toolTip = "Update Ready!"
+            update.setAccessibilityLabel("Update Ready!")
+            update.translatesAutoresizingMaskIntoConstraints = false
+            footer.addSubview(update)
+            constraints += [
+                update.trailingAnchor.constraint(equalTo: more.leadingAnchor, constant: -14),
+                update.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+            ]
+        }
+
         if !list.hooksInstalled {
             let hooks = NSButton(
                 title: "Install agent hooks",
@@ -685,6 +716,10 @@ private final class AgentPopoverViewController: NSViewController {
         onInstallHooks?()
     }
 
+    @objc private func installUpdate() {
+        onInstallUpdate?()
+    }
+
     @objc private func openMore(_ sender: NSButton) {
         onMore?(sender)
     }
@@ -701,6 +736,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var refreshRequestedWhileFetching = false
     private var pendingForce: SleepOverride?
     private let forceAwakeQueue = DispatchQueue(label: "asp.forceawake")
+    /// A background check found an update; the popover shows a badge for it.
+    private var updateAvailable = false
     private var permissionsWindow: NSWindow?
     private var permissionsTimer: Timer?
     private var lastAccessibilityGranted = false
@@ -719,7 +756,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private lazy var updaterController = SPUStandardUpdaterController(
         startingUpdater: true,
         updaterDelegate: nil,
-        userDriverDelegate: nil
+        userDriverDelegate: self
     )
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -756,6 +793,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         popoverController.onSleepOverride = { [weak self] mode in
             self?.setSleepOverride(mode)
+        }
+        popoverController.onInstallUpdate = { [weak self] in
+            self?.showPendingUpdate()
         }
 
         if isPreview {
@@ -1195,8 +1235,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.maxY + 4), in: button)
     }
 
+    func setUpdateAvailable(_ available: Bool) {
+        guard updateAvailable != available else { return }
+        updateAvailable = available
+        popoverController.setUpdateAvailable(available)
+        if popover.isShown {
+            popoverController.render(latestList)
+            popover.contentSize = popoverController.preferredContentSize
+        }
+    }
+
+    /// Badge clicked: bring Sparkle's pending update alert into focus.
+    private func showPendingUpdate() {
+        popover.performClose(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        updaterController.checkForUpdates(nil)
+    }
+
     @objc private func checkForUpdates(_ sender: Any?) {
         popover.performClose(nil)
+        // As an accessory app we are never frontmost. Activating here (plus
+        // in the user-driver delegate below, since Sparkle only shows its UI
+        // after the feed check returns) keeps the update window from opening
+        // behind everything — which looked like the first click did nothing.
+        NSApp.activate(ignoringOtherApps: true)
         updaterController.checkForUpdates(sender)
     }
 
@@ -1856,6 +1918,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.informativeText = message
         alert.addButton(withTitle: "OK")
         alert.runModal()
+    }
+}
+
+/// Two things here:
+/// 1. Sparkle shows its UI only once the feed check returns, well after the
+///    menu click. Without activating at that moment an accessory app's
+///    update window opens behind every other app, so the click appears to
+///    do nothing.
+/// 2. Gentle reminders: a background check must not steal focus with a
+///    window. We handle it ourselves by showing an update badge in the
+///    popover; clicking it brings Sparkle's update alert in focus.
+extension AppDelegate: SPUStandardUserDriverDelegate {
+    var supportsGentleScheduledUpdateReminders: Bool { true }
+
+    func standardUserDriverShouldHandleShowingScheduledUpdate(
+        _ update: SUAppcastItem,
+        andInImmediateFocus immediateFocus: Bool
+    ) -> Bool {
+        // We show the badge instead; the user opens the alert when ready.
+        false
+    }
+
+    func standardUserDriverWillHandleShowingUpdate(
+        _ handleShowingUpdate: Bool,
+        forUpdate update: SUAppcastItem,
+        state: SPUUserUpdateState
+    ) {
+        if handleShowingUpdate {
+            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            // Ours to show: badge the popover, no focus stealing.
+            setUpdateAvailable(true)
+        }
+    }
+
+    func standardUserDriverWillShowModalAlert() {
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func standardUserDriverWillFinishUpdateSession() {
+        setUpdateAvailable(false)
     }
 }
 
