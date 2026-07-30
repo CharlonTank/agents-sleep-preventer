@@ -4,6 +4,7 @@ mod history;
 mod onboarding;
 mod overlay;
 mod result_popup;
+mod sounds;
 mod text_injection;
 mod transcription;
 
@@ -328,6 +329,10 @@ impl DictationManager {
     }
 
     fn start_recording(&mut self) {
+        // Audible confirmation that the hotkey registered, before the mic
+        // opens so the cue doesn't land in the recorded audio.
+        sounds::play(sounds::Cue::Start);
+
         // Initialize recorder
         match AudioRecorder::new() {
             Ok(mut recorder) => {
@@ -374,6 +379,8 @@ impl DictationManager {
     }
 
     fn stop_and_transcribe(&mut self) {
+        sounds::play(sounds::Cue::Stop);
+
         // Switch overlay to transcribing mode (orange)
         self.overlay.set_mode(OverlayMode::Transcribing);
 

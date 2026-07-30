@@ -282,6 +282,18 @@ fn copy_with_ditto(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Dictation feedback cues played on hotkey press/release.
+fn copy_dictation_sounds(resources_dir: &Path) -> Result<()> {
+    for sound in ["dictation-start.wav", "dictation-stop.wav"] {
+        let src = Path::new("sounds").join(sound);
+        if src.exists() {
+            fs::copy(&src, resources_dir.join(sound))
+                .with_context(|| format!("Failed to copy {}", src.display()))?;
+        }
+    }
+    Ok(())
+}
+
 fn codesign_runtime(path: &Path) -> Result<()> {
     run(
         "codesign",
@@ -553,6 +565,7 @@ fn build_dmg(skip_notarize: bool) -> Result<()> {
 
     // Copy bundled binaries to Resources
     fs::copy(whisper_cli_path, resources_dir.join("whisper-cli"))?;
+    copy_dictation_sounds(&resources_dir)?;
 
     // Step 5: Sign bundled binaries and Sparkle before the app bundle itself
     println!("[5/9] Signing bundled binaries...");
@@ -1085,6 +1098,7 @@ fn replace_app(open_app: bool) -> Result<()> {
         &frameworks_dir.join("Sparkle.framework"),
     )?;
     fs::copy("Info.plist", &plist_path)?;
+    copy_dictation_sounds(&resources_dir)?;
 
     // Sign with the stable Developer ID (not ad hoc): TCC grants
     // (Accessibility/Microphone) are tied to the signing identity, and an
