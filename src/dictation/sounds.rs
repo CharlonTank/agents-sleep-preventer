@@ -10,7 +10,7 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use crate::objc_utils::{nsstring, CGFloat, Id};
+use crate::objc_utils::{nsstring, Id};
 use crate::settings::AppSettings;
 
 #[derive(Clone, Copy)]
@@ -100,7 +100,9 @@ pub fn play(cue: Cue) {
         if playing == YES {
             let _: BOOL = msg_send![sound, stop];
         }
-        let _: () = msg_send![sound, setVolume: volume as CGFloat];
+        // setVolume: takes a C float (f32); passing a CGFloat/f64 corrupts the
+        // value on arm64 (the callee reads only the low 32 bits of the double).
+        let _: () = msg_send![sound, setVolume: volume];
         let _: BOOL = msg_send![sound, play];
     }
 }
