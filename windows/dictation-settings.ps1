@@ -3,7 +3,7 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [Windows.Forms.Application]::EnableVisualStyles()
 $settingsPath = Join-Path $env:ASP_DATA_DIR 'dictation.json'
-$settings = @{ enabled = $true; model = 'large-v3-turbo-q5_0'; language = 'en'; hotkey = 'Ctrl+Alt+Space'; vocabulary = ''; sounds = $true }
+$settings = @{ enabled = $true; model = 'parakeet-v3'; language = 'en'; hotkey = 'Ctrl+Alt+Space'; vocabulary = ''; sounds = $true }
 if (Test-Path -LiteralPath $settingsPath) {
     try { $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json } catch { }
 }

@@ -14,7 +14,7 @@ Installation copies the app and speech engines to `%LOCALAPPDATA%\Programs\Agent
 ## Dictation
 
 1. Open **Dictation Settings…** from the tray menu.
-2. Choose **Whisper Turbo** (574 MB), **Parakeet v3** (669 MB), or **Whisper Tiny** (78 MB). Select a language and optional custom vocabulary for Whisper. Parakeet detects its supported languages automatically.
+2. **Parakeet v3** (669 MB) is selected by default for fast CPU dictation and automatic language detection. You can also choose **Whisper Turbo** (574 MB) or **Whisper Tiny** (78 MB). Select a language and optional custom vocabulary for Whisper. Parakeet detects its supported languages automatically.
 3. Choose **Download Dictation Model…**. Download progress stays visible; models are verified with SHA-256 before use.
 4. Focus an editable text field and press **Ctrl+Alt+Space** once. Speak, then press it again to finish. A floating indicator and optional sounds show recording/transcription state.
 5. The text is inserted when transcription finishes. It remains editable: ASP does not press Enter or submit messages.

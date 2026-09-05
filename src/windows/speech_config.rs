@@ -61,7 +61,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: true,
-            model: MODELS[0].id.into(),
+            model: "parakeet-v3".into(),
             language: "en".into(),
             hotkey: "Ctrl+Alt+Space".into(),
             vocabulary: String::new(),
