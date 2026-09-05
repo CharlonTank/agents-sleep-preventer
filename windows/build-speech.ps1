@@ -23,5 +23,6 @@ foreach ($engine in @('whisper-cli.exe', 'parakeet-cli.exe')) {
     Copy-Item -LiteralPath (Join-Path $build "bin/Release/$engine") -Destination $OutputDirectory -Force
 }
 Copy-Item -LiteralPath (Join-Path $source 'LICENSE') -Destination (Join-Path $OutputDirectory 'LICENSE-whisper.cpp.txt') -Force
-Copy-Item -LiteralPath (Join-Path $source 'ggml/LICENSE') -Destination (Join-Path $OutputDirectory 'LICENSE-ggml.txt') -Force
+# This revision includes ggml under the repository-wide MIT license above;
+# it does not contain a separate ggml/LICENSE file.
 [IO.File]::WriteAllText((Join-Path $OutputDirectory 'SOURCE.txt'), "whisper.cpp v1.9.1`nhttps://github.com/ggml-org/whisper.cpp/tree/$revision`n")
