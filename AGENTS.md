@@ -10,6 +10,8 @@
 
 ## Testing / Clean Install
 
+The cleanup/DMG workflow below applies to macOS installation tests. For source-only checks and Windows work, use `cargo test --locked` and the Windows workflow below; do not remove the installed macOS app to cross-compile or run unit tests.
+
 Before testing a new build, run the Rust cleanup task to ensure a fresh state:
 
 ```bash
@@ -43,6 +45,22 @@ This removes:
 - Whisper CLI + models (Homebrew paths and /tmp build), unless `--keep-model`
 
 ## Dev scripts (Rust only)
+
+- `cargo xtask build-windows` builds `asp.exe` and a portable ZIP under `dist/` without publishing. On Windows it uses MSVC and builds static speech engines with `windows/build-speech.ps1`. Cross-building on macOS additionally needs a tested `speech/` directory from the Windows CI artifact via `ASP_WINDOWS_SPEECH_DIR`.
+- `cargo check --target x86_64-pc-windows-msvc --all-targets` checks the Windows compilation surface from any host.
+- `windows/smoke-test.ps1` verifies the native Windows monitor in a temporary directory, including real power requests when elevated. It does not install hooks or startup shortcuts.
+- `windows/speech-smoke-test.ps1` runs real Whisper and Parakeet transcription on Windows using an upstream audio fixture and isolated model data.
+- `.github/workflows/windows.yml` runs Windows tests, packages the ZIP, and runs the native sleep and dictation smoke tests. CI artifacts are separate from GitHub releases.
+
+## Platform layout
+
+- `src/main.rs` selects the platform. `src/macos.rs` retains the macOS application at crate scope for the existing native UI modules.
+- `src/hook_config.rs` contains the shared, non-destructive hook merge and Codex feature migration helpers.
+- `src/windows/` implements the Windows tray/CLI, a persistent execution-state request, per-user locked/atomic session state, and native Claude Code/Codex hooks. Pure hook/state tests also run on macOS via `tests/windows_portable.rs`.
+- Windows installation uses `%LOCALAPPDATA%/Programs/AgentsSleepPreventer` and current-user Startup/Start menu shortcuts. It never modifies power plans, HKLM, or macOS system configuration.
+- Windows dictation supports bundled Whisper and Parakeet executables, CPAL microphone input, Unicode typing, Ctrl+Alt+Space toggle, settings, sounds, and local history. macOS-specific hotkeys, agent notifications, Sparkle, and automatic Hermes/WSL hook installation remain platform-specific.
+
+## macOS dev scripts
 
 - `cargo xtask complete-test --skip-notarize` (clean system, build DMG, open it)
 - `cargo xtask complete-test --skip-notarize --keep-model` (same but keeps models + whisper-cli)
@@ -88,3 +106,7 @@ To publish a new version:
 
 - `--` in AppleScript starts a comment. Use short flags like `-y` instead of `--yes` when running commands via AppleScript.
 - Use `osascript -e "..."` via `Command::new()` instead of `NSAppleScript` - it's more reliable.
+
+## Windows release artifacts
+
+Release uploads require the tested `dist/AgentsSleepPreventer-X.Y.Z-windows-x86_64.zip` from the Windows workflow in addition to the DMG and Sparkle appcast. Download the artifact for the exact release commit before publishing. The Windows ZIP includes both static speech engines and their licenses; models download on first setup with pinned SHA-256 verification. Never package just asp.exe.

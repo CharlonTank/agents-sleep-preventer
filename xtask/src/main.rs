@@ -34,6 +34,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Build a Windows executable and a portable ZIP (no publication)
+    BuildWindows {
+        #[arg(long, default_value = "x86_64-pc-windows-msvc")]
+        target: String,
+    },
     /// Build a signed and notarized DMG
     BuildDmg {
         /// Skip notarization (for local testing)
@@ -83,6 +88,7 @@ fn main() -> Result<()> {
     std::env::set_current_dir(&project_root)?;
 
     match cli.command {
+        Commands::BuildWindows { target } => build_windows(&target),
         Commands::BuildDmg { skip_notarize } => build_dmg(skip_notarize),
         Commands::Clean { keep_model } => clean(keep_model),
         Commands::CompleteTest {
@@ -96,6 +102,116 @@ fn main() -> Result<()> {
             upload,
         } => release(&version, skip_notarize, upload),
     }
+}
+
+fn build_windows(target: &str) -> Result<()> {
+    if !matches!(target, "x86_64-pc-windows-msvc" | "aarch64-pc-windows-msvc") {
+        bail!("Supported Windows targets: x86_64-pc-windows-msvc, aarch64-pc-windows-msvc");
+    }
+    if cfg!(windows) {
+        run(
+            "cargo",
+            &[
+                "build",
+                "--release",
+                "--locked",
+                "--bin",
+                "asp",
+                "--target",
+                target,
+            ],
+        )?;
+    } else {
+        // cargo-xwin obtains the Windows SDK and uses LLVM to link the .exe.
+        // Install with: cargo install cargo-xwin --locked
+        run(
+            "cargo",
+            &[
+                "xwin",
+                "build",
+                "--release",
+                "--locked",
+                "--bin",
+                "asp",
+                "--target",
+                target,
+            ],
+        )?;
+    }
+    let arch = target
+        .split('-')
+        .next()
+        .context("Missing target architecture")?;
+    let name = format!("AgentsSleepPreventer-{}-windows-{arch}", get_version()?);
+    let dist = project_root()?.join("dist");
+    let package = dist.join(&name);
+    fs::create_dir_all(&package)?;
+    fs::copy(
+        format!("target/{target}/release/asp.exe"),
+        package.join("asp.exe"),
+    )?;
+    let speech_dir = package.join("speech");
+    if cfg!(windows) {
+        run(
+            "powershell.exe",
+            &[
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "windows/build-speech.ps1",
+                "-OutputDirectory",
+                speech_dir.to_str().context("Invalid speech directory")?,
+            ],
+        )?;
+    } else {
+        let source = std::env::var_os("ASP_WINDOWS_SPEECH_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                project_root()
+                    .unwrap()
+                    .join("target/windows-speech-runtime")
+            });
+        if !source.join("whisper-cli.exe").is_file() || !source.join("parakeet-cli.exe").is_file() {
+            bail!("Build speech engines on Windows first, then set ASP_WINDOWS_SPEECH_DIR to the extracted speech folder (the Windows CI artifact includes it).");
+        }
+        fs::create_dir_all(&speech_dir)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                fs::copy(entry.path(), speech_dir.join(entry.file_name()))?;
+            }
+        }
+    }
+    fs::copy("windows/install.ps1", package.join("install.ps1"))?;
+    fs::copy("windows/README.md", package.join("README.md"))?;
+    fs::copy("LICENSE", package.join("LICENSE"))?;
+    let archive = dist.join(format!("{name}.zip"));
+    if cfg!(windows) {
+        let status = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command",
+                "$ErrorActionPreference = 'Stop'; Compress-Archive -Path (Join-Path $env:ASP_PACKAGE '*') -DestinationPath $env:ASP_ARCHIVE -Force"])
+            .env("ASP_PACKAGE", &package).env("ASP_ARCHIVE", &archive).status()?;
+        if !status.success() {
+            bail!("Failed to package Windows ZIP");
+        }
+    } else {
+        if archive.exists() {
+            fs::remove_file(&archive)?;
+        }
+        run(
+            "ditto",
+            &[
+                "-c",
+                "-k",
+                "--norsrc",
+                package.to_str().context("Invalid package path")?,
+                archive.to_str().context("Invalid archive path")?,
+            ],
+        )?;
+    }
+    println!("Windows package: {}", archive.display());
+    Ok(())
 }
 
 fn complete_test(skip_notarize: bool, keep_model: bool) -> Result<()> {
@@ -1246,6 +1362,7 @@ fn ensure_github_release(version: &str, release_notes_path: &Path, target: &str)
 }
 
 fn upload_release_assets(version: &str, appcast_path: &Path) -> Result<()> {
+    let windows_zip = format!("dist/AgentsSleepPreventer-{version}-windows-x86_64.zip");
     let tag = format!("v{}", version);
     let dmg_name = format!("AgentsSleepPreventer-{}.dmg", version);
     run(
@@ -1258,6 +1375,7 @@ fn upload_release_assets(version: &str, appcast_path: &Path) -> Result<()> {
             GITHUB_REPO,
             &dmg_name,
             appcast_path.to_str().context("Invalid appcast path")?,
+            &windows_zip,
             "--clobber",
         ],
     )
@@ -1284,7 +1402,8 @@ fn verify_uploaded_release(version: &str) -> Result<()> {
         .and_then(serde_json::Value::as_array)
         .context("GitHub release response did not include assets")?;
 
-    for required_asset in [&dmg_name, SPARKLE_APPCAST_ASSET_NAME] {
+    let windows_name = format!("AgentsSleepPreventer-{version}-windows-x86_64.zip");
+    for required_asset in [&dmg_name, SPARKLE_APPCAST_ASSET_NAME, &windows_name] {
         let found = assets.iter().any(|asset| {
             asset
                 .get("name")
@@ -1355,6 +1474,10 @@ fn verify_latest_appcast(version: &str) -> Result<()> {
 }
 
 fn publish_release(version: &str, artifacts: &AppcastArtifacts, target: &str) -> Result<()> {
+    let windows_zip = format!("dist/AgentsSleepPreventer-{version}-windows-x86_64.zip");
+    if !Path::new(&windows_zip).is_file() {
+        bail!("Missing tested Windows package: {windows_zip}");
+    }
     ensure_github_release(version, &artifacts.release_notes_path, target)?;
     upload_release_assets(version, &artifacts.appcast_path)?;
     verify_uploaded_release(version)?;

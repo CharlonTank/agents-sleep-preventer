@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")]
+
 //! Integration check for the Parakeet engine. Runs only when the model is
 //! already downloaded (dev machines); skips silently otherwise.
 

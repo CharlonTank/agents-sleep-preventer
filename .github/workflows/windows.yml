@@ -1,0 +1,51 @@
+name: Windows
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: target/windows-speech-source
+          key: windows-speech-v1.9.1-static-x64-noavx-v1
+      - uses: actions/cache@v4
+        with:
+          path: target/speech-test-data/models
+          key: speech-models-tiny-parakeet-q8-v1
+      - name: Validate PowerShell scripts
+        shell: powershell
+        run: |
+          Get-ChildItem windows/*.ps1 | ForEach-Object {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) { throw ($errors | Out-String) }
+          }
+      - name: Test
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+      - name: Package
+        run: cargo xtask build-windows
+      - name: Native Windows smoke test
+        shell: powershell
+        run: |
+          $package = Get-ChildItem dist -Directory | Select-Object -First 1
+          ./windows/smoke-test.ps1 -Binary "$($package.FullName)/asp.exe"
+      - name: Local dictation on Windows (Whisper and Parakeet)
+        shell: powershell
+        run: |
+          $package = Get-ChildItem dist -Directory | Select-Object -First 1
+          ./windows/speech-smoke-test.ps1 -Binary "$($package.FullName)/asp.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AgentsSleepPreventer-windows-x86_64
+          path: dist/*.zip
+          if-no-files-found: error

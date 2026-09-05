@@ -2,12 +2,12 @@
 
 # ☕ Agents Sleep Preventer
 
-### Keep your Mac awake while coding agents are working
-**Sleep prevention, local dictation, and agent controls in one macOS menu bar app.**
+### Keep your computer awake while coding agents are working
+**Sleep prevention and local voice dictation on macOS and Windows.**
 
 <br>
 
-[![Download DMG](https://img.shields.io/badge/Download-DMG%20Installer-blue?style=for-the-badge&logo=apple)](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-4.6.1.dmg)
+[![Download DMG](https://img.shields.io/badge/Download-DMG%20Installer-blue?style=for-the-badge&logo=apple)](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-5.0.0.dmg)
 
 <br>
 
@@ -28,11 +28,11 @@ You ask your coding agent to refactor your codebase. It's going to take 10 minut
 
 ## The Solution
 
-Install this tool. Now your Mac stays awake while your agent works, even with the lid closed. When it finishes, normal sleep resumes. The same menu bar app also provides local speech-to-text dictation for any app.
+Install this tool. Your computer stays awake while your agent works; normal sleep resumes when it finishes. On macOS, it can also keep working with the lid closed and provides local speech-to-text dictation. Windows prevents automatic idle sleep and respects the configured lid and power-button actions.
 
 <div align="center">
 
-| Before | After |
+| Before (macOS) | After (macOS) |
 |--------|-------|
 | 😴 Lid closed = Mac sleeps | ☕ Lid closed = agent keeps working |
 | 🔄 Come back to interrupted work | ✅ Come back to finished work |
@@ -43,20 +43,32 @@ Install this tool. Now your Mac stays awake while your agent works, even with th
 
 ## Features
 
-- Sleep prevention while supported coding agents are active
-- Agent notifications: get notified when a long task finishes or when an agent is waiting for your input
-- Local voice dictation with a customizable hotkey (Fn+Shift by default)
+- Sleep prevention while supported coding agents are active, on macOS and Windows
+- A macOS menu bar app or Windows tray app, with automatic and manual sleep controls
+
+- Local voice dictation with a customizable hotkey: hold Fn+Shift on macOS, toggle Ctrl+Alt+Space on Windows
 - Two dictation engines: Whisper (best accuracy, custom vocabulary) or Parakeet v3 (near-instant transcription)
 - English transcription by default, with language selection in Settings
-- Sparkle updates from signed releases
+- Dictation settings, recording cues, and local transcription history
+- macOS extras: agent notifications, terminal controls, and signed Sparkle updates
 
 ---
 
 ## Installation
 
+### Windows 10 / 11
+
+[Download the Windows ZIP](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-5.0.0-windows-x86_64.zip), extract it, and run `asp.exe` for the system tray app. To install native Claude Code/Codex hooks and start at login, run this in PowerShell from the extracted folder:
+
+```powershell
+.\asp.exe install --yes
+```
+
+No administrator rights are required. See the [Windows guide](windows/README.md) for build prerequisites, commands, verification, and platform differences. For dictation, open **Dictation Settings…** in the tray menu, choose Whisper or Parakeet, then **Download Dictation Model…**. Press Ctrl+Alt+Space to start recording and again to insert the transcript.
+
 ### 🍎 Download DMG (Easiest)
 
-1. [Download the latest DMG](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-4.6.1.dmg)
+1. [Download the latest DMG](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-5.0.0.dmg)
 2. Drag `AgentsSleepPreventer.app` to Applications
 3. Launch the app - it will auto-configure on first run
 4. Restart your coding agents

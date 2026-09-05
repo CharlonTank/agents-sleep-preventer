@@ -3,9 +3,9 @@ members = [".", "xtask"]
 
 [package]
 name = "agents-sleep-preventer"
-version = "4.6.1"
+version = "5.0.0"
 edition = "2021"
-description = "Keep your Mac awake while coding agents are working"
+description = "Keep your computer awake while coding agents are working"
 license = "MIT"
 repository = "https://github.com/CharlonTank/agents-sleep-preventer"
 
@@ -22,6 +22,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tao = "0.30"
 tray-icon = "0.21"
+hound = "3.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
 io-kit-sys = "0.5.0"
 core-foundation = "0.10.1"
 mach2 = "0.6.0"
@@ -30,12 +33,23 @@ libc = "0.2"
 
 # Dictation feature
 cpal = "0.15"       # Audio recording
-hound = "3.5"       # WAV file writing
 transcribe-rs = { version = "0.3.11", default-features = false, features = ["onnx"] } # Parakeet v3 (ONNX)
 objc = "0.2"        # Objective-C runtime
 block = "0.1"       # Objective-C blocks for completion handlers
 core-graphics = "0.24"  # CGEventTap for key monitoring
 dispatch = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+fs2 = "0.4"
+cpal = "0.15"
+sha2 = "0.10"
+tempfile = "3"
+base64 = "0.22"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Power", "Win32_System_Console", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole", "Win32_Media_Audio"] }
+
+[dev-dependencies]
+tempfile = "3"
+base64 = "0.22"
 
 [features]
 cargo-clippy = []

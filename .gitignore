@@ -6,4 +6,5 @@ build/
 # Added by cargo
 
 /target
+/dist
 *.dmg
