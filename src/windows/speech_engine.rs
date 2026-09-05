@@ -27,6 +27,31 @@ pub fn runtime_ready() -> bool {
     })
 }
 
+fn accelerated_cpu() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("avx2")
+            && std::is_x86_feature_detected!("fma")
+            && std::is_x86_feature_detected!("f16c")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    false
+}
+
+fn engine_path(dir: &Path, parakeet: bool, accelerated: bool) -> PathBuf {
+    let name = if parakeet {
+        "parakeet-cli"
+    } else {
+        "whisper-cli"
+    };
+    let optimized = dir.join(format!("{name}-avx2.exe"));
+    if accelerated && optimized.is_file() {
+        optimized
+    } else {
+        dir.join(format!("{name}.exe"))
+    }
+}
+
 fn hash_file(path: &Path) -> Result<String> {
     let mut file = File::open(path)?;
     let mut hash = Sha256::new();
@@ -169,11 +194,7 @@ pub fn transcribe(
     let output = temporary.path().join("transcript");
     audio_samples::write_wav(samples, &audio)?;
     let model = settings.selected_model()?;
-    let engine = runtime_dir()?.join(if model.parakeet {
-        "parakeet-cli.exe"
-    } else {
-        "whisper-cli.exe"
-    });
+    let engine = engine_path(&runtime_dir()?, model.parakeet, accelerated_cpu());
     let mut command = Command::new(engine);
     command
         .arg("-m")
@@ -204,4 +225,22 @@ pub fn transcribe(
     let text = audio_samples::normalized_text(&fs::read_to_string(output.with_extension("txt"))?);
     ensure!(!text.is_empty(), "No speech detected");
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn optimized_engines_require_cpu_support_and_keep_a_portable_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        for (parakeet, name) in [(false, "whisper-cli"), (true, "parakeet-cli")] {
+            let baseline = dir.path().join(format!("{name}.exe"));
+            let optimized = dir.path().join(format!("{name}-avx2.exe"));
+            assert_eq!(engine_path(dir.path(), parakeet, true), baseline);
+            fs::write(&optimized, []).unwrap();
+            assert_eq!(engine_path(dir.path(), parakeet, false), baseline);
+            assert_eq!(engine_path(dir.path(), parakeet, true), optimized);
+        }
+    }
 }

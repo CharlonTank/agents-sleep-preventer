@@ -1,6 +1,6 @@
 # Agents Sleep Preventer for Windows
 
-Windows 10/11, Intel/AMD x64. Local Whisper and Parakeet engines are included; no Rust, Python, CUDA, Visual C++ installer, or administrator rights are required to run the app.
+Windows 10/11, Intel/AMD x64. Local Whisper and Parakeet engines automatically use AVX2 acceleration on compatible CPUs, with a portable fallback for older PCs. Both engines are included; no Rust, Python, CUDA, Visual C++ installer, or administrator rights are required to run the app.
 
 ## Install
 

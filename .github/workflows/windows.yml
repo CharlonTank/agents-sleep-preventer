@@ -17,8 +17,10 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/windows-speech-source
-          key: windows-speech-v1.9.1-static-x64-noavx-crt-v2
-          restore-keys: windows-speech-v1.9.1-static-x64-noavx-v1
+          key: windows-speech-v1.9.1-static-x64-dispatch-v3
+          restore-keys: |
+            windows-speech-v1.9.1-static-x64-noavx-crt-v2
+            windows-speech-v1.9.1-static-x64-noavx-v1
       - uses: actions/cache@v4
         with:
           path: target/speech-test-data/models
