@@ -17,11 +17,13 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/windows-speech-source
-          key: windows-speech-v1.9.1-static-x64-noavx-v1
+          key: windows-speech-v1.9.1-static-x64-noavx-crt-v2
+          restore-keys: windows-speech-v1.9.1-static-x64-noavx-v1
       - uses: actions/cache@v4
         with:
           path: target/speech-test-data/models
-          key: speech-models-tiny-parakeet-q8-v1
+          key: speech-models-turbo-tiny-parakeet-q8-v2
+          restore-keys: speech-models-tiny-parakeet-q8-v1
       - name: Validate PowerShell scripts
         shell: powershell
         run: |

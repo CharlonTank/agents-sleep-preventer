@@ -14,13 +14,27 @@ if (-not (Test-Path -LiteralPath (Join-Path $source 'CMakeLists.txt'))) {
 }
 $actual = git -C $source rev-parse HEAD
 if ($actual.Trim() -ne $revision) { throw 'Unexpected speech engine source revision' }
-cmake -S $source -B $build -A x64 -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DBUILD_SHARED_LIBS=OFF -DGGML_STATIC=ON -DGGML_OPENMP=OFF -DGGML_NATIVE=OFF -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_SDL2=OFF
+# whisper.cpp's old minimum CMake version otherwise silently ignores the CRT
+# selection. Reset cached /MD flags from older builds as well.
+cmake --fresh -S $source -B $build -A x64 -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DBUILD_SHARED_LIBS=OFF -DGGML_STATIC=ON -DGGML_OPENMP=OFF -DGGML_NATIVE=OFF -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_SDL2=OFF
 if ($LASTEXITCODE -ne 0) { throw 'Could not configure speech engine build' }
 cmake --build $build --config Release --target whisper-cli parakeet-cli --parallel 4
 if ($LASTEXITCODE -ne 0) { throw 'Could not build speech engines' }
+$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+$visualStudio = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+if ($LASTEXITCODE -ne 0 -or -not $visualStudio) { throw 'Could not find Visual Studio for dependency inspection' }
+$dumpbin = Get-ChildItem (Join-Path $visualStudio 'VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe') | Sort-Object FullName -Descending | Select-Object -First 1
+if (-not $dumpbin) { throw 'Could not find dumpbin for dependency inspection' }
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 foreach ($engine in @('whisper-cli.exe', 'parakeet-cli.exe')) {
-    Copy-Item -LiteralPath (Join-Path $build "bin/Release/$engine") -Destination $OutputDirectory -Force
+    $executable = Join-Path $build "bin/Release/$engine"
+    $dependencies = (& $dumpbin.FullName /dependents $executable) -join "`n"
+    if ($LASTEXITCODE -ne 0) { throw "Could not inspect $engine" }
+    if ($dependencies -match '(?i)\b(?:MSVCP|VCRUNTIME|libomp)[\w-]*\.dll') {
+        throw "The speech engine requires an external runtime: $engine`n$dependencies"
+    }
+    Write-Host "$engine dependency check passed: no external Visual C++ or OpenMP runtime."
+    Copy-Item -LiteralPath $executable -Destination $OutputDirectory -Force
 }
 Copy-Item -LiteralPath (Join-Path $source 'LICENSE') -Destination (Join-Path $OutputDirectory 'LICENSE-whisper.cpp.txt') -Force
 # This revision includes ggml under the repository-wide MIT license above;

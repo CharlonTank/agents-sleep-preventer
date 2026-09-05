@@ -6,7 +6,7 @@ New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 $dataDir = (Resolve-Path $dataDir).Path
 $audio = Join-Path $dataDir 'jfk.wav'
 Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/ggml-org/whisper.cpp/f049fff95a089aa9969deb009cdd4892b3e74916/samples/jfk.wav' -OutFile $audio -UseBasicParsing
-foreach ($model in @('tiny', 'parakeet-v3')) {
+foreach ($model in @('tiny', 'large-v3-turbo-q5_0', 'parakeet-v3')) {
     & $binaryPath --data-dir $dataDir dictation setup --model $model
     if ($LASTEXITCODE -ne 0) { throw "Model setup failed: $model" }
     $text = (& $binaryPath --data-dir $dataDir dictation transcribe $audio) -join ' '
