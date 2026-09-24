@@ -3,6 +3,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use objc::{class, msg_send, sel, sel_impl};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 // Link AVFoundation framework
@@ -76,6 +77,7 @@ pub enum MicrophonePermission {
 
 pub struct AudioRecorder {
     samples: Arc<Mutex<Vec<f32>>>,
+    level: Arc<AtomicU32>,
     stream: Option<cpal::Stream>,
     sample_rate: u32,
     channels: u16,
@@ -94,6 +96,7 @@ impl AudioRecorder {
 
         Ok(Self {
             samples: Arc::new(Mutex::new(Vec::new())),
+            level: Arc::new(AtomicU32::new(0)),
             stream: None,
             sample_rate: config.sample_rate().0,
             channels: config.channels(),
@@ -113,12 +116,15 @@ impl AudioRecorder {
 
         // Clear previous samples
         self.samples.lock().unwrap().clear();
+        self.level.store(0, Ordering::Relaxed);
+        let level = self.level.clone();
         let samples_clone = self.samples.clone();
 
         let stream = match config.sample_format() {
             cpal::SampleFormat::F32 => device.build_input_stream(
                 &config.into(),
                 move |data: &[f32], _| {
+                    level.fetch_max(recording_level(data).to_bits(), Ordering::Relaxed);
                     samples_clone.lock().unwrap().extend_from_slice(data);
                 },
                 |err| eprintln!("Audio stream error: {}", err),
@@ -131,6 +137,7 @@ impl AudioRecorder {
                     move |data: &[i16], _| {
                         let floats: Vec<f32> =
                             data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
+                        level.fetch_max(recording_level(&floats).to_bits(), Ordering::Relaxed);
                         samples_clone.lock().unwrap().extend_from_slice(&floats);
                     },
                     |err| eprintln!("Audio stream error: {}", err),
@@ -146,6 +153,7 @@ impl AudioRecorder {
                             .iter()
                             .map(|&s| (s as f32 - u16::MAX as f32 / 2.0) / (u16::MAX as f32 / 2.0))
                             .collect();
+                        level.fetch_max(recording_level(&floats).to_bits(), Ordering::Relaxed);
                         samples_clone.lock().unwrap().extend_from_slice(&floats);
                     },
                     |err| eprintln!("Audio stream error: {}", err),
@@ -175,6 +183,12 @@ impl AudioRecorder {
     /// a clone of the buffer Arc).
     pub fn stop_stream(&mut self) {
         self.stream = None;
+    }
+
+    /// Strongest recent audio block since the last UI tick. No audio-buffer
+    /// lock or sample copying is needed; a stalled stream naturally reads zero.
+    pub fn take_level(&self) -> f32 {
+        f32::from_bits(self.level.swap(0, Ordering::Relaxed))
     }
 
     /// Shared live sample buffer, for streaming transcription while recording.
@@ -267,5 +281,53 @@ impl AudioRecorder {
         }
 
         output
+    }
+}
+
+/// Map RMS loudness to a visual range, suppressing low background hiss.
+fn recording_level(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let power = samples
+        .iter()
+        .map(|&sample| {
+            if sample.is_finite() {
+                f64::from(sample.clamp(-1.0, 1.0)).powi(2)
+            } else {
+                0.0
+            }
+        })
+        .sum::<f64>()
+        / samples.len() as f64;
+    let db = 10.0 * power.max(1e-12).log10();
+    ((db + 55.0) / 37.0).clamp(0.0, 1.0) as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recording_level;
+
+    #[test]
+    fn recording_meter_ignores_silence_and_background_hiss() {
+        for samples in [&[][..], &[0.0, 0.0], &[0.0001, -0.0001]] {
+            assert_eq!(recording_level(samples), 0.0);
+        }
+    }
+
+    #[test]
+    fn recording_meter_tracks_loudness_without_cancelling_stereo() {
+        let quiet = recording_level(&[0.005, -0.005]);
+        let speech = recording_level(&[0.04, -0.04]);
+        let loud = recording_level(&[0.15, -0.15]);
+        assert!(0.0 < quiet && quiet < speech && speech < loud);
+        assert_eq!(loud, 1.0);
+        assert_eq!(recording_level(&[0.04, -0.04]), recording_level(&[0.04]));
+    }
+
+    #[test]
+    fn recording_meter_bounds_clipped_and_invalid_samples() {
+        assert_eq!(recording_level(&[10.0, -10.0]), 1.0);
+        assert_eq!(recording_level(&[f32::NAN, f32::INFINITY]), 0.0);
     }
 }
