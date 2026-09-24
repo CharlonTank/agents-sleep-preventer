@@ -227,6 +227,8 @@ impl DictationManager {
 
         // Live preview: show the latest partial transcription while recording
         if self.state == DictationState::Recording {
+            let level = self.recorder.as_ref().map_or(0.0, AudioRecorder::take_level);
+            self.overlay.set_voice_level(level);
             if let Some(session) = &self.streaming {
                 let mut latest = None;
                 while let Ok(text) = session.partial_rx.try_recv() {
@@ -381,7 +383,7 @@ impl DictationManager {
     fn stop_and_transcribe(&mut self) {
         sounds::play(sounds::Cue::Stop);
 
-        // Switch overlay to transcribing mode (orange)
+        // Switch to the calmer, warmer transcription animation.
         self.overlay.set_mode(OverlayMode::Transcribing);
 
         // Streaming path: the model is already loaded in the streaming
