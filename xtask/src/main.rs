@@ -1514,7 +1514,14 @@ fn bump_version(version: &str) -> Result<()> {
     }
 
     replace_version_in_file("Cargo.toml", &current, version)?;
-    replace_version_in_file("Cargo.lock", &current, version)?;
+    // Only the app's own entry: dependencies can share the version number
+    // (dirs 5.0.1 did), and a blind replace corrupts the lockfile.
+    let package_entry = |v: &str| format!("name = \"agents-sleep-preventer\"\nversion = \"{}\"", v);
+    replace_version_in_file(
+        "Cargo.lock",
+        &package_entry(&current),
+        &package_entry(version),
+    )?;
     replace_version_in_file("Info.plist", &current, version)?;
     replace_version_in_file("README.md", &current, version)?;
     replace_version_in_file("distribution.xml", &current, version)?;
