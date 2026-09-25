@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-/// Manual override of the sleep behavior (popover tri-state control).
+/// Manual override of the sleep behavior (popover mode control).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SleepOverride {
@@ -17,6 +17,10 @@ pub enum SleepOverride {
     ForceAwake,
     /// Never prevent sleep, even while agents are working.
     ForceSleep,
+    /// Keep the Mac awake while agents work, then put it to sleep once they
+    /// are all done (even on power, where macOS may never sleep on its own).
+    /// One-shot: falls back to Auto after sleeping.
+    SleepWhenDone,
 }
 
 impl SleepOverride {
@@ -25,6 +29,7 @@ impl SleepOverride {
             Self::Auto => "auto",
             Self::ForceAwake => "awake",
             Self::ForceSleep => "sleep",
+            Self::SleepWhenDone => "when-done",
         }
     }
 }
@@ -34,7 +39,7 @@ impl SleepOverride {
 pub struct SleepPreventionSettings {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Manual override: force-awake / force-sleep / auto.
+    /// Manual override: force-awake / force-sleep / sleep-when-done / auto.
     #[serde(default)]
     pub force: SleepOverride,
 }
@@ -448,6 +453,17 @@ mod tests {
         assert_eq!(settings.sleep_prevention.force, SleepOverride::Auto);
         // speech_to_text should have defaults
         assert_eq!(settings.speech_to_text.language, "en");
+    }
+
+    #[test]
+    fn test_sleep_when_done_round_trip() {
+        let json = r#"{"sleep_prevention": {"enabled": true, "force": "sleep_when_done"}}"#;
+        let settings: AppSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.sleep_prevention.force, SleepOverride::SleepWhenDone);
+        // The CLI argument and the Swift raw value
+        assert_eq!(settings.sleep_prevention.force.as_str(), "when-done");
+        let saved = serde_json::to_string(&settings).unwrap();
+        assert!(saved.contains(r#""force":"sleep_when_done""#));
     }
 
     #[test]

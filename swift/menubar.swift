@@ -41,6 +41,7 @@ enum SleepOverride: String {
     case auto
     case awake
     case sleep
+    case whenDone = "when-done"
 }
 
 struct InstanceList {
@@ -476,17 +477,24 @@ private final class AgentPopoverViewController: NSViewController {
         let row = NSView()
 
         let control = NSSegmentedControl(
-            labels: ["Force sleep", "Auto", "Force awake"],
+            labels: ["Force sleep", "Sleep when done", "Auto", "Force awake"],
             trackingMode: .selectOne,
             target: self,
             action: #selector(sleepOverrideChanged(_:))
         )
         control.controlSize = .small
-        control.segmentDistribution = .fillEqually
+        control.segmentDistribution = .fillProportionally
+        control.setToolTip("Never keep the Mac awake, even while agents work", forSegment: 0)
+        control.setToolTip(
+            "Keep the Mac awake while agents work, then put it to sleep once they are all done and you have stepped away. Returns to Auto afterwards.",
+            forSegment: 1)
+        control.setToolTip("Keep the Mac awake while agents work", forSegment: 2)
+        control.setToolTip("Keep the Mac awake even when no agent is working", forSegment: 3)
         switch list.force {
         case .sleep: control.selectedSegment = 0
-        case .auto: control.selectedSegment = 1
-        case .awake: control.selectedSegment = 2
+        case .whenDone: control.selectedSegment = 1
+        case .auto: control.selectedSegment = 2
+        case .awake: control.selectedSegment = 3
         }
         control.setAccessibilityLabel("Sleep override")
         control.translatesAutoresizingMaskIntoConstraints = false
@@ -584,6 +592,9 @@ private final class AgentPopoverViewController: NSViewController {
         } else if list.force == .sleep {
             text = "FORCED SLEEP"
             color = .systemOrange
+        } else if list.force == .whenDone {
+            text = "SLEEP WHEN DONE"
+            color = .systemTeal
         } else if list.sleepDisabled {
             text = "MAC AWAKE"
             color = .systemGreen
@@ -709,7 +720,8 @@ private final class AgentPopoverViewController: NSViewController {
         let mode: SleepOverride
         switch sender.selectedSegment {
         case 0: mode = .sleep
-        case 2: mode = .awake
+        case 1: mode = .whenDone
+        case 3: mode = .awake
         default: mode = .auto
         }
         onSleepOverride?(mode)

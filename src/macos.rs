@@ -36,7 +36,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use sysinfo::System;
 
 #[link(name = "IOKit", kind = "framework")]
@@ -155,7 +156,8 @@ enum Commands {
     Menubar,
     /// Override sleep behavior: awake | sleep | auto
     Force {
-        /// awake (always prevent sleep) | sleep (never prevent) | auto
+        /// awake (always prevent sleep) | sleep (never prevent) | when-done
+        /// (prevent while agents work, then sleep once) | auto
         /// (prints the current mode when omitted)
         mode: Option<String>,
     },
@@ -636,6 +638,7 @@ fn sync_sleep_state_impl(source: &str, manual_enabled: bool, interactive: bool) 
         && match force {
             settings::SleepOverride::ForceAwake => true,
             settings::SleepOverride::ForceSleep => false,
+            settings::SleepOverride::SleepWhenDone => active > 0,
             settings::SleepOverride::Auto => manual_enabled && active > 0,
         };
 
@@ -662,6 +665,46 @@ fn sync_sleep_state_impl(source: &str, manual_enabled: bool, interactive: bool) 
 fn menubar_sync_sleep() {
     let manual_enabled = MANUAL_SLEEP_PREVENTION.load(Ordering::SeqCst);
     let _ = sync_sleep_state("sync", manual_enabled);
+    sleep_when_done_tick();
+}
+
+/// Covers the gap between an agent's turns (and the Stop hook racing the
+/// next prompt) so "Sleep when done" never fires mid-session.
+const SLEEP_WHEN_DONE_GRACE: Duration = Duration::from_secs(30);
+
+/// When "Sleep when done" first saw no agent working; reset whenever one is.
+static ALL_DONE_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// "Sleep when done": once every agent has been done for the grace period and
+/// nobody is using the Mac, fall back to Auto and put the Mac to sleep. Runs
+/// only in the long-lived app process so the grace timer survives ticks.
+fn sleep_when_done_tick() {
+    let mut all_done_since = ALL_DONE_SINCE.lock().unwrap_or_else(|e| e.into_inner());
+    if sleep_override_from_settings() != settings::SleepOverride::SleepWhenDone
+        || count_active_pids() > 0
+    {
+        *all_done_since = None;
+        return;
+    }
+
+    let since = *all_done_since.get_or_insert_with(Instant::now);
+    if since.elapsed() < SLEEP_WHEN_DONE_GRACE
+        || seconds_since_last_user_input() < RECENT_INPUT_SECS
+    {
+        return;
+    }
+    *all_done_since = None;
+
+    let mut app_settings = settings::AppSettings::load();
+    app_settings.sleep_prevention.force = settings::SleepOverride::Auto;
+    if let Err(e) = app_settings.save() {
+        // Without the fallback to Auto the Mac would be put back to sleep
+        // right after every wake.
+        logging::log(&format!("[when-done] Failed to reset mode to auto: {}", e));
+        return;
+    }
+    logging::log("[when-done] All agents done, mode back to auto, sleeping now");
+    force_sleep_now();
 }
 
 /// PIDs of every descendant of `pid` in the process table.
@@ -1614,7 +1657,11 @@ fn cmd_force(mode: Option<String>) -> Result<()> {
         Some("awake") => settings::SleepOverride::ForceAwake,
         Some("sleep") => settings::SleepOverride::ForceSleep,
         Some("auto") => settings::SleepOverride::Auto,
-        Some(other) => anyhow::bail!("Invalid mode '{}': use awake, sleep, or auto", other),
+        Some("when-done") => settings::SleepOverride::SleepWhenDone,
+        Some(other) => anyhow::bail!(
+            "Invalid mode '{}': use awake, sleep, when-done, or auto",
+            other
+        ),
     };
 
     app_settings.sleep_prevention.force = new_mode;
