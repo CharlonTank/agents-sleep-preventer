@@ -60,7 +60,7 @@ This removes:
 
 To publish a new version:
 
-1. `cargo xtask release X.Y.Z` (bumps `Cargo.toml`, `Cargo.lock`, `Info.plist`, `README.md`, package distribution XML, builds signed DMG, notarizes, generates signed appcast)
+1. `cargo xtask release X.Y.Z` (bumps `Cargo.toml`, `Cargo.lock`, `Info.plist`, `README.md`, builds signed DMG, notarizes, generates signed appcast)
 2. Review the generated app locally.
 3. Commit and push the version bump/release changes.
 4. `cargo xtask release X.Y.Z --upload` (requires a clean pushed HEAD; creates or updates `vX.Y.Z`, marks it latest, uploads the DMG and `appcast.xml`, verifies the release assets and latest Sparkle feed)
@@ -87,6 +87,8 @@ Integration test: `cargo test --test parakeet_integration` (skips if the model i
 - `sync_sleep_state`: `should_prevent = !thermal && match force { awake => true, sleep => false, when-done => active_pids > 0, auto => manual_enabled && active_pids > 0 }`. The force override (popover 4-segment control, `asp force awake|sleep|when-done|auto`) is stored in `settings.json` and read fresh on every sync so all asp processes react instantly. `asp reset` clears it back to auto.
 - "Sleep when done" (`sleep_when_done_tick`, long-lived app process only): once no agent has been working for 30s and there was no user input for 60s, it saves the mode back to auto FIRST, then runs `pmset sleepnow`. If the save fails it does not sleep (otherwise every wake would sleep again).
 - Re-enabling sleep only force-sleeps (`pmset sleepnow`) when the lid is closed AND no external display is active AND no input for 60s (`is_lid_closed_and_unattended`). A docked clamshell MacBook reports a closed lid and must never be slept mid-use (issue #6).
+- Hook ↔ app state (working-PID markers, attention markers, notification spool) lives in the per-user temp dir (`src/runtime_dir.rs`, `confstr(_CS_DARWIN_USER_TEMP_DIR)`/AgentsSleepPreventer, mode 0700), never in the shared /tmp: other local users could forge markers there.
+- Never log dictated text (plain log kept forever); log lengths only.
 - The installed sudoers rule (`/etc/sudoers.d/agents-pmset`) only allows `pmset -a disablesleep 0|1`, `pmset -a sleep 5` and `pmset sleepnow`. Any new sudo pmset invocation must be added there too.
 - Stop hooks fire at end-of-turn even while background work (Claude Workflow/ultracode, Codex /ultra subagents — both in-process) continues. `cmd_stop` therefore keeps the PID marker while the agent's process tree is busy (self ≥ 0.5% CPU or any descendant ≥ 5%); `cleanup_stale_pids` removes it once the tree is quiet for 30s.
 - Claude Code keep-awake hook events: UserPromptSubmit, PreToolUse, PostToolUse, PreCompact, SubagentStart, SubagentStop (the subagent events refresh the marker during multi-agent orchestration).
@@ -94,7 +96,7 @@ Integration test: `cargo test --test parakeet_integration` (skips if the model i
 
 ## Agent Notifications
 
-Hooks spool JSON to `/tmp/asp_notifications/`; the running app (menubar or agent loop) drains it every ~1-2s and posts via `NSUserNotificationCenter` (`src/notifications.rs`).
+Hooks spool JSON to `runtime_dir::notifications_dir()`; the running app (menubar or agent loop) drains it every ~1-2s and posts via `NSUserNotificationCenter` (`src/notifications.rs`).
 
 - Task finished: `cmd_stop` notifies if the PID file is older than `TASK_DONE_MIN_SECS` (45s) — shorter tasks mean the user is still watching.
 - Needs attention: Claude Code `Notification` hook → `~/.claude/hooks/agent-attention.sh` → `asp attention` (reads hook JSON on stdin, extracts `.message`).

@@ -2,7 +2,6 @@
 //! the spool and posts macOS notifications with the app's identity.
 
 use std::fs;
-use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,8 +12,6 @@ use objc::{class, msg_send, sel, sel_impl};
 use crate::logging;
 use crate::objc_utils::{nsstring, Id};
 use crate::settings::AppSettings;
-
-const SPOOL_DIR: &str = "/tmp/asp_notifications";
 
 /// Minimum task duration before a "finished" notification is worth sending.
 /// Shorter tasks mean the user is probably still watching the terminal.
@@ -35,14 +32,14 @@ pub fn spool(title: &str, body: &str, pid: Option<u32>) {
     if !AppSettings::load().notifications.enabled {
         return;
     }
-    if fs::create_dir_all(SPOOL_DIR).is_err() {
+    if fs::create_dir_all(crate::runtime_dir::notifications_dir()).is_err() {
         return;
     }
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let path = PathBuf::from(SPOOL_DIR).join(format!("{}-{}.json", std::process::id(), nanos));
+    let path = crate::runtime_dir::notifications_dir().join(format!("{}-{}.json", std::process::id(), nanos));
     let payload = SpooledNotification {
         title: title.to_string(),
         body: body.to_string(),
@@ -56,7 +53,7 @@ pub fn spool(title: &str, body: &str, pid: Option<u32>) {
 /// Post every spooled notification, then remove it. Called from the app's
 /// main loops (~1s cadence).
 pub fn drain_and_post() {
-    let entries = match fs::read_dir(SPOOL_DIR) {
+    let entries = match fs::read_dir(crate::runtime_dir::notifications_dir()) {
         Ok(e) => e,
         Err(_) => return,
     };

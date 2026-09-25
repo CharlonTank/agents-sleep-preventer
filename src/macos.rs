@@ -7,6 +7,7 @@ mod native_dialogs;
 mod notifications;
 mod objc_utils;
 mod popover;
+mod runtime_dir;
 mod settings;
 
 use anyhow::{Context, Result};
@@ -56,10 +57,6 @@ static CURRENT_PID_INDEX: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_INACTIVE_INDEX: AtomicUsize = AtomicUsize::new(0);
 static MANUAL_SLEEP_PREVENTION: AtomicBool = AtomicBool::new(true);
 
-const PIDS_DIR: &str = "/tmp/agents_working_pids";
-const LEGACY_PIDS_DIR: &str = "/tmp/claude_working_pids";
-/// One marker file per agent PID currently waiting for user input.
-const ATTENTION_DIR: &str = "/tmp/asp_attention";
 /// Give Claude Code time to update its session registry after firing a hook.
 const ATTENTION_RECONCILE_GRACE_SECS: u64 = 10;
 /// Fallback for agents without an authoritative session status.
@@ -473,18 +470,18 @@ fn find_agent_ancestor() -> Option<u32> {
 }
 
 fn ensure_pids_dir() -> Result<()> {
-    fs::create_dir_all(PIDS_DIR).context("Failed to create PIDs directory")?;
+    fs::create_dir_all(runtime_dir::pids_dir()).context("Failed to create PIDs directory")?;
     Ok(())
 }
 
 fn set_attention_marker(pid: u32) {
-    if fs::create_dir_all(ATTENTION_DIR).is_ok() {
-        let _ = fs::write(PathBuf::from(ATTENTION_DIR).join(pid.to_string()), "");
+    if fs::create_dir_all(runtime_dir::attention_dir()).is_ok() {
+        let _ = fs::write(runtime_dir::attention_dir().join(pid.to_string()), "");
     }
 }
 
 fn clear_attention_marker(pid: u32) {
-    let _ = fs::remove_file(PathBuf::from(ATTENTION_DIR).join(pid.to_string()));
+    let _ = fs::remove_file(runtime_dir::attention_dir().join(pid.to_string()));
 }
 
 fn parse_claude_attention_status(content: &str) -> Option<ClaudeAttentionStatus> {
@@ -537,7 +534,7 @@ fn attention_pids(processes: &[ProcessInfo]) -> HashSet<u32> {
         .collect::<HashMap<_, _>>();
     let home = resolve_user_home().ok();
 
-    if let Ok(entries) = fs::read_dir(ATTENTION_DIR) {
+    if let Ok(entries) = fs::read_dir(runtime_dir::attention_dir()) {
         for entry in entries.filter_map(|e| e.ok()) {
             let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
                 continue;
@@ -573,12 +570,12 @@ fn attention_pids(processes: &[ProcessInfo]) -> HashSet<u32> {
 }
 
 fn get_pid_file(pid: u32) -> PathBuf {
-    PathBuf::from(PIDS_DIR).join(pid.to_string())
+    runtime_dir::pids_dir().join(pid.to_string())
 }
 
 fn working_pid_ages() -> HashMap<u32, u64> {
     let mut working = HashMap::new();
-    if let Ok(entries) = fs::read_dir(PIDS_DIR) {
+    if let Ok(entries) = fs::read_dir(runtime_dir::pids_dir()) {
         for entry in entries.flatten() {
             let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
                 continue;
@@ -590,7 +587,7 @@ fn working_pid_ages() -> HashMap<u32, u64> {
 }
 
 fn count_active_pids() -> usize {
-    fs::read_dir(PIDS_DIR)
+    fs::read_dir(runtime_dir::pids_dir())
         .map(|entries| entries.filter_map(|e| e.ok()).count())
         .unwrap_or(0)
 }
@@ -798,7 +795,7 @@ fn own_call_chain(processes: &[ProcessInfo], agent_pid: u32) -> HashSet<u32> {
 }
 
 fn cleanup_stale_pids() {
-    let entries = match fs::read_dir(PIDS_DIR) {
+    let entries = match fs::read_dir(runtime_dir::pids_dir()) {
         Ok(e) => e,
         Err(_) => return,
     };
@@ -1267,7 +1264,7 @@ fn cmd_status() -> Result<()> {
 
     if active_count > 0 {
         println!("\nActive PIDs:");
-        if let Ok(entries) = fs::read_dir(PIDS_DIR) {
+        if let Ok(entries) = fs::read_dir(runtime_dir::pids_dir()) {
             for entry in entries.filter_map(|e| e.ok()) {
                 let pid: u32 = entry.file_name().to_string_lossy().parse().unwrap_or(0);
                 if pid > 0 {
@@ -1677,8 +1674,8 @@ fn cmd_force(mode: Option<String>) -> Result<()> {
 /// force_awake — thermal is a temporary override that sync_sleep_state
 /// already suppresses; force resumes once the warning clears.
 fn reset_markers_and_enable_sleep() -> Result<()> {
-    let _ = fs::remove_dir_all(PIDS_DIR);
-    let _ = fs::create_dir_all(PIDS_DIR);
+    let _ = fs::remove_dir_all(runtime_dir::pids_dir());
+    let _ = fs::create_dir_all(runtime_dir::pids_dir());
     enable_sleep_and_trigger_if_lid_closed()
 }
 
@@ -2962,7 +2959,7 @@ fn cmd_focus(pid: u32) -> Result<()> {
 
 fn get_instance_items() -> Vec<(u32, u64, f32, String)> {
     let mut items = Vec::new();
-    if let Ok(entries) = fs::read_dir(PIDS_DIR) {
+    if let Ok(entries) = fs::read_dir(runtime_dir::pids_dir()) {
         for entry in entries.filter_map(|e| e.ok()) {
             let pid: u32 = entry.file_name().to_string_lossy().parse().unwrap_or(0);
             if pid > 0 {
@@ -3691,11 +3688,17 @@ fn cmd_uninstall(keep_model: bool, keep_hooks: bool, keep_data: bool) -> Result<
             .output()?;
     }
 
-    // Remove PID tracking and notification spool directories
-    let _ = fs::remove_dir_all(PIDS_DIR);
-    let _ = fs::remove_dir_all(LEGACY_PIDS_DIR);
-    let _ = fs::remove_dir_all("/tmp/asp_notifications");
-    let _ = fs::remove_dir_all(ATTENTION_DIR);
+    // Remove PID tracking, attention and notification spool directories
+    for dir in [
+        runtime_dir::pids_dir(),
+        runtime_dir::attention_dir(),
+        runtime_dir::notifications_dir(),
+    ] {
+        let _ = fs::remove_dir_all(dir);
+    }
+    for dir in runtime_dir::LEGACY_TMP_DIRS {
+        let _ = fs::remove_dir_all(dir);
+    }
 
     // Reset sleep settings
     Command::new("sudo")

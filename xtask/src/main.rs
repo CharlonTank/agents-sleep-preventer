@@ -1079,8 +1079,18 @@ fn clean(keep_model: bool) -> Result<()> {
         clean_codex_hooks(&home)?;
     }
 
-    let _ = fs::remove_dir_all("/tmp/agents_working_pids");
-    let _ = fs::remove_dir_all("/tmp/claude_working_pids");
+    // Hook state lives in the per-user temp dir since 5.0.4, in /tmp before.
+    if let Ok(user_temp) = run_output("getconf", &["DARWIN_USER_TEMP_DIR"]) {
+        let _ = fs::remove_dir_all(Path::new(user_temp.trim()).join("AgentsSleepPreventer"));
+    }
+    for dir in [
+        "/tmp/agents_working_pids",
+        "/tmp/claude_working_pids",
+        "/tmp/asp_attention",
+        "/tmp/asp_notifications",
+    ] {
+        let _ = fs::remove_dir_all(dir);
+    }
 
     // Remove sudoers config
     println!("Removing sudoers config...");
