@@ -1,6 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
@@ -26,6 +26,7 @@ fn init_with_startup_message(write_startup: bool) {
         *LOG_FILE.lock().unwrap() = Some(log_path.clone());
 
         if write_startup {
+            remove_logged_transcripts(&log_path);
             log_internal(&format!(
                 "=== ASP {} started ===",
                 env!("CARGO_PKG_VERSION")
@@ -33,6 +34,24 @@ fn init_with_startup_message(write_startup: bool) {
             log_internal(&format!("Executable: {:?}", std::env::current_exe().ok()));
         }
     }
+}
+
+/// Versions before 5.0.4 logged every dictation verbatim; drop those lines
+/// so dictated secrets do not outlive the upgrade.
+fn remove_logged_transcripts(log_path: &Path) {
+    const TRANSCRIPT_MARKER: &str = "] [dictation] Transcription: ";
+    let Ok(content) = fs::read_to_string(log_path) else {
+        return;
+    };
+    if !content.contains(TRANSCRIPT_MARKER) {
+        return;
+    }
+    let kept: String = content
+        .lines()
+        .filter(|line| !line.contains(TRANSCRIPT_MARKER))
+        .flat_map(|line| [line, "\n"])
+        .collect();
+    let _ = fs::write(log_path, kept);
 }
 
 /// Log a message with timestamp
@@ -51,5 +70,31 @@ fn log_internal(message: &str) {
                 .unwrap_or(0);
             let _ = writeln!(file, "[{}] {}", timestamp, message);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remove_logged_transcripts_keeps_other_lines() {
+        let path = std::env::temp_dir().join(format!("asp-log-scrub-{}.log", std::process::id()));
+        fs::write(
+            &path,
+            "[1] [dictation] DictateStart event received\n\
+             [2] [dictation] Transcription: my secret password\n\
+             [3] [dictation] Transcription error: No audio recorded\n",
+        )
+        .unwrap();
+
+        remove_logged_transcripts(&path);
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[1] [dictation] DictateStart event received\n\
+             [3] [dictation] Transcription error: No audio recorded\n"
+        );
+        let _ = fs::remove_file(path);
     }
 }

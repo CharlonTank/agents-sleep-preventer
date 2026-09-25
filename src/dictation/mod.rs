@@ -246,7 +246,11 @@ impl DictationManager {
             if let Some(rx) = &self.result_rx {
                 match rx.try_recv() {
                     Ok(DictationResult::Transcribed(text)) => {
-                        logging::log(&format!("[dictation] Transcription: {}", text));
+                        // Never the text itself: the log is plain and kept indefinitely.
+                        logging::log(&format!(
+                            "[dictation] Transcribed {} chars",
+                            text.chars().count()
+                        ));
                         self.overlay.hide();
                         history::append(&text);
                         let delivered = match text_injection::inject_text(&text) {
