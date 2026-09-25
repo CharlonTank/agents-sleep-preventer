@@ -3,7 +3,7 @@ members = [".", "xtask"]
 
 [package]
 name = "agents-sleep-preventer"
-version = "5.0.1"
+version = "5.0.2"
 edition = "2021"
 description = "Keep your computer awake while coding agents are working"
 license = "MIT"
