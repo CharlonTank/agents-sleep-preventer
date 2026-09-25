@@ -58,7 +58,7 @@ pub struct DictationManager {
     enabled: bool,
     last_diag_log: Instant,
     last_flags_seen: Instant,
-    last_no_flags_log: Instant,
+    no_flags_logged: bool,
     accessibility_granted: bool,
     accessibility_alert_shown: bool,
     last_permission_check: Instant,
@@ -78,7 +78,7 @@ impl DictationManager {
             enabled: true,
             last_diag_log: Instant::now(),
             last_flags_seen: Instant::now(),
-            last_no_flags_log: Instant::now(),
+            no_flags_logged: false,
             accessibility_granted: false,
             accessibility_alert_shown: false,
             last_permission_check: Instant::now(),
@@ -192,6 +192,7 @@ impl DictationManager {
             let diag = globe_key::take_diagnostics();
             if diag.flags_events > 0 {
                 self.last_flags_seen = Instant::now();
+                self.no_flags_logged = false;
                 if let Some(keycode) = diag.last_keycode {
                     logging::log(&format!(
                         "[globe_key] flags events={}, last keycode={}, raw flags=0x{:x}",
@@ -212,12 +213,12 @@ impl DictationManager {
                 ));
             }
 
-            if self.last_flags_seen.elapsed() >= Duration::from_secs(15)
-                && self.last_no_flags_log.elapsed() >= Duration::from_secs(15)
-            {
-                self.last_no_flags_log = Instant::now();
+            // Silence is normal while the user isn't pressing modifiers: log
+            // once per quiet stretch instead of every 15s.
+            if !self.no_flags_logged && self.last_flags_seen.elapsed() >= Duration::from_secs(15) {
+                self.no_flags_logged = true;
                 logging::log(
-                    "[globe_key] No modifier events seen for 15s. Check Accessibility permission.",
+                    "[globe_key] No modifier events seen for 15s. If the dictation shortcut does not respond, check Accessibility permission.",
                 );
             }
         }

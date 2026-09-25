@@ -1458,9 +1458,42 @@ fn force_sleep_now() {
     let _ = Command::new("sudo").args(["pmset", "sleepnow"]).output();
 }
 
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventSourceSecondsSinceLastEventType(state_id: i32, event_type: u32) -> f64;
+}
+
+/// Input this recent means someone is at the Mac, whatever the lid says.
+const RECENT_INPUT_SECS: f64 = 60.0;
+
+/// Seconds since the last keyboard, mouse or trackpad event from any device.
+fn seconds_since_last_user_input() -> f64 {
+    const HID_SYSTEM_STATE: i32 = 1; // kCGEventSourceStateHIDSystemState
+    const ANY_INPUT_EVENT: u32 = u32::MAX; // kCGAnyInputEventType
+    unsafe { CGEventSourceSecondsSinceLastEventType(HID_SYSTEM_STATE, ANY_INPUT_EVENT) }
+}
+
+fn has_active_external_display() -> bool {
+    core_graphics::display::CGDisplay::active_displays().map_or(true, |displays| {
+        displays
+            .into_iter()
+            .any(|id| !core_graphics::display::CGDisplay::new(id).is_builtin())
+    })
+}
+
+/// A docked MacBook (lid closed, external display, keyboard and mouse) also
+/// reports a closed lid: only a closed lid with no external display and no
+/// recent input means the user walked away.
+fn is_lid_closed_and_unattended() -> bool {
+    is_lid_closed()
+        && !has_active_external_display()
+        && seconds_since_last_user_input() >= RECENT_INPUT_SECS
+}
+
 fn enable_sleep_and_trigger_if_lid_closed() -> Result<()> {
     set_sleep_disabled(false)?;
-    if is_lid_closed() {
+    if is_lid_closed_and_unattended() {
+        logging::log("[lid] Lid closed and Mac unattended, sleeping now");
         force_sleep_now();
     }
     Ok(())
