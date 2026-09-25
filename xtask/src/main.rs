@@ -1534,8 +1534,6 @@ fn bump_version(version: &str) -> Result<()> {
     )?;
     replace_version_in_file("Info.plist", &current, version)?;
     replace_version_in_file("README.md", &current, version)?;
-    replace_version_in_file("distribution.xml", &current, version)?;
-    replace_version_in_file("distribution-synth.xml", &current, version)?;
 
     Ok(())
 }

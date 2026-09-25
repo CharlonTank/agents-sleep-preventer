@@ -83,7 +83,7 @@ This removes:
 
 To publish a new version:
 
-1. `cargo xtask release X.Y.Z` (bumps `Cargo.toml`, `Cargo.lock`, `Info.plist`, `README.md`, package distribution XML, builds signed DMG, notarizes, generates signed appcast)
+1. `cargo xtask release X.Y.Z` (bumps `Cargo.toml`, `Cargo.lock`, `Info.plist`, `README.md`, builds signed DMG, notarizes, generates signed appcast)
 2. Review the generated app locally.
 3. Commit and push the version bump/release changes.
 4. `cargo xtask release X.Y.Z --upload` (requires a clean pushed HEAD; creates or updates `vX.Y.Z`, marks it latest, uploads the DMG and `appcast.xml`, verifies the release assets and latest Sparkle feed)

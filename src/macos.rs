@@ -1753,8 +1753,9 @@ fn real_user_from_console() -> Option<String> {
 }
 
 /// The human the install/uninstall is for, even when running elevated.
-/// The pkg postinstall runs as root WITHOUT SUDO_USER set; there the console
-/// user is the real user.
+/// First-time setup runs `asp install` through osascript "with administrator
+/// privileges", as root WITHOUT SUDO_USER set; there the console user is the
+/// real user.
 fn resolve_real_user() -> Option<String> {
     if let Ok(sudo_user) = std::env::var("SUDO_USER") {
         let sudo_user = sudo_user.trim();
