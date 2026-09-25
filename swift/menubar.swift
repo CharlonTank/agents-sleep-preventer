@@ -505,6 +505,9 @@ private final class AgentPopoverViewController: NSViewController {
         let settings = NSButton(title: "Settings", target: self, action: #selector(openSettings))
         settings.isBordered = false
         settings.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        settings.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 12, weight: .medium))
+        settings.imagePosition = .imageLeading
         settings.translatesAutoresizingMaskIntoConstraints = false
 
         let more = NSButton(title: "•••", target: self, action: #selector(openMore(_:)))
