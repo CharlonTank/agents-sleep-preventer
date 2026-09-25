@@ -3125,7 +3125,6 @@ fn cmd_menubar() -> Result<()> {
             if menu_event.id == settings_item_id {
                 logging::log("[menu] Settings selected");
                 popover.hide();
-                let was_available = dictation_manager.is_available();
                 if let Some(new_settings) = settings::window::show_settings() {
                     // Update manual sleep prevention based on settings.
                     // Interactive: the user just clicked Save, never
@@ -3145,13 +3144,7 @@ fn cmd_menubar() -> Result<()> {
                     // If the selected dictation model isn't downloaded yet,
                     // offer to download it now, then pick it up.
                     dictation::ensure_selected_model_downloaded();
-                    dictation_manager.reload_transcriber();
-                    dictation_manager.reload_hotkey();
-                    if !was_available && dictation_manager.is_available() {
-                        if let Err(e) = dictation_manager.start() {
-                            logging::log(&format!("[dictation] Failed to start: {}", e));
-                        }
-                    }
+                    apply_dictation_settings(&mut dictation_manager);
                 }
             } else if menu_event.id == quit_item_id {
                 logging::log("[menu] Quit selected");
@@ -3240,6 +3233,24 @@ fn cmd_menubar() -> Result<()> {
     });
 }
 
+/// Pick up a changed dictation shortcut or model in a running listener.
+fn apply_dictation_settings(dictation_manager: &mut DictationManager) {
+    let was_available = dictation_manager.is_available();
+    dictation_manager.reload_transcriber();
+    dictation_manager.reload_hotkey();
+    if !was_available && dictation_manager.is_available() {
+        if let Err(e) = dictation_manager.start() {
+            logging::log(&format!("[dictation] Failed to start: {}", e));
+        }
+    }
+}
+
+fn settings_modified_time() -> Option<std::time::SystemTime> {
+    fs::metadata(settings::AppSettings::settings_path())
+        .and_then(|metadata| metadata.modified())
+        .ok()
+}
+
 fn cmd_agent() -> Result<()> {
     logging::init();
     logging::log("[agent] Starting background agent");
@@ -3287,6 +3298,7 @@ fn cmd_agent() -> Result<()> {
         }
     }
 
+    let mut settings_modified = settings_modified_time();
     let mut tick_counter = 0u64;
 
     loop {
@@ -3317,10 +3329,23 @@ fn cmd_agent() -> Result<()> {
             }
         }
 
-        // Every 30s: reload settings from disk
-        if tick_counter % 600 == 0 {
-            let new_settings = settings::AppSettings::load();
-            MANUAL_SLEEP_PREVENTION.store(new_settings.sleep_prevention.enabled, Ordering::SeqCst);
+        // Every 1s: the Settings window runs as a separate `asp settings`
+        // process, so apply its saved changes (dictation shortcut, model,
+        // sleep prevention) as soon as settings.json changes on disk.
+        if tick_counter % 20 == 0 {
+            let modified = settings_modified_time();
+            if modified != settings_modified {
+                settings_modified = modified;
+                let new_settings = settings::AppSettings::load();
+                MANUAL_SLEEP_PREVENTION
+                    .store(new_settings.sleep_prevention.enabled, Ordering::SeqCst);
+                apply_dictation_settings(&mut dictation_manager);
+                logging::log(&format!(
+                    "[agent] Settings changed: shortcut={}, model={}",
+                    new_settings.resolved_hotkey().label,
+                    new_settings.speech_to_text.model
+                ));
+            }
         }
     }
 }
