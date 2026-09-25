@@ -11,9 +11,9 @@
     <key>CFBundleDisplayName</key>
     <string>Agents Sleep Preventer</string>
     <key>CFBundleVersion</key>
-    <string>5.0.3</string>
+    <string>5.0.4</string>
     <key>CFBundleShortVersionString</key>
-    <string>5.0.3</string>
+    <string>5.0.4</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleIconFile</key>
