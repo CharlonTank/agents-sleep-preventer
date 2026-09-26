@@ -365,11 +365,31 @@ fn is_hermes_process(process: &ProcessInfo) -> bool {
             && is_hermes_python_module(&tokens))
 }
 
+/// Claude Code's native installer keeps each release at
+/// `…/claude/versions/<version>`. Agent-team teammates (and sessions
+/// relaunched after an update) run that file directly, so the process is
+/// named after the version, not `claude`.
+fn is_claude_versioned_binary(token: &str) -> bool {
+    let path = Path::new(token);
+    let is_version = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(|c: char| c.is_ascii_digit()));
+    let versions_dir = path.parent();
+    is_version
+        && versions_dir.and_then(Path::file_name) == Some("versions".as_ref())
+        && versions_dir.and_then(Path::parent).and_then(Path::file_name)
+            == Some("claude".as_ref())
+}
+
 fn classify_agent_process(process: &ProcessInfo) -> Option<AgentKind> {
     let tokens = process_tokens(process);
     let arg0 = tokens.first().copied().unwrap_or(&process.comm);
 
-    if executable_name_is(arg0, "claude") || executable_name_is(&process.comm, "claude") {
+    if executable_name_is(arg0, "claude")
+        || executable_name_is(&process.comm, "claude")
+        || is_claude_versioned_binary(arg0)
+    {
         return Some(AgentKind::Claude);
     }
 
@@ -756,6 +776,14 @@ fn process_cpu_by_pid(pids: &[u32]) -> HashMap<u32, f32> {
 /// itself above the idle threshold, or a descendant (build process, spawned
 /// tool) clearly burning CPU. `excluded` removes asp's own hook-invocation
 /// chain so the hook shells never count as agent activity.
+/// Claude Code runs every Bash tool command through a shell that sources
+/// `<config dir>/shell-snapshots/snapshot-*.sh`. One still alive after the
+/// turn ended is a background task (a benchmark waiting on the network, a
+/// polling `sleep`) even when it uses no CPU.
+fn is_claude_bash_task(process: &ProcessInfo) -> bool {
+    process.args.contains("/shell-snapshots/snapshot-")
+}
+
 fn process_tree_is_busy(processes: &[ProcessInfo], pid: u32, excluded: &HashSet<u32>) -> bool {
     if get_process_cpu(pid) >= IDLE_CPU_THRESHOLD {
         return true;
@@ -763,7 +791,14 @@ fn process_tree_is_busy(processes: &[ProcessInfo], pid: u32, excluded: &HashSet<
     let descendants = descendant_pids(processes, pid)
         .into_iter()
         .filter(|descendant| !excluded.contains(descendant))
-        .collect::<Vec<_>>();
+        .collect::<HashSet<_>>();
+    if processes
+        .iter()
+        .any(|process| descendants.contains(&process.pid) && is_claude_bash_task(process))
+    {
+        return true;
+    }
+    let descendants = descendants.into_iter().collect::<Vec<_>>();
     process_cpu_by_pid(&descendants)
         .values()
         .any(|&cpu| cpu >= DESCENDANT_BUSY_CPU)
@@ -2408,6 +2443,51 @@ hooks = false
         };
 
         assert_eq!(classify_agent_process(&process), Some(AgentKind::Hermes));
+    }
+
+    #[test]
+    fn classify_agent_process_detects_versioned_claude_binary() {
+        let teammate = ProcessInfo {
+            pid: 42,
+            ppid: 1,
+            comm: "/Users/x/.local/share/claude/versions/2.1.282".to_string(),
+            args: "/Users/x/.local/share/claude/versions/2.1.282 --agent-id voice-bench@session-e6da8370 --agent-name voice-bench"
+                .to_string(),
+        };
+        assert_eq!(classify_agent_process(&teammate), Some(AgentKind::Claude));
+
+        let unrelated = ProcessInfo {
+            pid: 43,
+            ppid: 1,
+            comm: "/opt/tool/versions/2.1.282".to_string(),
+            args: "/opt/tool/versions/2.1.282 serve".to_string(),
+        };
+        assert_eq!(classify_agent_process(&unrelated), None);
+    }
+
+    #[test]
+    fn background_bash_task_keeps_idle_tree_busy() {
+        // PIDs far above pid_max: ps reports no CPU for any of them.
+        let agent = 9_000_001;
+        let mcp_server = ProcessInfo {
+            pid: 9_000_002,
+            ppid: agent,
+            comm: "node".to_string(),
+            args: "node /Users/x/.claude/plugins/cache/mcp-wrapper/index.mjs".to_string(),
+        };
+        let bench_shell = ProcessInfo {
+            pid: 9_000_003,
+            ppid: agent,
+            comm: "/bin/zsh".to_string(),
+            args: "/bin/zsh -c source /Users/x/.claude/shell-snapshots/snapshot-zsh-1790455727484-5v3tzd.sh && eval 'python3 scripts/bench.py'"
+                .to_string(),
+        };
+
+        let idle = vec![mcp_server.clone()];
+        assert!(!process_tree_is_busy(&idle, agent, &HashSet::new()));
+
+        let with_task = vec![mcp_server, bench_shell];
+        assert!(process_tree_is_busy(&with_task, agent, &HashSet::new()));
     }
 
     #[test]
