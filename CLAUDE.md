@@ -80,6 +80,8 @@ Two engines behind the model picker in Settings (`src/settings/mod.rs` `ModelEng
 - **Whisper** (whisper.cpp): shells out to the bundled `whisper-cli` with a GGML `.bin` model. Supports language selection and vocabulary prompt.
 - **Parakeet v3** (transcribe-rs crate, feature `onnx`, ONNX Runtime statically linked): in-process transcription, ~10x faster than Whisper, auto language (25 European languages), no vocabulary support. Model = 4 files downloaded from HF `istupakov/parakeet-tdt-0.6b-v3-onnx` into `models/parakeet-tdt-0.6b-v3-int8/`.
 
+Vocabulary words: Whisper also gets them as `--prompt`, but Parakeet cannot be prompted, so every transcript (final text and live preview, macOS and Windows) goes through `src/vocabulary.rs` `correct()`: a word or 2-3 adjacent words whose rough pronunciation key equals a vocabulary entry (or differs by one vowel, key ≥ 5) is replaced by the entry. Keep it strict; check changes against the real `dictation-history.txt` for false positives.
+
 Integration test: `cargo test --test parakeet_integration` (skips if the model isn't downloaded). Requires rustc >= 1.88.
 
 ## Sleep Prevention Logic

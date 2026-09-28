@@ -443,6 +443,10 @@ impl Dictation {
                     self.join_job();
                     match result {
                         Ok(text) => {
+                            let text = crate::vocabulary::correct(
+                                &text,
+                                &crate::vocabulary::parse_list(&self.settings.vocabulary),
+                            );
                             self.last_text = text.clone();
                             let _ = self.save_history(&text);
                             if let Some(target) = self.target.take() {

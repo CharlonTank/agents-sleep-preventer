@@ -64,6 +64,11 @@ pub struct DictationManager {
     last_permission_check: Instant,
 }
 
+/// Spell listed vocabulary words the user's way, whatever the engine heard.
+fn with_vocabulary(text: &str) -> String {
+    crate::vocabulary::correct(text, &AppSettings::load().speech_to_text.vocabulary_words)
+}
+
 impl DictationManager {
     pub fn new() -> Self {
         Self {
@@ -236,7 +241,7 @@ impl DictationManager {
                     latest = Some(text);
                 }
                 if let Some(text) = latest {
-                    self.overlay.set_preview_text(&text);
+                    self.overlay.set_preview_text(&with_vocabulary(&text));
                 }
             }
         }
@@ -246,6 +251,7 @@ impl DictationManager {
             if let Some(rx) = &self.result_rx {
                 match rx.try_recv() {
                     Ok(DictationResult::Transcribed(text)) => {
+                        let text = with_vocabulary(&text);
                         // Never the text itself: the log is plain and kept indefinitely.
                         logging::log(&format!(
                             "[dictation] Transcribed {} chars",

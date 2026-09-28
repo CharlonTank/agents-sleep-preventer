@@ -950,7 +950,7 @@ impl SettingsWindow {
                 let vocab_desc_frame =
                     NSRect::new(NSPoint::new(20.0, 90.0), NSSize::new(380.0, 18.0));
                 let vocab_desc = create_label(
-                    "One word per line. These help with transcription accuracy.",
+                    "One per line. Close mishearings are fixed with every model.",
                     vocab_desc_frame,
                     body_font,
                     body_color,

@@ -2,6 +2,7 @@
 mod audio_samples;
 
 mod hook_config;
+mod vocabulary;
 
 // Keep the existing macOS modules at crate scope for their shared UI state.
 #[cfg(target_os = "macos")]
