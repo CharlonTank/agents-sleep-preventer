@@ -4,13 +4,23 @@
 //! user listed ("cleemo") still comes out as it sounds ("climo"). After
 //! transcription, a word (or two or three adjacent words, for "clee mo")
 //! that sounds like a vocabulary entry is replaced by the entry's spelling.
-//! Matching is deliberately strict: identical rough pronunciation, or a
-//! single vowel swapped in a word of five sounds or more.
+//! Matching stays strict: identical rough pronunciation, or, for words of
+//! five sounds or more that start with the same two sounds, one vowel or
+//! similar consonant swapped ("clibo") or one extra consonant ("climbo").
 
 /// Adjacent words tried together, so a split name ("clee mo") still matches.
 const MAX_SPAN_WORDS: usize = 3;
-/// Shorter keys only match exactly: one vowel off is too loose for them.
-const MIN_KEY_LEN_FOR_VOWEL_SWAP: usize = 5;
+/// Shorter keys only match exactly: one sound off is too loose for them.
+const MIN_KEY_LEN_FOR_ONE_EDIT: usize = 5;
+/// Consonants speech engines confuse with each other.
+const SIMILAR_CONSONANTS: [&[char]; 6] = [
+    &['m', 'b', 'p'],
+    &['m', 'n'],
+    &['t', 'd'],
+    &['k', 'g'],
+    &['f', 'v'],
+    &['s', 'x'],
+];
 /// Keys this short are too ambiguous to correct at all.
 const MIN_KEY_LEN: usize = 3;
 
@@ -123,14 +133,36 @@ fn keys_match(candidate: &[char], target: &[char]) -> bool {
     if candidate == target {
         return true;
     }
-    if target.len() < MIN_KEY_LEN_FOR_VOWEL_SWAP || candidate.len() != target.len() {
+    if candidate.len().min(target.len()) < MIN_KEY_LEN_FOR_ONE_EDIT
+        || candidate[..2] != target[..2]
+    {
         return false;
     }
-    let mut differences = candidate.iter().zip(target).filter(|(a, b)| a != b);
-    matches!(
-        (differences.next(), differences.next()),
-        (Some((a, b)), None) if is_vowel(*a) && is_vowel(*b)
-    )
+    if candidate.len() == target.len() {
+        let mut differences = candidate.iter().zip(target).filter(|(a, b)| a != b);
+        return matches!(
+            (differences.next(), differences.next()),
+            (Some((a, b)), None) if sounds_similar(*a, *b)
+        );
+    }
+    let (longer, shorter) = if candidate.len() > target.len() {
+        (candidate, target)
+    } else {
+        (target, candidate)
+    };
+    if longer.len() != shorter.len() + 1 {
+        return false;
+    }
+    // One extra consonant ("climbo" for "climo"), anywhere after the start.
+    let split = shorter.iter().zip(longer).take_while(|(a, b)| a == b).count();
+    !is_vowel(longer[split]) && longer[split + 1..] == shorter[split..]
+}
+
+fn sounds_similar(a: char, b: char) -> bool {
+    (is_vowel(a) && is_vowel(b))
+        || SIMILAR_CONSONANTS
+            .iter()
+            .any(|group| group.contains(&a) && group.contains(&b))
 }
 
 fn is_vowel(c: char) -> bool {
@@ -230,6 +262,9 @@ mod tests {
         );
         assert_eq!(correct("Clemo is ready.", &["cleemo"]), "Cleemo is ready.");
         assert_eq!(correct("open Kleemo, then", &["cleemo"]), "open Cleemo, then");
+        // Real Parakeet outputs for "Cleemo"
+        assert_eq!(correct("Oui, Climbo. C'est bon", &["cleemo"]), "Oui, Cleemo. C'est bon");
+        assert_eq!(correct("écoute, Clibo ça marche", &["cleemo"]), "écoute, Cleemo ça marche");
     }
 
     #[test]
@@ -242,6 +277,8 @@ mod tests {
     #[test]
     fn keeps_the_listed_spelling_and_leaves_other_words_alone() {
         let text = "Climb the clean climate, calm client: clam, come on.";
+        assert_eq!(correct(text, &["cleemo"]), text);
+        let text = "Le climat, une Clio, un clip, limbo, clinique, Kimbo, clément.";
         assert_eq!(correct(text, &["cleemo"]), text);
         assert_eq!(correct("Marius et Lamdera", &["Marius", "Lamdera"]), "Marius et Lamdera");
     }
