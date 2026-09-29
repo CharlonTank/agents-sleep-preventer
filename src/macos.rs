@@ -80,7 +80,8 @@ const OWNED_HOOK_MARKERS: [&str; 4] = [
     "/usr/local/bin/agents-sleep-preventer",
     "claude-sleep-preventer",
 ];
-/// Substrings identifying ASP-owned hook entries in ~/.claude/settings.json.
+/// Substrings identifying ASP-owned hook entries in a Claude profile's
+/// settings.json. Every profile points at the scripts in ~/.claude/hooks.
 const CLAUDE_HOOK_MARKERS: [&str; 4] = [
     ".claude/hooks/prevent-sleep.sh",
     ".claude/hooks/refresh-sleep.sh",
@@ -1917,6 +1918,85 @@ fn install_claude_hooks(settings_file: &Path, hooks_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Claude Code profiles: ~/.claude plus every other `~/.claude-*` config
+/// dir (CLAUDE_CONFIG_DIR) that has been used, i.e. has a projects/ dir.
+fn claude_config_dirs(home: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![home.join(".claude")];
+    if let Ok(entries) = fs::read_dir(home) {
+        let mut profiles: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".claude-"))
+            .map(|entry| entry.path())
+            .filter(|path| path.join("projects").is_dir())
+            .collect();
+        profiles.sort();
+        dirs.extend(profiles);
+    }
+    dirs
+}
+
+fn claude_settings_have_asp_hooks(settings_file: &Path) -> bool {
+    fs::read_to_string(settings_file)
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .and_then(|json| json.get("hooks").and_then(|hooks| hooks.get("SubagentStop")).cloned())
+        .map(|groups| hook_value_contains_marker(&groups, &[".claude/hooks/refresh-sleep.sh"]))
+        .unwrap_or(false)
+}
+
+/// Sessions started with another CLAUDE_CONFIG_DIR read that profile's
+/// settings.json, so without this they never report working and the Mac
+/// sleeps under them. Returns the settings files that were updated.
+fn install_claude_profile_hooks(home: &Path) -> Vec<PathBuf> {
+    let hooks_dir = home.join(".claude").join("hooks");
+    if !hooks_dir.join("prevent-sleep.sh").exists() {
+        return Vec::new();
+    }
+    let mut updated = Vec::new();
+    for dir in claude_config_dirs(home).into_iter().skip(1) {
+        let settings_file = dir.join("settings.json");
+        if claude_settings_have_asp_hooks(&settings_file) {
+            continue;
+        }
+        match install_claude_hooks(&settings_file, &hooks_dir) {
+            Ok(()) => updated.push(settings_file),
+            Err(e) => logging::log(&format!(
+                "[hooks] Could not add hooks to {}: {}",
+                settings_file.display(),
+                e
+            )),
+        }
+    }
+    updated
+}
+
+/// Remove ASP-owned hooks from one Claude settings file, keeping the user's.
+fn remove_claude_hooks(settings_file: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(settings_file) else {
+        return false;
+    };
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    let Some(hooks) = json.get_mut("hooks") else {
+        return false;
+    };
+    if !remove_owned_hook_groups(hooks, &claude_owned_markers()) {
+        return false;
+    }
+    prune_empty_hook_events(hooks);
+    let hooks_empty = hooks.as_object().map(|events| events.is_empty()).unwrap_or(false);
+    if hooks_empty {
+        if let Some(settings) = json.as_object_mut() {
+            settings.remove("hooks");
+        }
+    }
+    let Ok(serialized) = serde_json::to_string_pretty(&json) else {
+        return false;
+    };
+    fs::write(settings_file, serialized).is_ok()
+}
+
 fn install_codex_hooks(home: &Path, app_binary: &str) -> Result<()> {
     let codex_dir = home.join(".codex");
     fs::create_dir_all(&codex_dir)
@@ -2443,6 +2523,45 @@ hooks = false
         };
 
         assert_eq!(classify_agent_process(&process), Some(AgentKind::Hermes));
+    }
+
+    #[test]
+    fn claude_profiles_get_keep_awake_hooks_and_lose_only_them() {
+        let home = std::env::temp_dir().join(format!("asp-profiles-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join(".claude/hooks")).unwrap();
+        fs::write(home.join(".claude/hooks/prevent-sleep.sh"), "").unwrap();
+        fs::create_dir_all(home.join(".claude-evo/projects")).unwrap();
+        fs::write(
+            home.join(".claude-evo/settings.json"),
+            r#"{"model":"opus","hooks":{"Stop":[{"hooks":[{"type":"command","command":"/Users/x/notify.sh"}]}]}}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(home.join(".claude-backup")).unwrap();
+
+        let evo = home.join(".claude-evo/settings.json");
+        assert_eq!(install_claude_profile_hooks(&home), vec![evo.clone()]);
+        assert!(claude_settings_have_asp_hooks(&evo));
+        assert!(!home.join(".claude-backup/settings.json").exists());
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&evo).unwrap()).unwrap();
+        assert_eq!(settings["model"], "opus");
+        assert!(settings["hooks"]["Stop"].to_string().contains("/Users/x/notify.sh"));
+        assert!(settings["hooks"]["UserPromptSubmit"]
+            .to_string()
+            .contains(".claude/hooks/prevent-sleep.sh"));
+
+        // Already hooked: nothing to do on the next pass.
+        assert!(install_claude_profile_hooks(&home).is_empty());
+
+        assert!(remove_claude_hooks(&evo));
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&evo).unwrap()).unwrap();
+        assert_eq!(
+            settings["hooks"],
+            serde_json::json!({"Stop":[{"hooks":[{"type":"command","command":"/Users/x/notify.sh"}]}]})
+        );
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -3377,6 +3496,7 @@ fn cmd_agent() -> Result<()> {
     }
 
     let mut settings_modified = settings_modified_time();
+    let home = resolve_user_home().ok();
     let mut tick_counter = 0u64;
 
     loop {
@@ -3403,6 +3523,19 @@ fn cmd_agent() -> Result<()> {
                 let active = count_active_pids();
                 if active > 0 {
                     play_lid_close_sound();
+                }
+            }
+        }
+
+        // At startup, then every 60s: hook up Claude Code profiles
+        // (CLAUDE_CONFIG_DIR) created or first used since the install.
+        if tick_counter % 1200 == 1 {
+            if let Some(home) = &home {
+                for settings_file in install_claude_profile_hooks(home) {
+                    logging::log(&format!(
+                        "[hooks] Added keep-awake hooks to {}",
+                        settings_file.display()
+                    ));
                 }
             }
         }
@@ -3631,6 +3764,11 @@ fn cmd_install(auto_yes: bool) -> Result<()> {
     #[cfg(unix)]
     fix_user_ownership(&settings_file);
 
+    for profile_settings in install_claude_profile_hooks(&home) {
+        #[cfg(unix)]
+        fix_user_ownership(&profile_settings);
+    }
+
     println!("Configuring CLI agent hooks...");
     install_codex_hooks(&home, APP_BINARY_PATH)?;
 
@@ -3703,7 +3841,6 @@ fn cmd_install(auto_yes: bool) -> Result<()> {
 fn cmd_uninstall(keep_model: bool, keep_hooks: bool, keep_data: bool) -> Result<()> {
     let home = resolve_user_home()?;
     let hooks_dir = home.join(".claude").join("hooks");
-    let settings_file = home.join(".claude").join("settings.json");
     let launch_agents_dir = home.join("Library/LaunchAgents");
 
     // Remove hook scripts (unless keeping hooks)
@@ -3713,28 +3850,11 @@ fn cmd_uninstall(keep_model: bool, keep_hooks: bool, keep_data: bool) -> Result<
         let _ = fs::remove_file(hooks_dir.join("allow-sleep.sh"));
         let _ = fs::remove_file(hooks_dir.join("agent-attention.sh"));
 
-        // Remove ASP-owned hooks from settings.json, preserving user hooks
-        if settings_file.exists() {
-            if let Ok(content) = fs::read_to_string(&settings_file) {
-                if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(hooks) = json.get_mut("hooks") {
-                        if remove_owned_hook_groups(hooks, &claude_owned_markers()) {
-                            prune_empty_hook_events(hooks);
-                            let hooks_empty = hooks
-                                .as_object()
-                                .map(|events| events.is_empty())
-                                .unwrap_or(false);
-                            if hooks_empty {
-                                json.as_object_mut().unwrap().remove("hooks");
-                            }
-                            let _ = fs::write(
-                                &settings_file,
-                                serde_json::to_string_pretty(&json).unwrap(),
-                            );
-                            println!("Removed ASP hooks from settings.json");
-                        }
-                    }
-                }
+        // Remove ASP-owned hooks from every Claude profile, preserving user hooks
+        for dir in claude_config_dirs(&home) {
+            let settings_file = dir.join("settings.json");
+            if remove_claude_hooks(&settings_file) {
+                println!("Removed ASP hooks from {}", settings_file.display());
             }
         }
         if remove_codex_hooks(&home)? {
