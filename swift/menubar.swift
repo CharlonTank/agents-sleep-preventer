@@ -10,6 +10,13 @@ enum AgentState: String {
     case idle
 }
 
+/// A Bash command an agent started that is still running (a background
+/// task, or the current tool call).
+struct AgentTask {
+    let pid: Int
+    let command: String
+}
+
 struct AgentInstance {
     let pid: Int
     let kind: String
@@ -18,6 +25,8 @@ struct AgentInstance {
     let cwd: String
     let state: AgentState
     let ageSecs: Int?
+    var attentionReason: String? = nil
+    var tasks: [AgentTask] = []
 }
 
 struct AgentGroup {
@@ -33,6 +42,14 @@ struct AgentGroup {
 
     var ageSecs: Int? {
         instances.compactMap(\.ageSecs).max()
+    }
+
+    var attentionReason: String? {
+        instances.lazy.compactMap(\.attentionReason).first
+    }
+
+    var tasks: [AgentTask] {
+        instances.flatMap(\.tasks)
     }
 }
 
@@ -103,6 +120,22 @@ private final class FlippedView: NSView {
     override var isFlipped: Bool { true }
 }
 
+private final class ActionButton: NSButton {
+    var onPress: (() -> Void)?
+
+    convenience init(title: String, onPress: @escaping () -> Void) {
+        self.init(frame: .zero)
+        self.title = title
+        self.onPress = onPress
+        target = self
+        action = #selector(press)
+    }
+
+    @objc private func press() {
+        onPress?()
+    }
+}
+
 private final class AgentRowView: NSControl {
     var onClick: (() -> Void)?
     private var trackingAreaRef: NSTrackingArea?
@@ -121,8 +154,10 @@ private final class AgentRowView: NSControl {
 
     override var acceptsFirstResponder: Bool { true }
 
+    /// The whole row is one click target, except its own buttons (Stop).
     override func hitTest(_ point: NSPoint) -> NSView? {
-        bounds.contains(point) ? self : nil
+        guard let hit = super.hitTest(point) else { return nil }
+        return hit is NSButton ? hit : self
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -186,6 +221,7 @@ private final class AgentRowView: NSControl {
 
 private final class AgentPopoverViewController: NSViewController {
     var onFocus: ((Int) -> Void)?
+    var onStopTasks: (([Int]) -> Void)?
     var onSettings: (() -> Void)?
     var onInstallHooks: (() -> Void)?
     var onMore: ((NSButton) -> Void)?
@@ -261,10 +297,11 @@ private final class AgentPopoverViewController: NSViewController {
             scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 120),
         ])
 
-        let rowCount = list.groups(in: .attention).count
-            + list.groups(in: .working).count
-            + min(list.groups(in: .idle).count, showAllIdle ? 8 : 3)
-        let height = min(686, max(376, 226 + (rowCount * 54)))
+        let visibleGroups = list.groups(in: .attention)
+            + list.groups(in: .working)
+            + list.groups(in: .idle).prefix(showAllIdle ? 8 : 3)
+        let rowsHeight = visibleGroups.reduce(0) { $0 + 54 + detailLines(for: $1).count * 15 }
+        let height = min(686, max(376, 226 + rowsHeight))
         preferredContentSize = NSSize(width: 390, height: height)
     }
 
@@ -391,7 +428,6 @@ private final class AgentPopoverViewController: NSViewController {
             let row = makeAgentRow(group)
             section.addArrangedSubview(row)
             row.widthAnchor.constraint(equalTo: section.widthAnchor).isActive = true
-            row.heightAnchor.constraint(equalToConstant: 48).isActive = true
         }
         return section
     }
@@ -417,7 +453,14 @@ private final class AgentPopoverViewController: NSViewController {
         project.lineBreakMode = .byTruncatingMiddle
         let metadata = label(metadataText(for: group), size: 11, color: .secondaryLabelColor)
         metadata.lineBreakMode = .byTruncatingTail
-        let textStack = NSStackView(views: [project, metadata])
+        let details = detailLines(for: group).map { line -> NSTextField in
+            let field = label(line.text, size: 11, color: line.color)
+            field.lineBreakMode = .byTruncatingTail
+            field.toolTip = line.toolTip
+            field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            return field
+        }
+        let textStack = NSStackView(views: [project, metadata] + details)
         textStack.orientation = .vertical
         textStack.alignment = .leading
         textStack.spacing = 2
@@ -432,20 +475,69 @@ private final class AgentPopoverViewController: NSViewController {
         row.addSubview(textStack)
         row.addSubview(state)
         NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(greaterThanOrEqualToConstant: 48),
             badge.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
-            badge.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            badge.topAnchor.constraint(equalTo: row.topAnchor, constant: 12),
             badge.widthAnchor.constraint(equalToConstant: 24),
             badge.heightAnchor.constraint(equalToConstant: 24),
             initials.leadingAnchor.constraint(equalTo: badge.leadingAnchor),
             initials.trailingAnchor.constraint(equalTo: badge.trailingAnchor),
             initials.centerYAnchor.constraint(equalTo: badge.centerYAnchor),
             textStack.leadingAnchor.constraint(equalTo: badge.trailingAnchor, constant: 10),
-            textStack.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            textStack.topAnchor.constraint(equalTo: row.topAnchor, constant: 8),
+            {
+                // Grows with the detail lines; the 48pt minimum wins for a
+                // plain two-line row.
+                let fit = row.bottomAnchor.constraint(equalTo: textStack.bottomAnchor, constant: 8)
+                fit.priority = .defaultHigh
+                return fit
+            }(),
             state.leadingAnchor.constraint(greaterThanOrEqualTo: textStack.trailingAnchor, constant: 8),
             state.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -10),
-            state.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            state.centerYAnchor.constraint(equalTo: badge.centerYAnchor),
         ])
+
+        let tasks = group.tasks
+        if !tasks.isEmpty {
+            let pids = group.instances.map(\.pid)
+            let stop = ActionButton(title: "Stop") { [weak self] in
+                self?.onStopTasks?(pids)
+            }
+            stop.bezelStyle = .rounded
+            stop.controlSize = .small
+            stop.font = NSFont.systemFont(ofSize: 11)
+            stop.toolTip = tasks.count == 1
+                ? "Stop this command"
+                : "Stop these \(tasks.count) commands"
+            stop.translatesAutoresizingMaskIntoConstraints = false
+            row.addSubview(stop)
+            NSLayoutConstraint.activate([
+                stop.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -10),
+                stop.bottomAnchor.constraint(equalTo: row.bottomAnchor, constant: -8),
+                stop.leadingAnchor.constraint(greaterThanOrEqualTo: textStack.trailingAnchor, constant: 8),
+            ])
+        }
         return row
+    }
+
+    /// Why the agent is waiting and what it is still running, under the
+    /// project name. Without these a "Needs you" or a busy idle session is a
+    /// mystery until its terminal is opened.
+    private func detailLines(for group: AgentGroup) -> [(text: String, color: NSColor, toolTip: String)] {
+        var lines: [(text: String, color: NSColor, toolTip: String)] = []
+        if group.state == .attention, let reason = group.attentionReason, !reason.isEmpty {
+            lines.append((reason, .systemOrange, reason))
+        }
+        let tasks = group.tasks
+        let shown = tasks.count > 2 ? 1 : tasks.count
+        for task in tasks.prefix(shown) {
+            lines.append(("▸ \(task.command)", .secondaryLabelColor, task.command))
+        }
+        if tasks.count > shown {
+            let rest = tasks.dropFirst(shown).map(\.command).joined(separator: "\n")
+            lines.append(("▸ +\(tasks.count - shown) more commands", .secondaryLabelColor, rest))
+        }
+        return lines
     }
 
     private func makeEmptyState() -> NSView {
@@ -778,6 +870,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
 
+        if !isPreview && relocateToApplicationsIfNeeded() {
+            return
+        }
+
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = item.button {
             button.title = "Zz"
@@ -794,6 +890,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popoverController.onFocus = { [weak self] pid in
             self?.popover.performClose(nil)
             self?.focusPid(pid)
+        }
+        popoverController.onStopTasks = { [weak self] pids in
+            self?.stopTasks(of: pids)
         }
         popoverController.onSettings = { [weak self] in
             self?.popover.performClose(nil)
@@ -897,6 +996,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 process.waitUntilExit()
             } catch {
                 NSLog("Failed to open settings: \(error)")
+            }
+            DispatchQueue.main.async {
+                self.refreshMenu()
+            }
+        }
+    }
+
+    private func stopTasks(of agentPids: [Int]) {
+        if isPreview { return }
+        let cliPath = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/MacOS/asp")
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process()
+            process.executableURL = cliPath
+            process.arguments = ["stop-tasks"] + agentPids.map(String.init)
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            do {
+                try process.run()
+                process.waitUntilExit()
+            } catch {
+                NSLog("Failed to stop tasks: \(error)")
             }
             DispatchQueue.main.async {
                 self.refreshMenu()
@@ -1096,6 +1218,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let project = rawProject.isEmpty || rawProject == "unknown"
                     ? "Unknown project"
                     : rawProject
+                let tasks = (item["tasks"] as? [[String: Any]] ?? []).compactMap { task -> AgentTask? in
+                    guard
+                        let pid = (task["pid"] as? NSNumber)?.intValue,
+                        let command = task["command"] as? String
+                    else { return nil }
+                    return AgentTask(pid: pid, command: command)
+                }
                 return AgentInstance(
                     pid: pid,
                     kind: item["kind"] as? String ?? "Agent",
@@ -1103,7 +1232,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     branch: item["branch"] as? String ?? "",
                     cwd: item["cwd"] as? String ?? "",
                     state: state,
-                    ageSecs: (item["age_secs"] as? NSNumber)?.intValue
+                    ageSecs: (item["age_secs"] as? NSNumber)?.intValue,
+                    attentionReason: item["attention_reason"] as? String,
+                    tasks: tasks
                 )
             }
         }
@@ -1299,7 +1430,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         return InstanceList(
             agents: [
-                agent(12110, "Claude Code", "cleemo-lamdera", .attention),
+                {
+                    var waiting = agent(12110, "Claude Code", "cleemo-lamdera", .attention)
+                    waiting.attentionReason = "Claude needs your permission to use Bash"
+                    return waiting
+                }(),
                 agent(16599, "Claude Code", "cleemo-lamdera", .attention),
                 agent(14433, "Claude Code", "webhealth", .attention),
                 agent(18206, "Claude Code", "capitole-immo-vision", .attention),
@@ -1310,7 +1445,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 agent(30102, "Hermes", "declarimmo", .idle),
                 agent(30103, "Hermes", "cleemo", .idle),
                 agent(30104, "Hermes", "default", .idle, branch: ""),
-                agent(30105, "Claude Code", "evo-hub", .idle),
+                {
+                    var polling = agent(30105, "Claude Code", "evo-hub", .working, age: 720)
+                    polling.tasks = [
+                        AgentTask(pid: 30106, command: "for i in $(seq 1 240); do git ls-remote lamdera refs/heads/main && exit 0; sleep 60; done"),
+                        AgentTask(pid: 30107, command: "python3 server.py > server.log 2>&1"),
+                    ]
+                    return polling
+                }(),
             ],
             activeCount: 1,
             hooksInstalled: true,
@@ -1458,13 +1600,138 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: - Install location
+    //
+    // A quarantined app opened from a DMG or ~/Downloads runs from a random
+    // App Translocation path, where macOS doesn't reliably honour its
+    // Accessibility grant: the switch in System Settings is on while
+    // AXIsProcessTrusted() stays false. The move has to happen here, in the
+    // app process, before the agent starts or any permission UI appears;
+    // relaunching only the agent left this translocated instance running.
+
+    private static let applicationsBundleURL =
+        URL(fileURLWithPath: "/Applications/AgentsSleepPreventer.app")
+
+    /// True when the copy in /Applications is being launched and this
+    /// instance is about to quit.
+    private func relocateToApplicationsIfNeeded() -> Bool {
+        let bundleURL = Bundle.main.bundleURL.resolvingSymlinksInPath()
+        guard bundleURL.pathExtension == "app",
+              bundleURL.path != Self.applicationsBundleURL.path
+        else { return false }
+
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Move to Applications?"
+        alert.informativeText = """
+            Agents Sleep Preventer is running from:
+            \(bundleURL.path)
+
+            From a disk image or Downloads, macOS doesn't reliably honour the Accessibility permission: the switch in System Settings can be on while dictation still has no access.
+
+            Move it to Applications and relaunch now?
+            """
+        alert.addButton(withTitle: "Move & Relaunch")
+        alert.addButton(withTitle: "Not Now")
+        guard alert.runModal() == .alertFirstButtonReturn else { return false }
+
+        do {
+            quitOtherInstances()
+            try installCopy(of: bundleURL, at: Self.applicationsBundleURL)
+        } catch {
+            showAlert(
+                "Couldn't move the app",
+                "Drag AgentsSleepPreventer.app into your Applications folder yourself, then open it from there.\n\n\(error.localizedDescription)"
+            )
+            return false
+        }
+
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.createsNewApplicationInstance = true
+        NSWorkspace.shared.openApplication(
+            at: Self.applicationsBundleURL,
+            configuration: configuration
+        ) { _, error in
+            DispatchQueue.main.async {
+                if let error {
+                    self.showAlert(
+                        "Moved, but couldn't relaunch",
+                        "Open Agents Sleep Preventer from your Applications folder.\n\n\(error.localizedDescription)"
+                    )
+                }
+                NSApp.terminate(nil)
+            }
+        }
+        return true
+    }
+
+    /// An older install still running from /Applications must quit before
+    /// its bundle is replaced, and so only one Zz stays in the menu bar.
+    private func quitOtherInstances() {
+        guard let bundleID = Bundle.main.bundleIdentifier else { return }
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            .filter { $0 != NSRunningApplication.current }
+        others.forEach { $0.terminate() }
+        let deadline = Date().addingTimeInterval(5)
+        while others.contains(where: { !$0.isTerminated }) && Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        }
+        others.filter { !$0.isTerminated }.forEach { $0.forceTerminate() }
+    }
+
+    /// Copies next to the destination first so a failed copy never leaves
+    /// the user without an installed app.
+    private func installCopy(of source: URL, at destination: URL) throws {
+        let fileManager = FileManager.default
+        let staging = destination.deletingLastPathComponent()
+            .appendingPathComponent(".\(destination.lastPathComponent).moving")
+        try? fileManager.removeItem(at: staging)
+        // Without the quarantine flag the copy isn't translocated again.
+        try runTool("/usr/bin/ditto", ["--noqtn", source.path, staging.path])
+        if fileManager.fileExists(atPath: destination.path) {
+            _ = try fileManager.replaceItemAt(destination, withItemAt: staging)
+        } else {
+            try fileManager.moveItem(at: staging, to: destination)
+        }
+    }
+
+    private func runTool(_ path: String, _ arguments: [String]) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw NSError(
+                domain: "AgentsSleepPreventer",
+                code: Int(process.terminationStatus),
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "\(process.executableURL?.lastPathComponent ?? path) failed (exit \(process.terminationStatus))"
+                ]
+            )
+        }
+    }
+
+    private func showAlert(_ title: String, _ message: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.runModal()
+    }
+
     // MARK: - Permissions panel
     //
     // ASP needs exactly two TCC permissions, both for dictation:
     // Accessibility (hotkey event tap + text insertion) and Microphone.
     // The panel shows what's missing, deep-links to the right System
     // Settings pane, and re-checks live; once Accessibility appears the
-    // agent is restarted so the hotkey listener actually starts.
+    // agent is restarted so the hotkey listener actually starts. It is the
+    // only permissions UI: the agent's first-launch onboarding only offers
+    // the dictation model.
 
     private func accessibilityGranted() -> Bool {
         AXIsProcessTrusted()
@@ -1549,13 +1816,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 action: #selector(openMicSettings))
         }
 
-        let stack = NSStackView(views: [
+        let accessibilityOK = accessibilityGranted()
+        var accessibilityViews: [NSView] = [
             permissionRow(
                 name: "Accessibility",
                 caption: "Dictation hotkey and text insertion",
-                granted: accessibilityGranted(),
+                granted: accessibilityOK,
                 actionTitle: "Open Settings…",
                 action: #selector(openAccessibilitySettings)),
+        ]
+        if !accessibilityOK {
+            let reset = NSButton(
+                title: "Switch already on but still red? Reset it…",
+                target: self,
+                action: #selector(resetAccessibilityPermission)
+            )
+            reset.isBordered = false
+            reset.contentTintColor = .linkColor
+            reset.font = NSFont.systemFont(ofSize: 11)
+            accessibilityViews.append(reset)
+        }
+        let accessibility = NSStackView(views: accessibilityViews)
+        accessibility.orientation = .vertical
+        accessibility.alignment = .leading
+        accessibility.spacing = 4
+        // Keeps "Open Settings…" aligned with the microphone row's action.
+        accessibilityViews[0].widthAnchor
+            .constraint(equalTo: accessibility.widthAnchor).isActive = true
+
+        let intro = label(
+            "Dictation runs entirely on this Mac. It needs these two permissions:",
+            size: 12,
+            color: .secondaryLabelColor
+        )
+        intro.lineBreakMode = .byWordWrapping
+        intro.maximumNumberOfLines = 2
+        intro.preferredMaxLayoutWidth = 390
+
+        let stack = NSStackView(views: [
+            intro,
+            accessibility,
             micRow,
             {
                 let note = label(
@@ -1585,6 +1885,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for row in stack.arrangedSubviews where row is NSStackView {
             row.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40).isActive = true
         }
+        // The reset link comes and goes with the Accessibility status.
+        window.setContentSize(NSSize(width: 430, height: stack.fittingSize.height))
     }
 
     private func permissionRow(
@@ -1633,6 +1935,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         field.lineBreakMode = .byTruncatingTail
         field.maximumNumberOfLines = 1
         return field
+    }
+
+    /// A grant recorded for another copy or an older signature of the app
+    /// keeps the switch on in System Settings while AXIsProcessTrusted()
+    /// stays false. Dropping the entry and prompting again registers this
+    /// copy; the user then flips the fresh switch.
+    @objc private func resetAccessibilityPermission() {
+        if let bundleID = Bundle.main.bundleIdentifier {
+            do {
+                try runTool("/usr/bin/tccutil", ["reset", "Accessibility", bundleID])
+            } catch {
+                NSLog("Failed to reset Accessibility permission: \(error)")
+            }
+        }
+        openAccessibilitySettings()
     }
 
     @objc private func openAccessibilitySettings() {

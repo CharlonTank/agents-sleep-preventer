@@ -104,15 +104,21 @@ Integration test: `cargo test --test parakeet_integration` (skips if the model i
 Hooks spool JSON to `runtime_dir::notifications_dir()`; the running app (menubar or agent loop) drains it every ~1-2s and posts via `NSUserNotificationCenter` (`src/notifications.rs`).
 
 - Task finished: `cmd_stop` notifies if the PID file is older than `TASK_DONE_MIN_SECS` (45s) — shorter tasks mean the user is still watching.
-- Needs attention: Claude Code `Notification` hook → `~/.claude/hooks/agent-attention.sh` → `asp attention` (reads hook JSON on stdin, extracts `.message`).
+- Needs attention: Claude Code `Notification` hook → `~/.claude/hooks/agent-attention.sh` → `asp attention` (reads hook JSON on stdin, extracts `.message`). The attention marker file stores that message; `asp list` returns it as `attention_reason` and the menu shows it under the project.
+- "Needs you" reconciliation reads Claude Code's own `<profile>/sessions/<pid>.json` status in every profile dir (`claude_config_dirs`), not only `~/.claude`: a session on `~/.claude-evo` otherwise stayed "Needs you" for up to 6h.
+- `asp list` also returns each agent's running Bash tasks (`tasks`: outermost `shell-snapshots` wrapper + the command from its `eval '…'`). The menu lists them with a Stop button → `asp stop-tasks <agent pid>…`, which SIGTERMs each task's whole process tree (only Bash tasks of live agents, never the caller's own chain).
+- `claude --chrome-native-host` is Chrome's extension bridge, not a session: `classify_agent_process` ignores it.
 - Toggle in Settings tab 1 (`notifications.enabled`, default true).
 
 ## macOS Permissions Notes
 
 The app requests only TWO permissions: Microphone and Accessibility.
 
+- **Install location**: the Swift app (`relocateToApplicationsIfNeeded`) asks to move itself to /Applications at the very start of `applicationDidFinishLaunching`, before the agent or any permission UI: translocated copies (DMG, ~/Downloads) show the Accessibility switch on while `AXIsProcessTrusted()` stays false. It quits other running instances, copies with `ditto --noqtn` via a staging bundle, relaunches, and terminates itself. The Rust agent no longer asks (it only exited the agent and left the translocated app running).
+- **Single permissions UI**: the Swift "ASP Permissions" panel (shown at launch when something is missing, and from the menu). The Rust first-launch onboarding (`run_onboarding_if_needed`) only offers the dictation model download; don't reintroduce a second permissions window.
+- **Stale grant**: the permissions panel offers "Switch already on but still red? Reset it…" → `tccutil reset Accessibility <bundle id>` + re-prompt, for a grant recorded against another copy/signature.
 - **Microphone**: App must call `AVCaptureDevice.requestAccessForMediaType:` to appear in System Preferences list. The system dialog triggers automatically.
-- **Accessibility**: Check with `AXIsProcessTrusted()`. Request with `AXIsProcessTrustedWithOptions` + `kAXTrustedCheckOptionPrompt` — this shows the system dialog AND auto-adds the app to the Accessibility list (user just flips the switch, no manual "+"). The prompt shows only once per app; later calls are no-ops, so also open `x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility` as fallback.
+- **Accessibility**: Check with `AXIsProcessTrusted()`. Request (Swift panel) with `AXIsProcessTrustedWithOptions` + `kAXTrustedCheckOptionPrompt` — this shows the system dialog AND auto-adds the app to the Accessibility list (user just flips the switch, no manual "+"). The prompt shows only once per app; later calls are no-ops, so also open `x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility` as fallback.
 - **Input Monitoring is NOT requested**: in TCC, Accessibility is a superset that covers listen-only CGEventTaps (same model as espanso/Hammerspoon). Since text injection via CGEventPost needs Accessibility anyway, Input Monitoring would be redundant. Do not re-add it.
 
 ## AppleScript Gotchas

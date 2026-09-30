@@ -1,19 +1,10 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
 
 use crate::logging;
-use crate::native_dialogs::{
-    self, PermissionToggle, PermissionsAction, PermissionsWindow, PermissionsWindowHandle,
-};
+use crate::native_dialogs;
 
-use super::audio::{
-    check_microphone_permission, request_microphone_permission_sync, MicrophonePermission,
-};
-use super::text_injection::{check_accessibility_permission, request_accessibility_permission};
 use super::transcription::{DictationSetupStatus, WhisperTranscriber};
 
 /// Check if this is the first launch (no preferences file exists)
@@ -53,45 +44,9 @@ pub fn run_onboarding_if_needed(auto_dismiss_final: bool) {
 
     logging::log("[onboarding] First launch detected, starting setup...");
 
-    let welcome_message = r#"Privacy is at the core of Agents Sleep Preventer.
-Allow these permissions to enable local voice dictation."#;
-
-    let window = PermissionsWindow::new("Set Up Permissions", welcome_message);
-    window.set_primary_button("Continue Setup");
-    window.set_secondary_button("Later");
-    window.set_secondary_visible(true);
-    window.set_progress(25.0);
-
-    loop {
-        update_permission_toggles(&window);
-        let refresh_flag = Arc::new(AtomicBool::new(true));
-        let refresh_flag_thread = refresh_flag.clone();
-        let window_handle = window.handle();
-        let refresh_thread = std::thread::spawn(move || {
-            while refresh_flag_thread.load(Ordering::Relaxed) {
-                update_permission_toggles_handle(&window_handle);
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        });
-
-        let action = window.wait_for_action();
-        refresh_flag.store(false, Ordering::Relaxed);
-        let _ = refresh_thread.join();
-
-        match action {
-            PermissionsAction::Primary => {
-                window.close();
-                break;
-            }
-            PermissionsAction::Secondary => {
-                window.close();
-                logging::log("[onboarding] User skipped onboarding");
-                return;
-            }
-            PermissionsAction::Toggle(toggle) => handle_permission_toggle(toggle),
-        }
-    }
-
+    // Permissions are asked by the menu bar app's single panel, which
+    // re-checks live and moves the app to /Applications first; onboarding
+    // only offers the dictation model.
     let model_window = native_dialogs::SetupWindow::new("Dictation Model", "Checking model...");
     setup_whisper_model(&model_window);
 
@@ -119,79 +74,6 @@ Allow these permissions to enable local voice dictation."#;
 
     mark_onboarding_complete();
     logging::log("[onboarding] Setup complete");
-}
-
-fn permission_button_label(granted: bool) -> &'static str {
-    if granted {
-        "Allowed"
-    } else {
-        "Allow"
-    }
-}
-
-fn update_permission_toggles(window: &PermissionsWindow) {
-    let mic_ok = matches!(check_microphone_permission(), MicrophonePermission::Granted);
-    let accessibility_ok = check_accessibility_permission();
-
-    window.set_toggle(
-        PermissionToggle::Microphone,
-        permission_button_label(mic_ok),
-        mic_ok,
-    );
-    window.set_toggle(
-        PermissionToggle::Accessibility,
-        permission_button_label(accessibility_ok),
-        accessibility_ok,
-    );
-}
-
-fn update_permission_toggles_handle(handle: &PermissionsWindowHandle) {
-    let mic_ok = matches!(check_microphone_permission(), MicrophonePermission::Granted);
-    let accessibility_ok = check_accessibility_permission();
-
-    handle.set_toggle(
-        PermissionToggle::Microphone,
-        permission_button_label(mic_ok),
-        mic_ok,
-    );
-    handle.set_toggle(
-        PermissionToggle::Accessibility,
-        permission_button_label(accessibility_ok),
-        accessibility_ok,
-    );
-}
-
-fn handle_permission_toggle(toggle: PermissionToggle) {
-    match toggle {
-        PermissionToggle::Microphone => {
-            let mut status = check_microphone_permission();
-            if status == MicrophonePermission::NotDetermined {
-                let granted = request_microphone_permission_sync();
-                status = if granted {
-                    MicrophonePermission::Granted
-                } else {
-                    MicrophonePermission::Denied
-                };
-            }
-            if status != MicrophonePermission::Granted {
-                open_microphone_settings();
-            }
-        }
-        PermissionToggle::Accessibility => {
-            // The prompt auto-adds the app to the Accessibility list; opening
-            // the pane too lands the user right on the switch to flip. On
-            // later clicks the prompt is a no-op and only the pane opens.
-            if !request_accessibility_permission() {
-                open_accessibility_settings();
-            }
-        }
-    }
-}
-
-fn open_microphone_settings() {
-    let _ = Command::new("open")
-        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
-        .spawn();
 }
 
 pub(super) fn open_accessibility_settings() {

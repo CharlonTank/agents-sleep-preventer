@@ -138,6 +138,8 @@ enum Commands {
     List,
     /// Focus an agent instance by PID
     Focus { pid: u32 },
+    /// Stop the Bash tasks (background or running) started by these agents
+    StopTasks { pids: Vec<u32> },
     /// Clean up stale PIDs (interrupted sessions)
     Cleanup,
     /// Run as daemon with cleanup + thermal monitoring
@@ -197,6 +199,7 @@ fn main() -> Result<()> {
         Commands::Status => cmd_status()?,
         Commands::List => cmd_list()?,
         Commands::Focus { pid } => cmd_focus(pid)?,
+        Commands::StopTasks { pids } => cmd_stop_tasks(&pids)?,
         Commands::Cleanup => cmd_cleanup()?,
         Commands::Daemon { interval } => cmd_daemon(interval)?,
         Commands::Attention => cmd_attention()?,
@@ -261,6 +264,18 @@ struct AgentListItem {
     state: AgentState,
     #[serde(skip_serializing_if = "Option::is_none")]
     age_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attention_reason: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tasks: Vec<AgentTask>,
+}
+
+/// A Bash tool command the agent started that is still running: a
+/// background task after the turn ended, or the current tool call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AgentTask {
+    pid: u32,
+    command: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -391,6 +406,11 @@ fn classify_agent_process(process: &ProcessInfo) -> Option<AgentKind> {
         || executable_name_is(&process.comm, "claude")
         || is_claude_versioned_binary(arg0)
     {
+        // Chrome launches `claude --chrome-native-host` as the browser
+        // extension's messaging bridge: a helper, not a session.
+        if tokens.contains(&"--chrome-native-host") {
+            return None;
+        }
         return Some(AgentKind::Claude);
     }
 
@@ -495,9 +515,11 @@ fn ensure_pids_dir() -> Result<()> {
     Ok(())
 }
 
-fn set_attention_marker(pid: u32) {
+/// The marker holds the agent's own words ("Claude needs your permission to
+/// use Bash") so the menu can say why the agent is waiting.
+fn set_attention_marker(pid: u32, message: &str) {
     if fs::create_dir_all(runtime_dir::attention_dir()).is_ok() {
-        let _ = fs::write(runtime_dir::attention_dir().join(pid.to_string()), "");
+        let _ = fs::write(runtime_dir::attention_dir().join(pid.to_string()), message);
     }
 }
 
@@ -522,10 +544,16 @@ fn parse_claude_attention_status(content: &str) -> Option<ClaudeAttentionStatus>
     }
 }
 
+/// Each session writes its state under its own profile (CLAUDE_CONFIG_DIR).
+/// A reused PID can leave a stale file in another profile, so the most
+/// recently written one wins.
 fn claude_attention_status(home: &Path, pid: u32) -> Option<ClaudeAttentionStatus> {
-    let session_path = home.join(format!(".claude/sessions/{pid}.json"));
-    fs::read_to_string(session_path)
-        .ok()
+    claude_config_dirs(home)
+        .into_iter()
+        .map(|dir| dir.join("sessions").join(format!("{pid}.json")))
+        .filter_map(|path| Some((fs::metadata(&path).ok()?.modified().ok()?, path)))
+        .max_by_key(|(modified, _)| *modified)
+        .and_then(|(_, path)| fs::read_to_string(path).ok())
         .and_then(|content| parse_claude_attention_status(&content))
 }
 
@@ -544,11 +572,12 @@ fn should_keep_attention_marker(
     }
 }
 
-/// PIDs of live agents currently waiting for user input. Claude Code's own
-/// session status wins after a short hook/update grace period; other agents
-/// retain fresh markers but cannot stay stuck indefinitely.
-fn attention_pids(processes: &[ProcessInfo]) -> HashSet<u32> {
-    let mut pids = HashSet::new();
+/// Live agents currently waiting for user input, with the reason they gave.
+/// Claude Code's own session status wins after a short hook/update grace
+/// period; other agents retain fresh markers but cannot stay stuck
+/// indefinitely.
+fn attention_reasons(processes: &[ProcessInfo]) -> HashMap<u32, String> {
+    let mut reasons = HashMap::new();
     let process_by_pid = processes
         .iter()
         .map(|process| (process.pid, process))
@@ -581,13 +610,14 @@ fn attention_pids(processes: &[ProcessInfo]) -> HashSet<u32> {
                 .and_then(|home| claude_attention_status(home, pid));
 
             if should_keep_attention_marker(marker_age, status) {
-                pids.insert(pid);
+                let reason = fs::read_to_string(entry.path()).unwrap_or_default();
+                reasons.insert(pid, reason.trim().to_string());
             } else {
                 let _ = fs::remove_file(entry.path());
             }
         }
     }
-    pids
+    reasons
 }
 
 fn get_pid_file(pid: u32) -> PathBuf {
@@ -783,6 +813,51 @@ fn process_cpu_by_pid(pids: &[u32]) -> HashMap<u32, f32> {
 /// polling `sleep`) even when it uses no CPU.
 fn is_claude_bash_task(process: &ProcessInfo) -> bool {
     process.args.contains("/shell-snapshots/snapshot-")
+}
+
+/// The agent's Bash tasks, outermost wrapper only (what it spawns is part of
+/// the task).
+fn agent_tasks(processes: &[ProcessInfo], agent_pid: u32) -> Vec<AgentTask> {
+    let descendants = descendant_pids(processes, agent_pid)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let task_pids = processes
+        .iter()
+        .filter(|process| descendants.contains(&process.pid) && is_claude_bash_task(process))
+        .map(|process| process.pid)
+        .collect::<HashSet<_>>();
+    let mut tasks = processes
+        .iter()
+        .filter(|process| task_pids.contains(&process.pid) && !task_pids.contains(&process.ppid))
+        .map(|process| AgentTask {
+            pid: process.pid,
+            command: claude_task_command(&process.args),
+        })
+        .collect::<Vec<_>>();
+    tasks.sort_by_key(|task| task.pid);
+    tasks
+}
+
+/// The command Claude asked for, out of its wrapper
+/// `zsh -c source <snapshot> … && eval '<command>' < /dev/null && pwd -P >| <file>`,
+/// on one line (ps escapes newlines and tabs as `\012`/`\011`), minus a
+/// leading `cd <dir> &&` that only repeats the project.
+fn claude_task_command(args: &str) -> String {
+    let command = args
+        .split_once("eval '")
+        .and_then(|(_, rest)| rest.rsplit_once('\''))
+        .map(|(command, _)| command.replace("'\\''", "'"))
+        .unwrap_or_else(|| args.to_string())
+        .replace("\\012", " ")
+        .replace("\\011", " ");
+    let without_cd = command.strip_prefix("cd ").and_then(|rest| {
+        ["&& ", "; "]
+            .iter()
+            .filter_map(|separator| rest.find(separator).map(|at| at + separator.len()))
+            .min()
+            .map(|end| rest[end..].trim_start().to_string())
+    });
+    without_cd.unwrap_or(command)
 }
 
 fn process_tree_is_busy(processes: &[ProcessInfo], pid: u32, excluded: &HashSet<u32>) -> bool {
@@ -1241,7 +1316,7 @@ fn cmd_attention() -> Result<()> {
         .unwrap_or("Agent");
 
     if let Some(pid) = agent_pid {
-        set_attention_marker(pid);
+        set_attention_marker(pid, &message);
     }
     notifications::spool(
         &format!("{} needs attention", agent_name),
@@ -1333,7 +1408,7 @@ fn build_agent_list_items(
     processes: &[ProcessInfo],
     agent_processes: &[ProcessInfo],
     working: &HashMap<u32, u64>,
-    attention: &HashSet<u32>,
+    attention: &HashMap<u32, String>,
     cwds: &HashMap<u32, String>,
 ) -> Vec<AgentListItem> {
     let process_by_pid = processes
@@ -1345,7 +1420,7 @@ fn build_agent_list_items(
         .map(|process| process.pid)
         .collect::<BTreeSet<_>>();
     all_pids.extend(working.keys().copied());
-    all_pids.extend(attention.iter().copied());
+    all_pids.extend(attention.keys().copied());
 
     let mut project_cache = HashMap::<String, ProjectInfo>::new();
     let mut agents = all_pids
@@ -1365,7 +1440,7 @@ fn build_agent_list_items(
                 project_info.branch.clear();
             }
 
-            let state = agent_state(attention.contains(&pid), working.contains_key(&pid));
+            let state = agent_state(attention.contains_key(&pid), working.contains_key(&pid));
             AgentListItem {
                 pid,
                 kind: process
@@ -1380,6 +1455,11 @@ fn build_agent_list_items(
                 age_secs: (state == AgentState::Working)
                     .then(|| working.get(&pid).copied())
                     .flatten(),
+                attention_reason: attention
+                    .get(&pid)
+                    .filter(|reason| !reason.is_empty())
+                    .cloned(),
+                tasks: agent_tasks(processes, pid),
             }
         })
         .collect::<Vec<_>>();
@@ -1398,13 +1478,13 @@ fn cmd_list() -> Result<()> {
     let processes = load_process_table();
     let agent_processes = select_agent_processes(&processes);
     let working = working_pid_ages();
-    let attention = attention_pids(&processes);
+    let attention = attention_reasons(&processes);
     let mut all_pids = agent_processes
         .iter()
         .map(|process| process.pid)
         .collect::<BTreeSet<_>>();
     all_pids.extend(working.keys().copied());
-    all_pids.extend(attention.iter().copied());
+    all_pids.extend(attention.keys().copied());
     let cwd_by_pid = get_process_cwds(&all_pids.into_iter().collect::<Vec<_>>());
     let agents = build_agent_list_items(
         &processes,
@@ -1436,7 +1516,7 @@ fn cmd_list() -> Result<()> {
                 "cpu": get_process_cpu(pid),
                 "location": location,
                 "kind": agent.kind.as_str(),
-                "attention": attention.contains(&pid),
+                "attention": attention.contains_key(&pid),
             }))
         })
         .collect::<Vec<_>>();
@@ -1455,7 +1535,7 @@ fn cmd_list() -> Result<()> {
                 "pid": process.pid,
                 "location": location,
                 "kind": agent.kind.as_str(),
-                "attention": attention.contains(&process.pid),
+                "attention": attention.contains_key(&process.pid),
             }))
         })
         .collect::<Vec<_>>();
@@ -2610,6 +2690,74 @@ hooks = false
     }
 
     #[test]
+    fn agent_tasks_list_outermost_bash_tasks_with_their_command() {
+        let agent = 9_000_001;
+        let process = |pid, ppid, args: &str| ProcessInfo {
+            pid,
+            ppid,
+            comm: "/bin/zsh".to_string(),
+            args: args.to_string(),
+        };
+        let server = process(
+            9_000_003,
+            agent,
+            "/bin/zsh -c source /Users/x/.claude-evo/shell-snapshots/snapshot-zsh-1-a.sh 2>/dev/null || true && eval 'cd ~/projects/site && python3 server.py > log 2>&1' < /dev/null && pwd -P >| /tmp/claude-39ce-cwd",
+        );
+        let nested = process(
+            9_000_004,
+            9_000_003,
+            "/bin/zsh -c source /Users/x/.claude/shell-snapshots/snapshot-zsh-2-b.sh && eval 'true'",
+        );
+        let python = process(9_000_005, 9_000_003, "python3 server.py");
+        let mcp = process(9_000_006, agent, "node /Users/x/mcp/index.mjs");
+        let other_agent_task = process(
+            9_000_007,
+            9_000_099,
+            "/bin/zsh -c source /Users/x/.claude/shell-snapshots/snapshot-zsh-3-c.sh && eval 'sleep 60'",
+        );
+
+        assert_eq!(
+            agent_tasks(&[server, nested, python, mcp, other_agent_task], agent),
+            vec![AgentTask {
+                pid: 9_000_003,
+                command: "python3 server.py > log 2>&1".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn claude_task_command_unescapes_quotes_and_keeps_unwrapped_args() {
+        assert_eq!(
+            claude_task_command(
+                "/bin/zsh -c source /x/shell-snapshots/snapshot-zsh-1-a.sh && eval 'echo '\\''hi'\\''; sleep 5' < /dev/null && pwd -P >| /tmp/c"
+            ),
+            "echo 'hi'; sleep 5"
+        );
+        assert_eq!(
+            claude_task_command("/bin/zsh -c cd /x; for i in 1 2; do sleep 1; done"),
+            "/bin/zsh -c cd /x; for i in 1 2; do sleep 1; done"
+        );
+        assert_eq!(
+            claude_task_command(
+                "/bin/zsh -c source /x/shell-snapshots/snapshot-zsh-1-a.sh && eval 'python3 -c \"\\012import sys\\012\\011print(1)\"'"
+            ),
+            "python3 -c \" import sys  print(1)\""
+        );
+    }
+
+    #[test]
+    fn classify_agent_process_ignores_the_chrome_native_host() {
+        let process = ProcessInfo {
+            pid: 42,
+            ppid: 1,
+            comm: "/Users/x/.local/bin/claude".to_string(),
+            args: "/Users/x/.local/bin/claude --chrome-native-host".to_string(),
+        };
+
+        assert_eq!(classify_agent_process(&process), None);
+    }
+
+    #[test]
     fn classify_agent_process_ignores_unrelated_python() {
         let process = ProcessInfo {
             pid: 42,
@@ -2747,6 +2895,22 @@ hooks = false
         assert_eq!(
             claude_attention_status(&home, 42),
             Some(ClaudeAttentionStatus::Waiting)
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn claude_attention_status_reads_the_sessions_own_profile() {
+        let home = unique_test_dir("claude-session-profile");
+        fs::create_dir_all(home.join(".claude/sessions")).unwrap();
+        let evo = home.join(".claude-evo");
+        fs::create_dir_all(evo.join("projects")).unwrap();
+        fs::create_dir_all(evo.join("sessions")).unwrap();
+        fs::write(evo.join("sessions/42.json"), r#"{"status":"idle"}"#).unwrap();
+
+        assert_eq!(
+            claude_attention_status(&home, 42),
+            Some(ClaudeAttentionStatus::NotWaiting)
         );
         fs::remove_dir_all(home).unwrap();
     }
@@ -3157,6 +3321,41 @@ fn cmd_focus(pid: u32) -> Result<()> {
     Ok(())
 }
 
+/// Signals each task with everything it spawned: stopping only the wrapper
+/// shell would orphan the server or poll loop it runs. Only Bash tasks of
+/// live agents are touched, whatever PIDs are passed.
+fn cmd_stop_tasks(pids: &[u32]) -> Result<()> {
+    logging::init();
+    let processes = load_process_table();
+    for &agent_pid in pids {
+        let is_agent = processes
+            .iter()
+            .any(|process| process.pid == agent_pid && classify_agent_process(process).is_some());
+        if !is_agent {
+            continue;
+        }
+        // Run from a Claude Bash tool call, its own wrapper is one of the tasks.
+        let own_chain = own_call_chain(&processes, agent_pid);
+        for task in agent_tasks(&processes, agent_pid)
+            .into_iter()
+            .filter(|task| !own_chain.contains(&task.pid))
+        {
+            let mut tree = descendant_pids(&processes, task.pid);
+            tree.push(task.pid);
+            for pid in tree {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
+            }
+            logging::log(&format!(
+                "[tasks] stopped task pid={} of agent pid={}",
+                task.pid, agent_pid
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn get_instance_items() -> Vec<(u32, u64, f32, String)> {
     let mut items = Vec::new();
     if let Ok(entries) = fs::read_dir(runtime_dir::pids_dir()) {
@@ -3467,7 +3666,9 @@ fn cmd_agent() -> Result<()> {
     unsafe {
         let _: objc_utils::Id = msg_send![class!(NSApplication), sharedApplication];
     }
-    ensure_running_from_applications();
+    // The Swift menu bar app moves itself to /Applications before spawning
+    // the agent; asking here too only exited the agent and left the
+    // translocated app running.
 
     run_onboarding_if_needed(true);
 
