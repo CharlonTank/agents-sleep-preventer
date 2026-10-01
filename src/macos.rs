@@ -154,12 +154,16 @@ enum Commands {
     Agent,
     /// Run native menu bar app
     Menubar,
-    /// Override sleep behavior: awake | sleep | auto
+    /// Override sleep behavior: awake | sleep | when-done | auto
     Force {
         /// awake (always prevent sleep) | sleep (never prevent) | when-done
         /// (prevent while agents work, then sleep once) | auto
         /// (prints the current mode when omitted)
         mode: Option<String>,
+        /// With when-done: sleep after this long even if agents still work
+        /// (30m, 1h, 1h30, 2h…), counted from now
+        #[arg(long, value_name = "DURATION")]
+        within: Option<String>,
     },
     /// Force reset: clear all PIDs and re-enable sleep
     Reset,
@@ -205,7 +209,7 @@ fn main() -> Result<()> {
         Commands::Attention => cmd_attention()?,
         Commands::Agent => cmd_agent()?,
         Commands::Menubar => cmd_menubar()?,
-        Commands::Force { mode } => cmd_force(mode)?,
+        Commands::Force { mode, within } => cmd_force(mode, within)?,
         Commands::Reset => cmd_reset()?,
         Commands::Thermal => cmd_thermal()?,
         Commands::Install { yes } => cmd_install(yes)?,
@@ -681,8 +685,10 @@ fn sync_sleep_state_impl(source: &str, manual_enabled: bool, interactive: bool) 
     let active = count_active_pids();
     let sleep_disabled = is_sleep_disabled();
     let thermal_warning = check_thermal_warning();
-    let force = sleep_override_from_settings();
+    let prevention = settings::AppSettings::load().sleep_prevention;
+    let force = prevention.force;
     let should_prevent = !thermal_warning
+        && !prevention.sleep_until_user_returns
         && match force {
             settings::SleepOverride::ForceAwake => true,
             settings::SleepOverride::ForceSleep => false,
@@ -724,35 +730,105 @@ const SLEEP_WHEN_DONE_GRACE: Duration = Duration::from_secs(30);
 static ALL_DONE_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// "Sleep when done": once every agent has been done for the grace period and
-/// nobody is using the Mac, fall back to Auto and put the Mac to sleep. Runs
+/// nobody is using the Mac, fall back to Auto and put the Mac to sleep. Past
+/// the optional time limit it does so even while agents still work. Runs
 /// only in the long-lived app process so the grace timer survives ticks.
 fn sleep_when_done_tick() {
     let mut all_done_since = ALL_DONE_SINCE.lock().unwrap_or_else(|e| e.into_inner());
-    if sleep_override_from_settings() != settings::SleepOverride::SleepWhenDone
-        || count_active_pids() > 0
-    {
+    let mut app_settings = settings::AppSettings::load();
+
+    if app_settings.sleep_prevention.sleep_until_user_returns {
+        // Sleep happened with no input for a minute: any input now is fresh,
+        // whether or not the idle counter ran during sleep.
+        if seconds_since_last_user_input() < RECENT_INPUT_SECS {
+            app_settings.sleep_prevention.sleep_until_user_returns = false;
+            if app_settings.save().is_ok() {
+                logging::log("[when-done] Someone is back, agents keep the Mac awake again");
+            }
+        }
+        return;
+    }
+
+    if app_settings.sleep_prevention.force != settings::SleepOverride::SleepWhenDone {
         *all_done_since = None;
         return;
     }
 
-    let since = *all_done_since.get_or_insert_with(Instant::now);
-    if since.elapsed() < SLEEP_WHEN_DONE_GRACE
-        || seconds_since_last_user_input() < RECENT_INPUT_SECS
-    {
+    let agents_working = count_active_pids() > 0;
+    let limit_reached = app_settings
+        .sleep_prevention
+        .sleep_by
+        .is_some_and(|sleep_by| unix_now() >= sleep_by);
+    if agents_working && !limit_reached {
+        *all_done_since = None;
+        return;
+    }
+    if !limit_reached {
+        let since = *all_done_since.get_or_insert_with(Instant::now);
+        if since.elapsed() < SLEEP_WHEN_DONE_GRACE {
+            return;
+        }
+    }
+    // Never put the Mac to sleep under someone using it, limit or not.
+    if seconds_since_last_user_input() < RECENT_INPUT_SECS {
         return;
     }
     *all_done_since = None;
 
-    let mut app_settings = settings::AppSettings::load();
     app_settings.sleep_prevention.force = settings::SleepOverride::Auto;
+    app_settings.sleep_prevention.sleep_by = None;
+    app_settings.sleep_prevention.sleep_until_user_returns = agents_working;
     if let Err(e) = app_settings.save() {
         // Without the fallback to Auto the Mac would be put back to sleep
         // right after every wake.
         logging::log(&format!("[when-done] Failed to reset mode to auto: {}", e));
         return;
     }
-    logging::log("[when-done] All agents done, mode back to auto, sleeping now");
+    if agents_working {
+        // Working agents hold `pmset disablesleep 1`, which sleepnow obeys.
+        if let Err(e) = set_sleep_disabled(false) {
+            logging::log(&format!("[when-done] Failed to re-enable sleep: {}", e));
+        }
+        logging::log("[when-done] Time limit reached with agents still working, mode back to auto, sleeping until someone uses the Mac");
+    } else {
+        logging::log("[when-done] All agents done, mode back to auto, sleeping now");
+    }
     force_sleep_now();
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// Minutes in a human duration: `30m`, `90`, `1h`, `1h30`, `1h30m`, `2.5h`.
+fn parse_duration_minutes(text: &str) -> Option<u64> {
+    let text = text.trim().to_ascii_lowercase();
+    let strip_minutes = |value: &str| -> Option<u64> {
+        let value = value
+            .strip_suffix("min")
+            .or_else(|| value.strip_suffix('m'))
+            .unwrap_or(value);
+        if value.is_empty() {
+            Some(0)
+        } else {
+            value.parse().ok()
+        }
+    };
+    let minutes = match text.split_once('h') {
+        Some((hours, rest)) => {
+            let hours: f64 = hours.parse().ok()?;
+            if !hours.is_finite() || hours < 0.0 {
+                return None;
+            }
+            (hours * 60.0).round() as u64 + strip_minutes(rest)?
+        }
+        None if text.is_empty() => return None,
+        None => strip_minutes(&text)?,
+    };
+    (minutes > 0).then_some(minutes)
 }
 
 /// PIDs of every descendant of `pid` in the process table.
@@ -1548,6 +1624,7 @@ fn cmd_list() -> Result<()> {
         "sleep_disabled": sleep_disabled,
         "manual_enabled": sleep_prevention_enabled_from_settings(),
         "force": sleep_override_from_settings().as_str(),
+        "sleep_by": settings::AppSettings::load().sleep_prevention.sleep_by,
         "thermal_warning": check_thermal_warning(),
     });
     println!("{}", payload);
@@ -1758,13 +1835,13 @@ fn cmd_cleanup() -> Result<()> {
     sync_sleep_state("cleanup", sleep_prevention_enabled_from_settings())
 }
 
-fn cmd_force(mode: Option<String>) -> Result<()> {
+fn cmd_force(mode: Option<String>, within: Option<String>) -> Result<()> {
     logging::init_quiet();
     let mut app_settings = settings::AppSettings::load();
 
     let new_mode = match mode.as_deref() {
         None => {
-            println!("force: {}", app_settings.sleep_prevention.force.as_str());
+            println!("{}", describe_sleep_override(&app_settings.sleep_prevention));
             return Ok(());
         }
         Some("awake") => settings::SleepOverride::ForceAwake,
@@ -1776,14 +1853,43 @@ fn cmd_force(mode: Option<String>) -> Result<()> {
             other
         ),
     };
+    let sleep_by = match within.as_deref() {
+        None => None,
+        Some(_) if new_mode != settings::SleepOverride::SleepWhenDone => {
+            anyhow::bail!("--within only applies to when-done")
+        }
+        Some(text) => {
+            let minutes = parse_duration_minutes(text).ok_or_else(|| {
+                anyhow::anyhow!("Invalid duration '{}': use e.g. 30m, 1h, 1h30", text)
+            })?;
+            Some(unix_now() + minutes * 60)
+        }
+    };
 
     app_settings.sleep_prevention.force = new_mode;
+    app_settings.sleep_prevention.sleep_by = sleep_by;
+    // Whoever runs this is at the Mac.
+    app_settings.sleep_prevention.sleep_until_user_returns = false;
     app_settings.save().map_err(anyhow::Error::msg)?;
-    logging::log(&format!("[force] mode set to {}", new_mode.as_str()));
+    logging::log(&format!(
+        "[force] mode set to {}{}",
+        new_mode.as_str(),
+        sleep_by.map_or(String::new(), |_| " with a time limit".to_string())
+    ));
 
     sync_sleep_state_impl("force", app_settings.sleep_prevention.enabled, true)?;
-    println!("force: {}", new_mode.as_str());
+    println!("{}", describe_sleep_override(&app_settings.sleep_prevention));
     Ok(())
+}
+
+fn describe_sleep_override(prevention: &settings::SleepPreventionSettings) -> String {
+    match prevention.sleep_by {
+        Some(sleep_by) if prevention.force == settings::SleepOverride::SleepWhenDone => format!(
+            "force: when-done, at the latest in {} min",
+            sleep_by.saturating_sub(unix_now()).div_ceil(60)
+        ),
+        _ => format!("force: {}", prevention.force.as_str()),
+    }
 }
 
 /// Thermal recovery: clear the working markers and re-enable sleep, but keep
@@ -1800,8 +1906,14 @@ fn cmd_reset() -> Result<()> {
     // drop any force override too, otherwise the next sync would immediately
     // re-apply it.
     let mut app_settings = settings::AppSettings::load();
-    if app_settings.sleep_prevention.force != settings::SleepOverride::Auto {
+    let prevention = &app_settings.sleep_prevention;
+    if prevention.force != settings::SleepOverride::Auto
+        || prevention.sleep_by.is_some()
+        || prevention.sleep_until_user_returns
+    {
         app_settings.sleep_prevention.force = settings::SleepOverride::Auto;
+        app_settings.sleep_prevention.sleep_by = None;
+        app_settings.sleep_prevention.sleep_until_user_returns = false;
         let _ = app_settings.save();
         logging::log("[reset] force override cleared");
     }
@@ -2743,6 +2855,21 @@ hooks = false
             ),
             "python3 -c \" import sys  print(1)\""
         );
+    }
+
+    #[test]
+    fn parse_duration_minutes_accepts_the_menu_and_cli_forms() {
+        assert_eq!(parse_duration_minutes("30m"), Some(30));
+        assert_eq!(parse_duration_minutes("90"), Some(90));
+        assert_eq!(parse_duration_minutes("1h"), Some(60));
+        assert_eq!(parse_duration_minutes("1h30"), Some(90));
+        assert_eq!(parse_duration_minutes("1H30m"), Some(90));
+        assert_eq!(parse_duration_minutes("2.5h"), Some(150));
+        assert_eq!(parse_duration_minutes("45min"), Some(45));
+        assert_eq!(parse_duration_minutes(""), None);
+        assert_eq!(parse_duration_minutes("0m"), None);
+        assert_eq!(parse_duration_minutes("-1h"), None);
+        assert_eq!(parse_duration_minutes("soon"), None);
     }
 
     #[test]

@@ -69,16 +69,18 @@ struct InstanceList {
     let manualEnabled: Bool
     let force: SleepOverride
     let thermalWarning: Bool
+    /// "Sleep when done" time limit: sleep by then even if agents still work.
+    var sleepBy: Date? = nil
 
     static let empty = InstanceList(
         agents: [], activeCount: 0, hooksInstalled: true, sleepDisabled: false,
         manualEnabled: true, force: .auto, thermalWarning: false)
 
-    func withForce(_ value: SleepOverride) -> InstanceList {
+    func withForce(_ value: SleepOverride, sleepBy: Date? = nil) -> InstanceList {
         InstanceList(
             agents: agents, activeCount: activeCount, hooksInstalled: hooksInstalled,
             sleepDisabled: sleepDisabled, manualEnabled: manualEnabled,
-            force: value, thermalWarning: thermalWarning)
+            force: value, thermalWarning: thermalWarning, sleepBy: sleepBy)
     }
 
     func agents(in state: AgentState) -> [AgentInstance] {
@@ -226,6 +228,8 @@ private final class AgentPopoverViewController: NSViewController {
     var onInstallHooks: (() -> Void)?
     var onMore: ((NSButton) -> Void)?
     var onSleepOverride: ((SleepOverride) -> Void)?
+    /// "Sleep when done" time limit in minutes from now; nil = no limit.
+    var onSleepLimit: ((Int?) -> Void)?
     var onInstallUpdate: (() -> Void)?
 
     private var currentList = InstanceList.empty
@@ -292,7 +296,7 @@ private final class AgentPopoverViewController: NSViewController {
             root.topAnchor.constraint(equalTo: view.topAnchor),
             root.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             header.heightAnchor.constraint(equalToConstant: 76),
-            forceAwakeRow.heightAnchor.constraint(equalToConstant: 46),
+            forceAwakeRow.heightAnchor.constraint(equalToConstant: list.force == .whenDone ? 76 : 46),
             footer.heightAnchor.constraint(equalToConstant: 50),
             scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 120),
         ])
@@ -301,7 +305,8 @@ private final class AgentPopoverViewController: NSViewController {
             + list.groups(in: .working)
             + list.groups(in: .idle).prefix(showAllIdle ? 8 : 3)
         let rowsHeight = visibleGroups.reduce(0) { $0 + 54 + detailLines(for: $1).count * 15 }
-        let height = min(686, max(376, 226 + rowsHeight))
+        let limitLine = list.force == .whenDone ? 30 : 0
+        let height = min(716, max(376, 226 + limitLine + rowsHeight))
         preferredContentSize = NSSize(width: 390, height: height)
     }
 
@@ -578,7 +583,7 @@ private final class AgentPopoverViewController: NSViewController {
         control.segmentDistribution = .fillProportionally
         control.setToolTip("Never keep the Mac awake, even while agents work", forSegment: 0)
         control.setToolTip(
-            "Keep the Mac awake while agents work, then put it to sleep once they are all done and you have stepped away. Returns to Auto afterwards.",
+            "Keep the Mac awake while agents work, then put it to sleep once they are all done and you have stepped away. An optional time limit makes it sleep then even if agents still work. Returns to Auto afterwards.",
             forSegment: 1)
         control.setToolTip("Keep the Mac awake while agents work", forSegment: 2)
         control.setToolTip("Keep the Mac awake even when no agent is working", forSegment: 3)
@@ -595,9 +600,53 @@ private final class AgentPopoverViewController: NSViewController {
         NSLayoutConstraint.activate([
             control.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 18),
             control.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -18),
-            control.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+        ])
+        guard list.force == .whenDone else {
+            control.centerYAnchor.constraint(equalTo: row.centerYAnchor).isActive = true
+            return row
+        }
+
+        let limit = makeSleepLimitLine(sleepBy: list.sleepBy)
+        limit.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(limit)
+        NSLayoutConstraint.activate([
+            control.topAnchor.constraint(equalTo: row.topAnchor, constant: 12),
+            limit.leadingAnchor.constraint(equalTo: control.leadingAnchor),
+            limit.topAnchor.constraint(equalTo: control.bottomAnchor, constant: 8),
         ])
         return row
+    }
+
+    static let sleepLimitChoices: [(title: String, minutes: Int)] = [
+        ("never", 0), ("in 30 min", 30), ("in 1 h", 60), ("in 1 h 30", 90),
+        ("in 2 h", 120), ("in 2 h 30", 150),
+    ]
+
+    /// "Even if agents keep working, sleep [by 02:07 ▾]": agents polling on
+    /// a schedule would otherwise keep the Mac awake all night. Picking a
+    /// duration counts from now, so it also grants more time.
+    private func makeSleepLimitLine(sleepBy: Date?) -> NSView {
+        let caption = label("Even if agents keep working, sleep", size: 11, color: .secondaryLabelColor)
+        let menu = NSPopUpButton(frame: .zero, pullsDown: true)
+        menu.controlSize = .small
+        menu.font = NSFont.systemFont(ofSize: 11)
+        let title = sleepBy.map {
+            "by \(DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .short))"
+        } ?? "never"
+        menu.addItem(withTitle: title)
+        for choice in Self.sleepLimitChoices {
+            menu.addItem(withTitle: choice.title)
+            menu.lastItem?.tag = choice.minutes
+        }
+        menu.target = self
+        menu.action = #selector(sleepLimitChanged(_:))
+        menu.setAccessibilityLabel("Sleep time limit")
+
+        let line = NSStackView(views: [caption, menu])
+        line.orientation = .horizontal
+        line.alignment = .centerY
+        line.spacing = 4
+        return line
     }
 
     private func makeFooter(for list: InstanceList) -> NSView {
@@ -684,6 +733,9 @@ private final class AgentPopoverViewController: NSViewController {
         } else if list.force == .sleep {
             text = "FORCED SLEEP"
             color = .systemOrange
+        } else if list.force == .whenDone, let sleepBy = list.sleepBy {
+            text = "SLEEP BY \(DateFormatter.localizedString(from: sleepBy, dateStyle: .none, timeStyle: .short))"
+            color = .systemTeal
         } else if list.force == .whenDone {
             text = "SLEEP WHEN DONE"
             color = .systemTeal
@@ -819,6 +871,11 @@ private final class AgentPopoverViewController: NSViewController {
         onSleepOverride?(mode)
     }
 
+    @objc private func sleepLimitChanged(_ sender: NSPopUpButton) {
+        guard let minutes = sender.selectedItem?.tag else { return }
+        onSleepLimit?(minutes == 0 ? nil : minutes)
+    }
+
     @objc private func installHooks() {
         onInstallHooks?()
     }
@@ -841,7 +898,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isRefreshing = false
     private var refreshPopoverOnNextList = false
     private var refreshRequestedWhileFetching = false
-    private var pendingForce: SleepOverride?
+    /// A force/time-limit write in flight, overlaid on snapshots fetched
+    /// before it lands; `overrideWrites` lets only the newest one clear it.
+    private var pendingOverride: (force: SleepOverride, sleepBy: Date?)?
+    private var overrideWrites = 0
     private let forceAwakeQueue = DispatchQueue(label: "asp.forceawake")
     /// A background check found an update; the popover shows a badge for it.
     private var updateAvailable = false
@@ -907,6 +967,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         popoverController.onSleepOverride = { [weak self] mode in
             self?.setSleepOverride(mode)
+        }
+        popoverController.onSleepLimit = { [weak self] minutes in
+            self?.setSleepOverride(.whenDone, limitMinutes: minutes)
         }
         popoverController.onInstallUpdate = { [weak self] in
             self?.showPendingUpdate()
@@ -1026,16 +1089,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func setSleepOverride(_ mode: SleepOverride) {
+    /// `limitMinutes` (with .whenDone): sleep after that long even if agents
+    /// still work, counted from now.
+    private func setSleepOverride(_ mode: SleepOverride, limitMinutes: Int? = nil) {
         // Optimistic local update so intermediate renders keep the new state;
-        // apply() overlays pendingForce onto snapshots fetched before the
+        // apply() overlays pendingOverride onto snapshots fetched before the
         // CLI write lands.
-        latestList = latestList.withForce(mode)
-        pendingForce = mode
+        let sleepBy = limitMinutes.map { Date().addingTimeInterval(TimeInterval($0 * 60)) }
+        latestList = latestList.withForce(mode, sleepBy: sleepBy)
+        pendingOverride = (mode, sleepBy)
+        overrideWrites += 1
+        let write = overrideWrites
         updateStatusTitle(with: latestList)
         if isPreview {
             popoverController.render(latestList)
-            pendingForce = nil
+            popover.contentSize = popoverController.preferredContentSize
+            pendingOverride = nil
             return
         }
 
@@ -1047,6 +1116,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let process = Process()
             process.executableURL = cliPath
             process.arguments = ["force", mode.rawValue]
+                + (limitMinutes.map { ["--within", "\($0)m"] } ?? [])
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
             do {
@@ -1057,8 +1127,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             DispatchQueue.main.async {
                 // Only the newest click's completion clears the overlay
-                if self.pendingForce == mode {
-                    self.pendingForce = nil
+                if self.overrideWrites == write {
+                    self.pendingOverride = nil
                 }
                 self.refreshMenu()
             }
@@ -1140,9 +1210,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func apply(_ list: InstanceList, updatePopover: Bool = true) {
         var list = list
-        if let pending = pendingForce {
+        if let pending = pendingOverride {
             // A force write is in flight; this snapshot may predate it
-            list = list.withForce(pending)
+            list = list.withForce(pending.force, sleepBy: pending.sleepBy)
         }
         latestList = list
         updateStatusTitle(with: list)
@@ -1195,11 +1265,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let manualEnabled = (json["manual_enabled"] as? NSNumber)?.boolValue ?? true
         let force = (json["force"] as? String).flatMap(SleepOverride.init(rawValue:)) ?? .auto
         let thermalWarning = (json["thermal_warning"] as? NSNumber)?.boolValue ?? false
+        let sleepBy = (json["sleep_by"] as? NSNumber)
+            .map { Date(timeIntervalSince1970: $0.doubleValue) }
 
         return InstanceList(
             agents: agents, activeCount: activeCount, hooksInstalled: hooksInstalled,
             sleepDisabled: sleepDisabled, manualEnabled: manualEnabled,
-            force: force, thermalWarning: thermalWarning)
+            force: force, thermalWarning: thermalWarning, sleepBy: sleepBy)
     }
 
     private func parseAgents(from json: [String: Any]) -> [AgentInstance] {

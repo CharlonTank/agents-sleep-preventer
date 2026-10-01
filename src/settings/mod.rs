@@ -42,6 +42,15 @@ pub struct SleepPreventionSettings {
     /// Manual override: force-awake / force-sleep / sleep-when-done / auto.
     #[serde(default)]
     pub force: SleepOverride,
+    /// "Sleep when done" time limit (unix seconds): past it the Mac sleeps
+    /// even though agents still work, e.g. one polling every 5 minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep_by: Option<u64>,
+    /// The time limit put the Mac to sleep with agents still working: they
+    /// must not keep it awake again (on a background wake) until someone
+    /// uses the Mac.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sleep_until_user_returns: bool,
 }
 
 impl Default for SleepPreventionSettings {
@@ -49,6 +58,8 @@ impl Default for SleepPreventionSettings {
         Self {
             enabled: true,
             force: SleepOverride::Auto,
+            sleep_by: None,
+            sleep_until_user_returns: false,
         }
     }
 }
@@ -453,6 +464,20 @@ mod tests {
         assert_eq!(settings.sleep_prevention.force, SleepOverride::Auto);
         // speech_to_text should have defaults
         assert_eq!(settings.speech_to_text.language, "en");
+    }
+
+    #[test]
+    fn test_sleep_when_done_time_limit_round_trip() {
+        let mut settings = AppSettings::default();
+        assert!(!serde_json::to_string(&settings).unwrap().contains("sleep_by"));
+
+        settings.sleep_prevention.force = SleepOverride::SleepWhenDone;
+        settings.sleep_prevention.sleep_by = Some(1_790_000_000);
+        settings.sleep_prevention.sleep_until_user_returns = true;
+        let saved = serde_json::to_string(&settings).unwrap();
+        let loaded: AppSettings = serde_json::from_str(&saved).unwrap();
+        assert_eq!(loaded.sleep_prevention.sleep_by, Some(1_790_000_000));
+        assert!(loaded.sleep_prevention.sleep_until_user_returns);
     }
 
     #[test]
