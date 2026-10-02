@@ -64,6 +64,7 @@ To publish a new version:
 2. Review the generated app locally.
 3. Commit and push the version bump/release changes.
 4. `cargo xtask release X.Y.Z --upload` (requires a clean pushed HEAD; creates or updates `vX.Y.Z`, marks it latest, uploads the DMG and `appcast.xml`, verifies the release assets and latest Sparkle feed)
+5. Bump the Homebrew cask: `$(brew --repository charlontank/tap)/Casks/agents-sleep-preventer.rb` (`version` + `sha256` of the DMG from `shasum -a 256`), `brew style` it, commit and push the tap.
 
 **IMPORTANT**: Minimum macOS is `MACOS_DEPLOYMENT_TARGET` in xtask (14.0) = `LSMinimumSystemVersion` in Info.plist; keep them equal. swiftc gets `-target arm64-apple-macos14.0`, cmake `CMAKE_OSX_DEPLOYMENT_TARGET`, cargo/cc `MACOSX_DEPLOYMENT_TARGET`. Without them every tool defaults to the build machine's macOS (5.0.7–5.2.0 shipped requiring macOS 27). `verify_deployment_target` fails the build if any bundled binary's `minos` is higher. whisper.cpp needs ≥ 13.3 (new Accelerate `cblas_sgemm`). whisper-cli is built in `/tmp/whisper.cpp/build-portable` with `GGML_NATIVE=OFF` + `-march=armv8.4-a+dotprod+fp16` (M1 baseline), never `-mcpu=native` of the build Mac.
 

@@ -66,6 +66,8 @@ Install this tool. Your computer stays awake while your agent works; normal slee
 
 No administrator rights are required. See the [Windows guide](windows/README.md) for build prerequisites, commands, verification, and platform differences. For dictation, open **Dictation Settings…** in the tray menu, choose Whisper or Parakeet, then **Download Dictation Model…**. Press Ctrl+Alt+Space to start recording and again to insert the transcript.
 
+Requires macOS 14 Sonoma or later on Apple Silicon.
+
 ### 🍎 Download DMG (Easiest)
 
 1. [Download the latest DMG](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-5.2.1.dmg)
@@ -78,10 +80,10 @@ The menu bar app uses Sparkle for in-app updates and can download + install new 
 ### 🍺 Homebrew
 
 ```bash
-brew tap CharlonTank/tap
-brew install agents-sleep-preventer
-asp install
+brew install --cask charlontank/tap/agents-sleep-preventer
 ```
+
+Then launch Agents Sleep Preventer from Applications: it sets up the agent hooks on first run.
 
 ### 🦀 Build from Source
 
