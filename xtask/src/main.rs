@@ -5,6 +5,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SIGNING_IDENTITY: &str = "Developer ID Application";
+/// Oldest macOS the app runs on (matches Info.plist LSMinimumSystemVersion).
+/// swiftc and cmake otherwise default to the build machine's own version,
+/// which shipped 5.0.7-5.2.0 requiring macOS 27.
+const MACOS_DEPLOYMENT_TARGET: &str = "14.0";
+/// Built for every Apple Silicon Mac, not tuned to the build machine: a
+/// native M2 build uses i8mm instructions that crash on M1.
+const WHISPER_BUILD_DIR: &str = "/tmp/whisper.cpp/build-portable";
 const SPARKLE_VERSION: &str = "2.9.0";
 const SPARKLE_RELEASE_URL: &str =
     "https://github.com/sparkle-project/Sparkle/releases/download/2.9.0/Sparkle-for-Swift-Package-Manager.zip";
@@ -86,6 +93,8 @@ fn main() -> Result<()> {
     // Ensure we're in the right directory
     let project_root = project_root()?;
     std::env::set_current_dir(&project_root)?;
+    // cargo, the cc crate and cmake all read it for every C/Rust object.
+    std::env::set_var("MACOSX_DEPLOYMENT_TARGET", MACOS_DEPLOYMENT_TARGET);
 
     match cli.command {
         Commands::BuildWindows { target } => build_windows(&target),
@@ -456,8 +465,66 @@ fn codesign_dmg(path: &Path) -> Result<()> {
     )
 }
 
+fn build_menubar(sparkle_framework_slice: &Path) -> Result<()> {
+    let target = format!("arm64-apple-macos{MACOS_DEPLOYMENT_TARGET}");
+    run(
+        "swiftc",
+        &[
+            "swift/menubar.swift",
+            "-target",
+            &target,
+            "-parse-as-library",
+            "-O",
+            "-F",
+            sparkle_framework_slice.to_str().unwrap(),
+            "-framework",
+            "Sparkle",
+            "-Xlinker",
+            "-rpath",
+            "-Xlinker",
+            "@executable_path/../Frameworks",
+            "-o",
+            "target/release/AgentsSleepPreventer",
+        ],
+    )
+}
+
+/// Fails the build when any executable needs a newer macOS than
+/// MACOS_DEPLOYMENT_TARGET: it would not even launch there.
+fn verify_deployment_target(binaries: &[PathBuf]) -> Result<()> {
+    let supported = parse_macos_version(MACOS_DEPLOYMENT_TARGET);
+    for binary in binaries {
+        let output = run_output("vtool", &["-show-build", binary.to_str().unwrap()])?;
+        let minos = output
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("minos "))
+            .map(|version| parse_macos_version(version.trim()))
+            .max()
+            .with_context(|| format!("No minos in {}", binary.display()))?;
+        if minos > supported {
+            bail!(
+                "{} requires macOS {}.{}, above the supported {}",
+                binary.display(),
+                minos.0,
+                minos.1,
+                MACOS_DEPLOYMENT_TARGET
+            );
+        }
+    }
+    Ok(())
+}
+
+fn parse_macos_version(version: &str) -> (u32, u32) {
+    let mut parts = version.split('.').map(|part| part.parse().unwrap_or(0));
+    (parts.next().unwrap_or(0), parts.next().unwrap_or(0))
+}
+
+fn whisper_cli_path() -> PathBuf {
+    Path::new(WHISPER_BUILD_DIR).join("bin/whisper-cli")
+}
+
 fn ensure_whisper_cli() -> Result<()> {
-    let whisper_cli_path = Path::new("/tmp/whisper.cpp/build/bin/whisper-cli");
+    let whisper_cli_path = whisper_cli_path();
     if whisper_cli_path.exists() {
         return Ok(());
     }
@@ -476,11 +543,10 @@ fn ensure_whisper_cli() -> Result<()> {
         )?;
     }
 
-    let build_dir = repo_dir.join("build");
-    fs::create_dir_all(&build_dir)?;
+    let build_dir = Path::new(WHISPER_BUILD_DIR);
+    fs::create_dir_all(build_dir)?;
 
-    let is_arm = matches!(std::env::consts::ARCH, "aarch64" | "arm");
-    let mut cmake_args = vec![
+    let cmake_args = [
         "..".to_string(),
         "-DBUILD_SHARED_LIBS=OFF".to_string(),
         "-DGGML_METAL=ON".to_string(),
@@ -488,20 +554,24 @@ fn ensure_whisper_cli() -> Result<()> {
         "-DGGML_CCACHE=OFF".to_string(),
         "-DGGML_OPENMP=OFF".to_string(),
         "-DCMAKE_WARN_DEPRECATED=OFF".to_string(),
+        format!("-DCMAKE_OSX_DEPLOYMENT_TARGET={MACOS_DEPLOYMENT_TARGET}"),
+        // M1 baseline (Apple A14): no i8mm/bf16, which M2+ add.
+        "-DGGML_NATIVE=OFF".to_string(),
+        "-DGGML_CPU_ARM_ARCH=armv8.4-a+dotprod+fp16".to_string(),
     ];
-    if is_arm {
-        cmake_args.push("-DARM_NATIVE_FLAG=-mcpu=native".to_string());
-    }
     let cmake_args_ref: Vec<&str> = cmake_args.iter().map(String::as_str).collect();
-    run_in_dir("cmake", &cmake_args_ref, &build_dir)?;
+    run_in_dir("cmake", &cmake_args_ref, build_dir)?;
 
     let jobs = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);
-    run_in_dir("make", &[&format!("-j{}", jobs), "whisper-cli"], &build_dir)?;
+    run_in_dir("make", &[&format!("-j{}", jobs), "whisper-cli"], build_dir)?;
 
     if !whisper_cli_path.exists() {
-        bail!("whisper-cli build failed (missing /tmp/whisper.cpp/build/bin/whisper-cli)");
+        bail!(
+            "whisper-cli build failed (missing {})",
+            whisper_cli_path.display()
+        );
     }
 
     Ok(())
@@ -624,29 +694,11 @@ fn build_dmg(skip_notarize: bool) -> Result<()> {
         bail!("swift/menubar.swift not found");
     }
     fs::create_dir_all("target/release")?;
-    run(
-        "swiftc",
-        &[
-            "swift/menubar.swift",
-            "-parse-as-library",
-            "-O",
-            "-F",
-            sparkle_framework_slice.to_str().unwrap(),
-            "-framework",
-            "Sparkle",
-            "-Xlinker",
-            "-rpath",
-            "-Xlinker",
-            "@executable_path/../Frameworks",
-            "-o",
-            "target/release/AgentsSleepPreventer",
-        ],
-    )?;
+    build_menubar(&sparkle_framework_slice)?;
 
     // Step 3: Ensure whisper-cli
     println!("[3/9] Ensuring whisper-cli...");
     ensure_whisper_cli()?;
-    let whisper_cli_path = Path::new("/tmp/whisper.cpp/build/bin/whisper-cli");
 
     // Step 4: Create app bundle
     println!("[4/9] Creating app bundle...");
@@ -680,8 +732,13 @@ fn build_dmg(skip_notarize: bool) -> Result<()> {
     )?;
 
     // Copy bundled binaries to Resources
-    fs::copy(whisper_cli_path, resources_dir.join("whisper-cli"))?;
+    fs::copy(whisper_cli_path(), resources_dir.join("whisper-cli"))?;
     copy_dictation_sounds(&resources_dir)?;
+    verify_deployment_target(&[
+        macos_dir.join("AgentsSleepPreventer"),
+        macos_dir.join("asp"),
+        resources_dir.join("whisper-cli"),
+    ])?;
 
     // Step 5: Sign bundled binaries and Sparkle before the app bundle itself
     println!("[5/9] Signing bundled binaries...");
@@ -1192,24 +1249,7 @@ fn replace_app(open_app: bool) -> Result<()> {
     println!("=== Replace App ===\n");
     println!("Building release...");
     run("cargo", &["build", "--release"])?;
-    run(
-        "swiftc",
-        &[
-            "swift/menubar.swift",
-            "-parse-as-library",
-            "-O",
-            "-F",
-            sparkle_framework_slice.to_str().unwrap(),
-            "-framework",
-            "Sparkle",
-            "-Xlinker",
-            "-rpath",
-            "-Xlinker",
-            "@executable_path/../Frameworks",
-            "-o",
-            "target/release/AgentsSleepPreventer",
-        ],
-    )?;
+    build_menubar(&sparkle_framework_slice)?;
     let bin_path = app_dir.join("Contents/MacOS/asp");
     let menubar_path = app_dir.join("Contents/MacOS/AgentsSleepPreventer");
     let plist_path = app_dir.join("Contents/Info.plist");
@@ -1217,6 +1257,7 @@ fn replace_app(open_app: bool) -> Result<()> {
     let frameworks_dir = app_dir.join("Contents/Frameworks");
     fs::copy("target/release/asp", &bin_path)?;
     fs::copy("target/release/AgentsSleepPreventer", &menubar_path)?;
+    verify_deployment_target(&[bin_path.clone(), menubar_path.clone()])?;
     fs::create_dir_all(&resources_dir)?;
     fs::create_dir_all(&frameworks_dir)?;
     copy_with_ditto(
