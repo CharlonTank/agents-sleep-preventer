@@ -307,7 +307,11 @@ private final class AgentPopoverViewController: NSViewController {
         let rowsHeight = visibleGroups.reduce(0) { $0 + 54 + detailLines(for: $1).count * 15 }
         let limitLine = list.force == .whenDone ? 30 : 0
         let height = min(716, max(376, 226 + limitLine + rowsHeight))
-        preferredContentSize = NSSize(width: 390, height: height)
+        // The 4-segment control's width follows the system's font metrics;
+        // with a fixed 390pt it overflowed and the popover clipped its right
+        // edge (issue #10). Widen to whatever the control and its margins need.
+        let width = min(520, max(390, ceil(forceAwakeRow.fittingSize.width)))
+        preferredContentSize = NSSize(width: width, height: CGFloat(height))
     }
 
     private func makeHeader(for list: InstanceList) -> NSView {
