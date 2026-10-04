@@ -68,6 +68,8 @@ To publish a new version:
 
 **IMPORTANT**: Minimum macOS is `MACOS_DEPLOYMENT_TARGET` in xtask (14.0) = `LSMinimumSystemVersion` in Info.plist; keep them equal. swiftc gets `-target arm64-apple-macos14.0`, cmake `CMAKE_OSX_DEPLOYMENT_TARGET`, cargo/cc `MACOSX_DEPLOYMENT_TARGET`. Without them every tool defaults to the build machine's macOS (5.0.7–5.2.0 shipped requiring macOS 27). `verify_deployment_target` fails the build if any bundled binary's `minos` is higher. whisper.cpp needs ≥ 13.3 (new Accelerate `cblas_sgemm`). whisper-cli is built in `/tmp/whisper.cpp/build-portable` with `GGML_NATIVE=OFF` + `-march=armv8.4-a+dotprod+fp16` (M1 baseline), never `-mcpu=native` of the build Mac.
 
+**IMPORTANT**: The app icon source is `AppIcon.icon` (Icon Composer package: `icon.json` + one full-bleed opaque 1024 px `Assets/artwork.png`, no rounded corners or margin). `compile_app_icon` runs `xcrun actool` at build time to produce `Assets.car` (macOS 26+, which draws the squircle itself) and `AppIcon.icns` (older macOS); Info.plist sets both `CFBundleIconName` and `CFBundleIconFile`. Never ship a hand-made icns alone: macOS 26+ shrinks legacy icons onto a gray plate. The artwork is rendered from `assets/logo-animated.svg`'s geometry.
+
 **IMPORTANT**: The keychain profile is `"notary"` (NOT "notarytool").
 
 **IMPORTANT**: Update the version number in README.md download links when releasing a new version.

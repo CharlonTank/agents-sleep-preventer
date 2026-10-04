@@ -519,6 +519,37 @@ fn parse_macos_version(version: &str) -> (u32, u32) {
     (parts.next().unwrap_or(0), parts.next().unwrap_or(0))
 }
 
+/// Compiles the Icon Composer icon (AppIcon.icon) into the bundle: Assets.car,
+/// whose shape macOS 26+ draws itself (a legacy icns there gets shrunk onto a
+/// gray plate), and AppIcon.icns for older macOS. Info.plist names both
+/// (CFBundleIconName / CFBundleIconFile).
+fn compile_app_icon(resources_dir: &Path) -> Result<()> {
+    let partial_plist = std::env::temp_dir().join("asp-app-icon-partial.plist");
+    run(
+        "xcrun",
+        &[
+            "actool",
+            "AppIcon.icon",
+            "--compile",
+            resources_dir.to_str().unwrap(),
+            "--platform",
+            "macosx",
+            "--minimum-deployment-target",
+            MACOS_DEPLOYMENT_TARGET,
+            "--app-icon",
+            "AppIcon",
+            "--output-partial-info-plist",
+            partial_plist.to_str().unwrap(),
+        ],
+    )?;
+    for compiled in ["Assets.car", "AppIcon.icns"] {
+        if !resources_dir.join(compiled).exists() {
+            bail!("actool did not produce {compiled}");
+        }
+    }
+    Ok(())
+}
+
 fn whisper_cli_path() -> PathBuf {
     Path::new(WHISPER_BUILD_DIR).join("bin/whisper-cli")
 }
@@ -725,7 +756,7 @@ fn build_dmg(skip_notarize: bool) -> Result<()> {
     // Copy Rust CLI binary
     fs::copy("target/release/asp", macos_dir.join("asp"))?;
     fs::copy("Info.plist", contents_dir.join("Info.plist"))?;
-    fs::copy("AppIcon.icns", resources_dir.join("AppIcon.icns"))?;
+    compile_app_icon(&resources_dir)?;
     copy_with_ditto(
         &sparkle_framework,
         &frameworks_dir.join("Sparkle.framework"),
@@ -1266,6 +1297,7 @@ fn replace_app(open_app: bool) -> Result<()> {
     )?;
     fs::copy("Info.plist", &plist_path)?;
     copy_dictation_sounds(&resources_dir)?;
+    compile_app_icon(&resources_dir)?;
 
     // Sign with the stable Developer ID (not ad hoc): TCC grants
     // (Accessibility/Microphone) are tied to the signing identity, and an
