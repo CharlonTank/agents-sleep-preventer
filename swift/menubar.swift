@@ -1243,7 +1243,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return .empty
         }
 
+        // Read while it runs: waiting first deadlocks once the list outgrows
+        // the pipe buffer (asp blocks in write, waitUntilExit never returns,
+        // and no refresh ever runs again). The watchdog bounds a hung list.
+        let watchdog = DispatchWorkItem {
+            if process.isRunning { process.terminate() }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 15, execute: watchdog)
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
+        watchdog.cancel()
         let hooksInstalled = isHooksInstalled()
 
         guard process.terminationStatus == 0 else {
@@ -1252,7 +1261,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 manualEnabled: true, force: .auto, thermalWarning: false)
         }
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
         guard
             let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
@@ -2172,8 +2180,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
 
-            process.waitUntilExit()
             let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
             let errText = String(data: errData, encoding: .utf8) ?? ""
             let status = process.terminationStatus
 
@@ -2292,8 +2300,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
 
-            process.waitUntilExit()
             let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
             let errText = String(data: errData, encoding: .utf8) ?? ""
             let status = process.terminationStatus
 

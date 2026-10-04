@@ -933,7 +933,18 @@ fn claude_task_command(args: &str) -> String {
             .min()
             .map(|end| rest[end..].trim_start().to_string())
     });
-    without_cd.unwrap_or(command)
+    truncate_chars(without_cd.unwrap_or(command), TASK_COMMAND_MAX_CHARS)
+}
+
+/// A task's command is shown on one menu line; scripts passed inline can run
+/// to thousands of characters and would bloat every `asp list`.
+const TASK_COMMAND_MAX_CHARS: usize = 200;
+
+fn truncate_chars(text: String, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((cut, _)) => format!("{}…", text[..cut].trim_end()),
+        None => text,
+    }
 }
 
 fn process_tree_is_busy(processes: &[ProcessInfo], pid: u32, excluded: &HashSet<u32>) -> bool {
@@ -2835,6 +2846,16 @@ hooks = false
                 command: "python3 server.py > log 2>&1".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn claude_task_command_is_capped_for_long_inline_scripts() {
+        let script = "é".repeat(500);
+        let command = claude_task_command(&format!(
+            "/bin/zsh -c source /x/shell-snapshots/snapshot-zsh-1-a.sh && eval 'python3 -c \"{script}\"'"
+        ));
+        assert_eq!(command.chars().count(), TASK_COMMAND_MAX_CHARS + 1);
+        assert!(command.ends_with('…'));
     }
 
     #[test]
