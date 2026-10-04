@@ -230,6 +230,8 @@ private final class AgentPopoverViewController: NSViewController {
     var onSleepOverride: ((SleepOverride) -> Void)?
     /// "Sleep when done" time limit in minutes from now; nil = no limit.
     var onSleepLimit: ((Int?) -> Void)?
+    /// "Custom…": the user types any duration (17h, 1h30, 45m).
+    var onSleepLimitCustom: (() -> Void)?
     var onInstallUpdate: (() -> Void)?
 
     private var currentList = InstanceList.empty
@@ -623,8 +625,10 @@ private final class AgentPopoverViewController: NSViewController {
 
     static let sleepLimitChoices: [(title: String, minutes: Int)] = [
         ("never", 0), ("in 30 min", 30), ("in 1 h", 60), ("in 1 h 30", 90),
-        ("in 2 h", 120), ("in 2 h 30", 150),
+        ("in 2 h", 120), ("in 3 h", 180), ("in 4 h", 240), ("in 8 h", 480),
+        ("in 12 h", 720),
     ]
+    static let customSleepLimitTag = -1
 
     /// "Even if agents keep working, sleep [by 02:07 ▾]": agents polling on
     /// a schedule would otherwise keep the Mac awake all night. Picking a
@@ -642,6 +646,9 @@ private final class AgentPopoverViewController: NSViewController {
             menu.addItem(withTitle: choice.title)
             menu.lastItem?.tag = choice.minutes
         }
+        menu.menu?.addItem(.separator())
+        menu.addItem(withTitle: "Custom…")
+        menu.lastItem?.tag = Self.customSleepLimitTag
         menu.target = self
         menu.action = #selector(sleepLimitChanged(_:))
         menu.setAccessibilityLabel("Sleep time limit")
@@ -877,6 +884,10 @@ private final class AgentPopoverViewController: NSViewController {
 
     @objc private func sleepLimitChanged(_ sender: NSPopUpButton) {
         guard let minutes = sender.selectedItem?.tag else { return }
+        if minutes == Self.customSleepLimitTag {
+            onSleepLimitCustom?()
+            return
+        }
         onSleepLimit?(minutes == 0 ? nil : minutes)
     }
 
@@ -973,7 +984,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.setSleepOverride(mode)
         }
         popoverController.onSleepLimit = { [weak self] minutes in
-            self?.setSleepOverride(.whenDone, limitMinutes: minutes)
+            self?.setSleepOverride(
+                .whenDone,
+                within: minutes.map { "\($0)m" },
+                expectedSleepBy: minutes.map { Date().addingTimeInterval(TimeInterval($0 * 60)) })
+        }
+        popoverController.onSleepLimitCustom = { [weak self] in
+            self?.promptCustomSleepLimit()
         }
         popoverController.onInstallUpdate = { [weak self] in
             self?.showPendingUpdate()
@@ -1093,13 +1110,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// `limitMinutes` (with .whenDone): sleep after that long even if agents
-    /// still work, counted from now.
-    private func setSleepOverride(_ mode: SleepOverride, limitMinutes: Int? = nil) {
+    /// Any duration the user types (`asp force --within` parses it), e.g.
+    /// to let a long task run all night: 17h, 20 hours, 1h30, 45m.
+    private func promptCustomSleepLimit() {
+        popover.performClose(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Sleep even if agents keep working, in…"
+        alert.informativeText = "Any duration, counted from now: 17h, 20 hours, 1h30, 45m."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+        field.placeholderString = "17h"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Set")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        setSleepOverride(.whenDone, within: text)
+    }
+
+    /// `within` (with .whenDone): sleep after that long even if agents still
+    /// work, counted from now. `expectedSleepBy` only feeds the optimistic
+    /// render; the next list shows the time the CLI actually stored.
+    private func setSleepOverride(
+        _ mode: SleepOverride, within: String? = nil, expectedSleepBy: Date? = nil
+    ) {
         // Optimistic local update so intermediate renders keep the new state;
         // apply() overlays pendingOverride onto snapshots fetched before the
         // CLI write lands.
-        let sleepBy = limitMinutes.map { Date().addingTimeInterval(TimeInterval($0 * 60)) }
+        let sleepBy = expectedSleepBy
         latestList = latestList.withForce(mode, sleepBy: sleepBy)
         pendingOverride = (mode, sleepBy)
         overrideWrites += 1
@@ -1120,12 +1160,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let process = Process()
             process.executableURL = cliPath
             process.arguments = ["force", mode.rawValue]
-                + (limitMinutes.map { ["--within", "\($0)m"] } ?? [])
+                + (within.map { ["--within", $0] } ?? [])
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
+            var succeeded = false
             do {
                 try process.run()
                 process.waitUntilExit()
+                succeeded = process.terminationStatus == 0
             } catch {
                 NSLog("Failed to set force mode: \(error)")
             }
@@ -1135,6 +1177,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.pendingOverride = nil
                 }
                 self.refreshMenu()
+                if !succeeded, let within {
+                    self.showAlert(
+                        "Couldn't set the time limit",
+                        "\"\(within)\" isn't a duration ASP understands. Try 17h, 20 hours, 1h30 or 45m.")
+                }
             }
         }
     }

@@ -161,7 +161,7 @@ enum Commands {
         /// (prints the current mode when omitted)
         mode: Option<String>,
         /// With when-done: sleep after this long even if agents still work
-        /// (30m, 1h, 1h30, 2h…), counted from now
+        /// (any duration: 45m, 1h30, 17h, "20 hours"), counted from now
         #[arg(long, value_name = "DURATION")]
         within: Option<String>,
     },
@@ -803,9 +803,17 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Minutes in a human duration: `30m`, `90`, `1h`, `1h30`, `1h30m`, `2.5h`.
+/// Minutes in a human duration: `30m`, `90`, `1h`, `1h30`, `1h30m`, `2.5h`,
+/// `17 hours`, `20 heures`, `45 min`.
 fn parse_duration_minutes(text: &str) -> Option<u64> {
-    let text = text.trim().to_ascii_lowercase();
+    let mut text = text.trim().to_lowercase().replace([' ', ','], "");
+    // Spelled-out units, longest first so "heures" doesn't leave "es" behind
+    for (word, unit) in [
+        ("heures", "h"), ("heure", "h"), ("hours", "h"), ("hour", "h"), ("hrs", "h"), ("hr", "h"),
+        ("minutes", "m"), ("minute", "m"), ("mins", "m"),
+    ] {
+        text = text.replace(word, unit);
+    }
     let strip_minutes = |value: &str| -> Option<u64> {
         let value = value
             .strip_suffix("min")
@@ -2887,6 +2895,10 @@ hooks = false
         assert_eq!(parse_duration_minutes("1H30m"), Some(90));
         assert_eq!(parse_duration_minutes("2.5h"), Some(150));
         assert_eq!(parse_duration_minutes("45min"), Some(45));
+        assert_eq!(parse_duration_minutes("17h"), Some(17 * 60));
+        assert_eq!(parse_duration_minutes("20 heures"), Some(20 * 60));
+        assert_eq!(parse_duration_minutes("17 Hours 30"), Some(17 * 60 + 30));
+        assert_eq!(parse_duration_minutes("45 minutes"), Some(45));
         assert_eq!(parse_duration_minutes(""), None);
         assert_eq!(parse_duration_minutes("0m"), None);
         assert_eq!(parse_duration_minutes("-1h"), None);
