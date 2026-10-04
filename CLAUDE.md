@@ -85,6 +85,8 @@ Two engines behind the model picker in Settings (`src/settings/mod.rs` `ModelEng
 
 Vocabulary words: Whisper also gets them as `--prompt`, but Parakeet cannot be prompted, so every transcript (final text and live preview, macOS and Windows) goes through `src/vocabulary.rs` `correct()`: a word or 2-3 adjacent words whose rough pronunciation key equals a vocabulary entry, or (keys ≥ 5, same first two sounds) differs by one vowel/similar consonant or one extra consonant, is replaced by the entry. Real words that differ more ("climat") are deliberately left. Keep it strict; check changes against the real `dictation-history.txt` for false positives.
 
+Shortcut gesture (`HotkeyGesture` in `src/dictation/mod.rs`, macOS): hold = push-to-talk; a press shorter than `TAP_MAX` (300 ms) is a tap and its recording is discarded; two taps whose presses are within `DOUBLE_TAP_WINDOW` (500 ms) lock recording on (hands-free) until the next press, which stops and transcribes (its release is ignored).
+
 Integration test: `cargo test --test parakeet_integration` (skips if the model isn't downloaded). Requires rustc >= 1.88.
 
 ## Sleep Prevention Logic

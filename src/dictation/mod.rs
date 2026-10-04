@@ -34,6 +34,75 @@ pub enum DictationState {
     Transcribing,
 }
 
+/// A press shorter than this is a tap, not push-to-talk.
+const TAP_MAX: Duration = Duration::from_millis(300);
+/// Two taps whose presses are at most this far apart lock recording on.
+const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(500);
+
+/// What a shortcut press or release does to the recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GestureAction {
+    Start,
+    Stop,
+    /// A lone tap: too short to hold speech, and maybe the first half of a
+    /// double tap. Dropped without transcribing.
+    Discard,
+    /// Second tap: keep recording after the keys are released.
+    Lock,
+    Nothing,
+}
+
+/// Push-to-talk by default (hold the shortcut, release to transcribe). A
+/// quick double tap locks recording on so the keys can be let go; the next
+/// press ends it.
+#[derive(Debug, Default)]
+struct HotkeyGesture {
+    pressed_at: Option<Instant>,
+    last_tap_at: Option<Instant>,
+    locked: bool,
+    ignore_release: bool,
+}
+
+impl HotkeyGesture {
+    fn press(&mut self, now: Instant, recording: bool) -> GestureAction {
+        if recording && self.locked {
+            self.locked = false;
+            // The release of this stopping press must not start anything
+            self.ignore_release = true;
+            return GestureAction::Stop;
+        }
+        if recording {
+            return GestureAction::Nothing;
+        }
+        self.pressed_at = Some(now);
+        GestureAction::Start
+    }
+
+    fn release(&mut self, now: Instant, recording: bool) -> GestureAction {
+        if std::mem::take(&mut self.ignore_release) || !recording || self.locked {
+            return GestureAction::Nothing;
+        }
+        let Some(pressed_at) = self.pressed_at.take() else {
+            return GestureAction::Stop;
+        };
+        if now.saturating_duration_since(pressed_at) >= TAP_MAX {
+            self.last_tap_at = None;
+            return GestureAction::Stop;
+        }
+        let second_tap = self
+            .last_tap_at
+            .take()
+            .is_some_and(|tap| pressed_at.saturating_duration_since(tap) <= DOUBLE_TAP_WINDOW);
+        if second_tap {
+            self.locked = true;
+            GestureAction::Lock
+        } else {
+            self.last_tap_at = Some(now);
+            GestureAction::Discard
+        }
+    }
+}
+
 pub enum DictationResult {
     Transcribed(String),
     Error(String),
@@ -62,6 +131,7 @@ pub struct DictationManager {
     accessibility_granted: bool,
     accessibility_alert_shown: bool,
     last_permission_check: Instant,
+    gesture: HotkeyGesture,
 }
 
 /// Spell listed vocabulary words the user's way, whatever the engine heard.
@@ -87,6 +157,7 @@ impl DictationManager {
             accessibility_granted: false,
             accessibility_alert_shown: false,
             last_permission_check: Instant::now(),
+            gesture: HotkeyGesture::default(),
         }
     }
 
@@ -177,16 +248,27 @@ impl DictationManager {
                 }
                 GlobeKeyEvent::DictateStart => {
                     logging::log("[dictation] DictateStart event received");
-                    if self.state == DictationState::Idle {
-                        // A new dictation replaces a lingering fallback popup
-                        self.result_popup.hide();
-                        self.start_recording();
+                    let recording = self.state == DictationState::Recording;
+                    match self.gesture.press(Instant::now(), recording) {
+                        GestureAction::Start if self.state == DictationState::Idle => {
+                            // A new dictation replaces a lingering fallback popup
+                            self.result_popup.hide();
+                            self.start_recording();
+                        }
+                        GestureAction::Stop => self.stop_and_transcribe(),
+                        _ => {}
                     }
                 }
                 GlobeKeyEvent::DictateStop => {
                     logging::log("[dictation] DictateStop event received");
-                    if self.state == DictationState::Recording {
-                        self.stop_and_transcribe();
+                    let recording = self.state == DictationState::Recording;
+                    match self.gesture.release(Instant::now(), recording) {
+                        GestureAction::Stop => self.stop_and_transcribe(),
+                        GestureAction::Discard => self.discard_recording(),
+                        GestureAction::Lock => {
+                            logging::log("[dictation] Double tap: recording locked until the next press");
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -391,6 +473,19 @@ impl DictationManager {
         logging::log("[dictation] Recording started");
     }
 
+    /// Drops a recording without transcribing it (a lone short tap).
+    fn discard_recording(&mut self) {
+        if let Some(session) = self.streaming.take() {
+            session.stop.store(true, AtomicOrdering::Relaxed);
+        }
+        if let Some(mut recorder) = self.recorder.take() {
+            recorder.stop_recording();
+        }
+        self.overlay.hide();
+        self.state = DictationState::Idle;
+        logging::log("[dictation] Short tap: recording discarded");
+    }
+
     fn stop_and_transcribe(&mut self) {
         sounds::play(sounds::Cue::Stop);
 
@@ -474,5 +569,59 @@ impl DictationManager {
 impl Drop for DictationManager {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GestureAction, HotkeyGesture};
+    use std::time::{Duration, Instant};
+
+    fn ms(start: Instant, millis: u64) -> Instant {
+        start + Duration::from_millis(millis)
+    }
+
+    #[test]
+    fn holding_the_shortcut_is_push_to_talk() {
+        let t = Instant::now();
+        let mut g = HotkeyGesture::default();
+        assert_eq!(g.press(t, false), GestureAction::Start);
+        assert_eq!(g.release(ms(t, 2000), true), GestureAction::Stop);
+    }
+
+    #[test]
+    fn double_tap_locks_until_the_next_press() {
+        let t = Instant::now();
+        let mut g = HotkeyGesture::default();
+        assert_eq!(g.press(t, false), GestureAction::Start);
+        assert_eq!(g.release(ms(t, 120), true), GestureAction::Discard);
+        assert_eq!(g.press(ms(t, 300), false), GestureAction::Start);
+        assert_eq!(g.release(ms(t, 420), true), GestureAction::Lock);
+        // Keys released, still recording; the next press ends it
+        assert_eq!(g.press(ms(t, 9000), true), GestureAction::Stop);
+        assert_eq!(g.release(ms(t, 9100), false), GestureAction::Nothing);
+        // Back to push-to-talk afterwards
+        assert_eq!(g.press(ms(t, 12000), false), GestureAction::Start);
+        assert_eq!(g.release(ms(t, 14000), true), GestureAction::Stop);
+    }
+
+    #[test]
+    fn slow_taps_do_not_lock() {
+        let t = Instant::now();
+        let mut g = HotkeyGesture::default();
+        assert_eq!(g.press(t, false), GestureAction::Start);
+        assert_eq!(g.release(ms(t, 100), true), GestureAction::Discard);
+        assert_eq!(g.press(ms(t, 1500), false), GestureAction::Start);
+        assert_eq!(g.release(ms(t, 1600), true), GestureAction::Discard);
+    }
+
+    #[test]
+    fn tap_then_hold_is_a_normal_dictation() {
+        let t = Instant::now();
+        let mut g = HotkeyGesture::default();
+        assert_eq!(g.press(t, false), GestureAction::Start);
+        assert_eq!(g.release(ms(t, 100), true), GestureAction::Discard);
+        assert_eq!(g.press(ms(t, 300), false), GestureAction::Start);
+        assert_eq!(g.release(ms(t, 3000), true), GestureAction::Stop);
     }
 }
