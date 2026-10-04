@@ -1,6 +1,8 @@
 <div align="center">
 
-# ☕ Agents Sleep Preventer
+<img src="assets/logo-animated.svg" width="140" alt="Agents Sleep Preventer logo: a crescent moon cradling a terminal prompt">
+
+# Agents Sleep Preventer
 
 ### Keep your computer awake while coding agents are working
 **Sleep prevention and local voice dictation on macOS and Windows.**

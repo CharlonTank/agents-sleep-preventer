@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Agents Sleep Preventer">
+  <title>Agents Sleep Preventer</title>
+  <style>
+    /* The moon keeps the agent company through the night: stars twinkle,
+       the moon breathes, and the prompt's cursor blinks while it works. */
+    .asp-star { transform-box: fill-box; transform-origin: center; animation: twinkle 3.4s ease-in-out infinite; }
+    .asp-s2 { animation-delay: -0.7s; } .asp-s3 { animation-delay: -1.5s; } .asp-s4 { animation-delay: -2.2s; }
+    .asp-s5 { animation-delay: -2.9s; } .asp-s6 { animation-delay: -1.1s; }
+    .asp-halo { animation: breathe 4.8s ease-in-out infinite; }
+    .asp-cursor { animation: blink 1.1s steps(1, end) infinite; }
+    .asp-chevron { animation: nudge 4.8s ease-in-out infinite; }
+    @keyframes twinkle { 0%, 100% { opacity: .25; transform: scale(.6); } 50% { opacity: 1; transform: scale(1); } }
+    @keyframes breathe { 0%, 100% { opacity: .45; } 50% { opacity: .9; } }
+    @keyframes blink { 0%, 55% { opacity: 1; } 56%, 100% { opacity: 0; } }
+    @keyframes nudge { 0%, 100% { transform: translateX(0); } 50% { transform: translateX(6px); } }
+    @media (prefers-reduced-motion: reduce) { * { animation: none !important; } }
+  </style>
+  <defs>
+    <linearGradient id="sky" x1="0.2" y1="0" x2="0.55" y2="1">
+      <stop offset="0" stop-color="#22308c"/>
+      <stop offset="0.5" stop-color="#261a64"/>
+      <stop offset="1" stop-color="#5b28d2"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.08"/>
+      <stop offset="0.45" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="moonFill" cx="0.32" cy="0.38" r="0.78">
+      <stop offset="0" stop-color="#fff8d2"/>
+      <stop offset="0.5" stop-color="#ffd977"/>
+      <stop offset="1" stop-color="#f0a43a"/>
+    </radialGradient>
+    <mask id="crescent">
+      <circle cx="495" cy="520" r="290" fill="#fff"/>
+      <circle cx="579" cy="472" r="244" fill="#000"/>
+    </mask>
+    <clipPath id="tile"><rect x="100" y="100" width="824" height="824" rx="186"/></clipPath>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#0b0620" flood-opacity="0.55"/>
+    </filter>
+    <filter id="blurBig" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="34"/></filter>
+    <filter id="blurSmall" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="12"/></filter>
+    <path id="spark" d="M0 -14 C2 -4 4 -2 14 0 C4 2 2 4 0 14 C-2 4 -4 2 -14 0 C-4 -2 -2 -4 0 -14 Z" fill="#fff6d6"/>
+  </defs>
+
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#sky)" filter="url(#shadow)"/>
+  <g clip-path="url(#tile)">
+    <rect x="100" y="100" width="824" height="824" fill="url(#sheen)"/>
+    <!-- the group places each star; the CSS animation scales the inner shape -->
+    <g transform="translate(256 213) scale(1.15)"><use href="#spark" class="asp-star asp-s1"/></g>
+    <g transform="translate(782 283) scale(1.05)"><use href="#spark" class="asp-star asp-s2"/></g>
+    <g transform="translate(669 222) scale(0.45)"><use href="#spark" class="asp-star asp-s3"/></g>
+    <g transform="translate(714 401) scale(0.4)"><use href="#spark" class="asp-star asp-s4"/></g>
+    <g transform="translate(840 478) scale(0.42)"><use href="#spark" class="asp-star asp-s5"/></g>
+    <g transform="translate(191 710) scale(0.45)"><use href="#spark" class="asp-star asp-s6"/></g>
+    <rect x="100" y="100" width="824" height="824" rx="186" fill="none" stroke="#8f9bff" stroke-opacity="0.35" stroke-width="8"/>
+  </g>
+
+  <!-- moon: a breathing halo behind the crisp crescent -->
+  <!-- blurring the already-cut crescent lets the glow spill around it -->
+  <g class="asp-halo" filter="url(#blurBig)">
+    <circle cx="495" cy="520" r="290" fill="#ffc35a" mask="url(#crescent)"/>
+  </g>
+  <circle cx="495" cy="520" r="290" fill="url(#moonFill)" mask="url(#crescent)"/>
+
+  <!-- the agent's prompt, resting in the crook of the moon -->
+  <g stroke-linecap="round" stroke-linejoin="round">
+    <g class="asp-chevron">
+      <path d="M452 418 L540 472 L452 526" fill="none" stroke="#ffc94d" stroke-width="58" filter="url(#blurSmall)" opacity="0.7"/>
+      <path d="M452 418 L540 472 L452 526" fill="none" stroke="#ffe48a" stroke-width="44"/>
+    </g>
+    <g class="asp-cursor">
+      <rect x="550" y="536" width="156" height="44" rx="22" fill="#ffc94d" filter="url(#blurSmall)" opacity="0.7"/>
+      <rect x="550" y="536" width="156" height="44" rx="22" fill="#ffe48a"/>
+    </g>
+  </g>
+</svg>
