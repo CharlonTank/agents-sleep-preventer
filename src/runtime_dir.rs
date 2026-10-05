@@ -57,6 +57,11 @@ pub fn notifications_dir() -> PathBuf {
     root().join("notifications")
 }
 
+/// Codex session id → the terminal process its daemon-run hooks belong to.
+pub fn codex_sessions_dir() -> PathBuf {
+    root().join("codex_sessions")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

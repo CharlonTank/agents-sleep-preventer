@@ -337,11 +337,47 @@ fn codex_command_index(tokens: &[&str]) -> Option<usize> {
         .position(|token| executable_name_is(token, "codex"))
 }
 
-fn is_codex_app_server(tokens: &[&str]) -> bool {
-    codex_command_index(tokens)
-        .and_then(|idx| tokens.get(idx + 1))
-        .map(|arg| *arg == "app-server")
-        .unwrap_or(false)
+/// Codex options whose value follows as a separate token.
+const CODEX_VALUE_OPTIONS: [&str; 16] = [
+    "-c",
+    "--config",
+    "-m",
+    "--model",
+    "-p",
+    "--profile",
+    "-C",
+    "--cd",
+    "-s",
+    "--sandbox",
+    "-a",
+    "--ask-for-approval",
+    "-i",
+    "--image",
+    "--enable",
+    "--disable",
+];
+
+/// Codex's background services, not sessions: the `app-server` of the
+/// desktop app and of the managed daemon (which runs the CLI sessions' turns
+/// and hooks since Codex 0.160), and the cloud `exec-server`.
+const CODEX_SERVICE_SUBCOMMANDS: [&str; 2] = ["app-server", "exec-server"];
+
+/// The first positional argument after `codex`, skipping options and their
+/// values (the desktop app runs `codex -c key=value app-server`).
+fn codex_subcommand<'a>(tokens: &[&'a str]) -> Option<&'a str> {
+    let mut rest = tokens.iter().skip(codex_command_index(tokens)? + 1);
+    while let Some(token) = rest.next() {
+        if CODEX_VALUE_OPTIONS.contains(token) {
+            rest.next();
+        } else if !token.starts_with('-') {
+            return Some(token);
+        }
+    }
+    None
+}
+
+fn is_codex_service(tokens: &[&str]) -> bool {
+    codex_subcommand(tokens).is_some_and(|sub| CODEX_SERVICE_SUBCOMMANDS.contains(&sub))
 }
 
 fn is_codex_wrapper_process(process: &ProcessInfo) -> bool {
@@ -354,14 +390,14 @@ fn is_codex_wrapper_process(process: &ProcessInfo) -> bool {
             .get(1)
             .map(|arg1| executable_name_is(arg1, "codex"))
             .unwrap_or(false)
-        && !is_codex_app_server(&tokens)
+        && !is_codex_service(&tokens)
 }
 
 fn is_codex_native_process(process: &ProcessInfo) -> bool {
     let tokens = process_tokens(process);
     let arg0 = tokens.first().copied().unwrap_or(&process.comm);
     (executable_name_is(arg0, "codex") || executable_name_is(&process.comm, "codex"))
-        && !is_codex_app_server(&tokens)
+        && !is_codex_service(&tokens)
 }
 
 fn is_python_executable(token: &str) -> bool {
@@ -489,8 +525,8 @@ fn select_agent_processes(processes: &[ProcessInfo]) -> Vec<ProcessInfo> {
 
 fn find_agent_ancestor() -> Option<u32> {
     let processes = load_process_table();
-    let by_pid: HashMap<u32, ProcessInfo> = processes
-        .into_iter()
+    let by_pid: HashMap<u32, &ProcessInfo> = processes
+        .iter()
         .map(|process| (process.pid, process))
         .collect();
     let this_pid = std::process::id();
@@ -501,8 +537,16 @@ fn find_agent_ancestor() -> Option<u32> {
             break;
         };
 
-        if current_pid != this_pid && classify_agent_process(process).is_some() {
-            return Some(current_pid);
+        if current_pid != this_pid {
+            if classify_agent_process(process).is_some() {
+                return Some(current_pid);
+            }
+            // Since Codex 0.160 the CLI hands its turns to a shared
+            // `codex app-server` daemon, which runs the hooks: the session's
+            // terminal process is not among our ancestors.
+            if is_codex_service(&process_tokens(process)) {
+                return Some(codex_hook_session_pid(&processes, current_pid));
+            }
         }
 
         if process.ppid == 0 || process.ppid == current_pid {
@@ -512,6 +556,100 @@ fn find_agent_ancestor() -> Option<u32> {
     }
 
     Some(std::os::unix::process::parent_id())
+}
+
+fn read_hook_input() -> Option<serde_json::Value> {
+    let mut input = String::new();
+    use std::io::Read as _;
+    std::io::stdin().read_to_string(&mut input).ok()?;
+    serde_json::from_str(&input).ok()
+}
+
+/// The terminal session a hook run by the Codex daemon belongs to. The hook
+/// JSON gives the session id and its cwd. A session's first hook picks,
+/// among the Codex processes in that cwd not tied to another live session,
+/// the busiest one (a working TUI redraws its timer); later hooks reuse that
+/// choice. With no such process (a desktop-app thread), the service itself
+/// holds the marker so the Mac still stays awake.
+fn codex_hook_session_pid(processes: &[ProcessInfo], service_pid: u32) -> u32 {
+    let Some(hook) = read_hook_input() else {
+        return service_pid;
+    };
+    let field = |name: &str| hook.get(name).and_then(|value| value.as_str());
+    let (Some(session), Some(cwd)) = (field("session_id"), field("cwd")) else {
+        return service_pid;
+    };
+
+    let sessions_dir = runtime_dir::codex_sessions_dir();
+    let claims = live_codex_session_claims(&sessions_dir, processes);
+    if let Some(&pid) = claims.get(session) {
+        return pid;
+    }
+
+    let taken: HashSet<u32> = claims.values().copied().collect();
+    let codex_pids = select_agent_processes(processes)
+        .into_iter()
+        .filter(|process| classify_agent_process(process) == Some(AgentKind::Codex))
+        .map(|process| process.pid)
+        .filter(|pid| !taken.contains(pid))
+        .collect::<Vec<_>>();
+    let session_dir = fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd));
+    let in_session_dir = get_process_cwds(&codex_pids)
+        .into_iter()
+        .filter(|(_, process_cwd)| {
+            fs::canonicalize(process_cwd).unwrap_or_else(|_| PathBuf::from(process_cwd))
+                == session_dir
+        })
+        .map(|(pid, _)| pid)
+        .collect::<Vec<_>>();
+    let Some(pid) = busiest_pid(&in_session_dir, &process_cpu_by_pid(&in_session_dir)) else {
+        return service_pid;
+    };
+
+    if is_codex_session_id(session) && fs::create_dir_all(&sessions_dir).is_ok() {
+        let _ = fs::write(sessions_dir.join(session), pid.to_string());
+    }
+    pid
+}
+
+/// Session → terminal process choices still valid (process alive and still
+/// a Codex session); stale ones are deleted on the way.
+fn live_codex_session_claims(sessions_dir: &Path, processes: &[ProcessInfo]) -> HashMap<String, u32> {
+    let codex_pids: HashSet<u32> = processes
+        .iter()
+        .filter(|process| classify_agent_process(process) == Some(AgentKind::Codex))
+        .map(|process| process.pid)
+        .collect();
+    let mut claims = HashMap::new();
+    for entry in fs::read_dir(sessions_dir).into_iter().flatten().flatten() {
+        let session = entry.file_name().to_string_lossy().into_owned();
+        let pid = fs::read_to_string(entry.path())
+            .ok()
+            .and_then(|content| content.trim().parse::<u32>().ok());
+        match pid {
+            Some(pid) if codex_pids.contains(&pid) => {
+                claims.insert(session, pid);
+            }
+            _ => {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    claims
+}
+
+/// Codex session ids are UUIDs; anything else is not used as a file name.
+fn is_codex_session_id(session: &str) -> bool {
+    !session.is_empty() && session.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// Highest CPU first, then the newest process (highest pid) on a tie.
+fn busiest_pid(pids: &[u32], cpu: &HashMap<u32, f32>) -> Option<u32> {
+    pids.iter().copied().max_by(|a, b| {
+        let cpu_a = cpu.get(a).copied().unwrap_or(0.0);
+        let cpu_b = cpu.get(b).copied().unwrap_or(0.0);
+        cpu_a.total_cmp(&cpu_b).then(a.cmp(b))
+    })
 }
 
 fn ensure_pids_dir() -> Result<()> {
@@ -1389,12 +1527,7 @@ fn agent_kind_name(kind: AgentKind) -> &'static str {
 fn cmd_attention() -> Result<()> {
     logging::init_quiet();
 
-    let mut input = String::new();
-    use std::io::Read as _;
-    let _ = std::io::stdin().read_to_string(&mut input);
-
-    let message = serde_json::from_str::<serde_json::Value>(&input)
-        .ok()
+    let message = read_hook_input()
         .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
         .filter(|m| !m.trim().is_empty())
         .unwrap_or_else(|| "Waiting for your input.".to_string());
@@ -2915,6 +3048,58 @@ hooks = false
         };
 
         assert_eq!(classify_agent_process(&process), None);
+    }
+
+    fn codex_process(args: &str) -> ProcessInfo {
+        ProcessInfo {
+            pid: 42,
+            ppid: 1,
+            comm: args.split_whitespace().next().unwrap_or_default().to_string(),
+            args: args.to_string(),
+        }
+    }
+
+    #[test]
+    fn classify_agent_process_ignores_codex_services() {
+        for args in [
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex -c features.code_mode_host=true app-server --analytics-default-enabled",
+            "/Users/x/.codex/packages/app-server-daemon/releases/0.160.1-aarch64-apple-darwin/bin/codex app-server --listen unix:// --managed-daemon",
+            "/Users/x/.codex/packages/app-server-daemon/releases/0.160.1-aarch64-apple-darwin/bin/codex app-server daemon pid-update-loop",
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex exec-server --remote https://example.com/api",
+        ] {
+            assert_eq!(classify_agent_process(&codex_process(args)), None, "{args}");
+        }
+    }
+
+    #[test]
+    fn classify_agent_process_keeps_codex_sessions() {
+        for args in [
+            "/Users/x/.bun/install/global/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex --yolo",
+            "/usr/local/bin/codex -m gpt-5 resume --last",
+            "/usr/local/bin/codex fix the app-server crash",
+        ] {
+            assert_eq!(
+                classify_agent_process(&codex_process(args)),
+                Some(AgentKind::Codex),
+                "{args}"
+            );
+        }
+    }
+
+    #[test]
+    fn busiest_pid_prefers_cpu_then_newest() {
+        let cpu = HashMap::from([(10, 0.0), (20, 4.1), (30, 0.0)]);
+        assert_eq!(busiest_pid(&[10, 20, 30], &cpu), Some(20));
+        let idle = HashMap::from([(10, 0.0), (30, 0.0)]);
+        assert_eq!(busiest_pid(&[10, 30], &idle), Some(30));
+        assert_eq!(busiest_pid(&[], &idle), None);
+    }
+
+    #[test]
+    fn codex_session_ids_are_safe_file_names() {
+        assert!(is_codex_session_id("01a10d63-cfe8-7e72-826b-fcd1a3cffd4b"));
+        assert!(!is_codex_session_id("../settings"));
+        assert!(!is_codex_session_id(""));
     }
 
     #[test]

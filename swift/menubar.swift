@@ -1047,6 +1047,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.terminate(nil)
     }
 
+    private static let repositoryURL = URL(string: "https://github.com/CharlonTank/agents-sleep-preventer")!
+
+    @objc private func openGitHubIssue() {
+        NSWorkspace.shared.open(Self.repositoryURL.appendingPathComponent("issues/new"))
+    }
+
+    @objc private func openGitHubRepository() {
+        NSWorkspace.shared.open(Self.repositoryURL)
+    }
+
     @objc private func openLogs() {
         let logDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Logs/AgentsSleepPreventer")
@@ -1492,6 +1502,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         updates.target = self
         menu.addItem(updates)
+        menu.addItem(.separator())
+
+        let issue = NSMenuItem(
+            title: "Report an Issue...",
+            action: #selector(openGitHubIssue),
+            keyEquivalent: ""
+        )
+        issue.target = self
+        menu.addItem(issue)
+        let source = NSMenuItem(
+            title: "View Source on GitHub",
+            action: #selector(openGitHubRepository),
+            keyEquivalent: ""
+        )
+        source.target = self
+        menu.addItem(source)
         menu.addItem(.separator())
 
         let logs = NSMenuItem(title: "Open Logs", action: #selector(openLogs), keyEquivalent: "l")
