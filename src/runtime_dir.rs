@@ -57,6 +57,11 @@ pub fn notifications_dir() -> PathBuf {
     root().join("notifications")
 }
 
+/// Auto-resume records: agents whose turn a network or API error cut off.
+pub fn interruptions_dir() -> PathBuf {
+    root().join("interruptions")
+}
+
 /// Codex session id → the terminal process its daemon-run hooks belong to.
 pub fn codex_sessions_dir() -> PathBuf {
     root().join("codex_sessions")

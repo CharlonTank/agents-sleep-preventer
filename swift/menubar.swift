@@ -26,6 +26,8 @@ struct AgentInstance {
     let state: AgentState
     let ageSecs: Int?
     var attentionReason: String? = nil
+    /// Auto-resume status after a network drop cut the agent's turn off.
+    var resumeNote: String? = nil
     var tasks: [AgentTask] = []
 }
 
@@ -46,6 +48,10 @@ struct AgentGroup {
 
     var attentionReason: String? {
         instances.lazy.compactMap(\.attentionReason).first
+    }
+
+    var resumeNote: String? {
+        instances.lazy.compactMap(\.resumeNote).first
     }
 
     var tasks: [AgentTask] {
@@ -71,6 +77,8 @@ struct InstanceList {
     let thermalWarning: Bool
     /// "Sleep when done" time limit: sleep by then even if agents still work.
     var sleepBy: Date? = nil
+    /// Type "continue" into agents a network drop cut off.
+    var autoResume: Bool = true
 
     static let empty = InstanceList(
         agents: [], activeCount: 0, hooksInstalled: true, sleepDisabled: false,
@@ -80,7 +88,8 @@ struct InstanceList {
         InstanceList(
             agents: agents, activeCount: activeCount, hooksInstalled: hooksInstalled,
             sleepDisabled: sleepDisabled, manualEnabled: manualEnabled,
-            force: value, thermalWarning: thermalWarning, sleepBy: sleepBy)
+            force: value, thermalWarning: thermalWarning, sleepBy: sleepBy,
+            autoResume: autoResume)
     }
 
     func agents(in state: AgentState) -> [AgentInstance] {
@@ -538,6 +547,9 @@ private final class AgentPopoverViewController: NSViewController {
         var lines: [(text: String, color: NSColor, toolTip: String)] = []
         if group.state == .attention, let reason = group.attentionReason, !reason.isEmpty {
             lines.append((reason, .systemOrange, reason))
+        }
+        if let note = group.resumeNote, !note.isEmpty {
+            lines.append(("⟳ \(note)", .systemBlue, note))
         }
         let tasks = group.tasks
         let shown = tasks.count > 2 ? 1 : tasks.count
@@ -1049,6 +1061,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private static let repositoryURL = URL(string: "https://github.com/CharlonTank/agents-sleep-preventer")!
 
+    @objc private func toggleAutoResume() {
+        if isPreview { return }
+        let cliPath = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/MacOS/asp")
+        let enable = !latestList.autoResume
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process()
+            process.executableURL = cliPath
+            process.arguments = ["auto-resume", enable ? "on" : "off"]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            do {
+                try process.run()
+                process.waitUntilExit()
+            } catch {
+                NSLog("Failed to set auto-resume: \(error)")
+            }
+            DispatchQueue.main.async {
+                self.refreshMenu()
+            }
+        }
+    }
+
     @objc private func openGitHubIssue() {
         NSWorkspace.shared.open(Self.repositoryURL.appendingPathComponent("issues/new"))
     }
@@ -1336,11 +1372,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let thermalWarning = (json["thermal_warning"] as? NSNumber)?.boolValue ?? false
         let sleepBy = (json["sleep_by"] as? NSNumber)
             .map { Date(timeIntervalSince1970: $0.doubleValue) }
+        let autoResume = (json["auto_resume"] as? NSNumber)?.boolValue ?? true
 
         return InstanceList(
             agents: agents, activeCount: activeCount, hooksInstalled: hooksInstalled,
             sleepDisabled: sleepDisabled, manualEnabled: manualEnabled,
-            force: force, thermalWarning: thermalWarning, sleepBy: sleepBy)
+            force: force, thermalWarning: thermalWarning, sleepBy: sleepBy,
+            autoResume: autoResume)
     }
 
     private func parseAgents(from json: [String: Any]) -> [AgentInstance] {
@@ -1375,6 +1413,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     state: state,
                     ageSecs: (item["age_secs"] as? NSNumber)?.intValue,
                     attentionReason: item["attention_reason"] as? String,
+                    resumeNote: item["resume_note"] as? String,
                     tasks: tasks
                 )
             }
@@ -1502,6 +1541,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         updates.target = self
         menu.addItem(updates)
+
+        let autoResume = NSMenuItem(
+            title: "Auto-Resume After Network Drops",
+            action: #selector(toggleAutoResume),
+            keyEquivalent: ""
+        )
+        autoResume.target = self
+        autoResume.state = latestList.autoResume ? .on : .off
+        autoResume.toolTip = "When a network drop or an API error cuts an agent off, type \"continue\" in its terminal once the connection is back."
+        menu.addItem(autoResume)
         menu.addItem(.separator())
 
         let issue = NSMenuItem(

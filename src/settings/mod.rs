@@ -245,6 +245,20 @@ impl ModelChoice {
     }
 }
 
+/// Auto-resume: type "continue" into an agent whose turn a network drop or
+/// an API error cut off, once the API answers again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoResumeSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for AutoResumeSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// Application settings
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppSettings {
@@ -254,6 +268,8 @@ pub struct AppSettings {
     pub speech_to_text: SpeechToTextSettings,
     #[serde(default)]
     pub notifications: NotificationSettings,
+    #[serde(default)]
+    pub auto_resume: AutoResumeSettings,
 }
 
 fn default_true() -> bool {

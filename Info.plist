@@ -26,6 +26,8 @@
 	<true/>
 	<key>NSAccessibilityUsageDescription</key>
 	<string>To detect the dictation shortcut and insert transcribed text.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>To bring an agent's terminal to the front, and to type “continue” into it when a network drop cut its work off.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>

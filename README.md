@@ -47,6 +47,7 @@ Install this tool. Your computer stays awake while your agent works; normal slee
 
 - Sleep prevention while supported coding agents are active, on macOS and Windows
 - A macOS menu bar app or Windows tray app, with automatic and manual sleep controls
+- Auto-resume on macOS: when a network drop cuts Claude Code or Codex off, it types "continue" into the agent's terminal once the connection is back
 
 - Local voice dictation with a customizable hotkey: hold Fn+Shift on macOS, toggle Ctrl+Alt+Space on Windows
 - Two dictation engines: Whisper (best accuracy, custom vocabulary) or Parakeet v3 (near-instant transcription)
@@ -112,6 +113,16 @@ You send a prompt
 
 Sleep prevention works automatically after setup.
 
+### Auto-Resume After Network Drops (macOS)
+
+On a train or a flaky Wi-Fi, an agent's turn can end on a network error and the work stalls until you type "continue". Agents Sleep Preventer does it for you:
+
+1. Claude Code reports the failure through its `StopFailure` hook; Codex records it in its session log.
+2. The menu shows the agent as cut off, and the Mac stays awake for up to 30 minutes.
+3. Once the API has answered for 20 seconds in a row (a captive portal doesn't count), it types a "continue" prompt into that agent's terminal: iTerm2, Terminal or tmux. API errors such as "overloaded" are retried after a pause instead.
+
+It gives up after 3 tries in a row, never touches usage-limit, login or billing errors, and waits if you are typing in that very terminal. Turn it off from the menu's **…** button or with `asp auto-resume off`.
+
 ### Dictation
 
 Agents Sleep Preventer includes local speech-to-text dictation:
@@ -137,6 +148,7 @@ Two engines are available:
 asp status     # Check current state
 asp settings   # Open sleep prevention and dictation settings
 asp cleanup    # Clean up after interrupts
+asp auto-resume on|off  # Type "continue" after a network drop (macOS)
 asp uninstall  # Remove completely
 ```
 

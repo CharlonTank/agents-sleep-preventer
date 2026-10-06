@@ -924,11 +924,12 @@ fn prune_empty_hook_events(hooks: &mut serde_json::Value) {
 }
 
 /// Substrings identifying ASP-owned hook entries in ~/.claude/settings.json.
-const CLAUDE_HOOK_MARKERS: [&str; 4] = [
+const CLAUDE_HOOK_MARKERS: [&str; 5] = [
     ".claude/hooks/prevent-sleep.sh",
     ".claude/hooks/refresh-sleep.sh",
     ".claude/hooks/allow-sleep.sh",
     ".claude/hooks/agent-attention.sh",
+    ".claude/hooks/agent-interrupted.sh",
 ];
 
 fn hook_value_contains_asp_command(value: &serde_json::Value) -> bool {
@@ -1116,6 +1117,7 @@ fn clean(keep_model: bool) -> Result<()> {
             "refresh-sleep.sh",
             "allow-sleep.sh",
             "agent-attention.sh",
+            "agent-interrupted.sh",
         ];
         let mut needs_sudo = false;
         for script in asp_scripts {

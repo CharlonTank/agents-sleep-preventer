@@ -1103,12 +1103,14 @@ pub fn show_settings() -> Option<AppSettings> {
     let mut result = window.run_modal();
 
     if let Some(ref mut settings) = result {
-        // The window doesn't edit the force override or its time limit; keep
-        // whatever the popover control set while the window was open.
-        let current = AppSettings::load().sleep_prevention;
+        // The window doesn't edit the force override, its time limit or
+        // auto-resume; keep whatever the menu set while the window was open.
+        let saved = AppSettings::load();
+        let current = saved.sleep_prevention;
         settings.sleep_prevention.force = current.force;
         settings.sleep_prevention.sleep_by = current.sleep_by;
         settings.sleep_prevention.sleep_until_user_returns = current.sleep_until_user_returns;
+        settings.auto_resume = saved.auto_resume;
         if let Err(e) = settings.save() {
             crate::logging::log(&format!("[settings] Failed to save settings: {}", e));
         }

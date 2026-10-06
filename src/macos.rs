@@ -1,6 +1,7 @@
 use crate::hook_config::*;
 
 mod authorization;
+mod auto_resume;
 mod dictation;
 mod logging;
 mod native_dialogs;
@@ -82,11 +83,12 @@ const OWNED_HOOK_MARKERS: [&str; 4] = [
 ];
 /// Substrings identifying ASP-owned hook entries in a Claude profile's
 /// settings.json. Every profile points at the scripts in ~/.claude/hooks.
-const CLAUDE_HOOK_MARKERS: [&str; 4] = [
+const CLAUDE_HOOK_MARKERS: [&str; 5] = [
     ".claude/hooks/prevent-sleep.sh",
     ".claude/hooks/refresh-sleep.sh",
     ".claude/hooks/allow-sleep.sh",
     ".claude/hooks/agent-attention.sh",
+    ".claude/hooks/agent-interrupted.sh",
 ];
 /// Claude Code events that refresh the working marker without resetting the
 /// turn state (`asp refresh`). SubagentStart and SubagentStop fire in the
@@ -150,6 +152,13 @@ enum Commands {
     /// Agent needs attention (hook): reads the hook JSON on stdin
     #[command(hide = true)]
     Attention,
+    /// Agent's turn ended on an API error (StopFailure hook): reads the hook
+    /// JSON on stdin and schedules an automatic resume
+    #[command(hide = true)]
+    Interrupted,
+    /// Type "continue" into agents cut off by a network drop: on | off
+    /// (prints the current setting when omitted)
+    AutoResume { state: Option<String> },
     /// Run background agent (dictation + permissions, no UI)
     Agent,
     /// Run native menu bar app
@@ -207,6 +216,8 @@ fn main() -> Result<()> {
         Commands::Cleanup => cmd_cleanup()?,
         Commands::Daemon { interval } => cmd_daemon(interval)?,
         Commands::Attention => cmd_attention()?,
+        Commands::Interrupted => cmd_interrupted()?,
+        Commands::AutoResume { state } => cmd_auto_resume(state)?,
         Commands::Agent => cmd_agent()?,
         Commands::Menubar => cmd_menubar()?,
         Commands::Force { mode, within } => cmd_force(mode, within)?,
@@ -270,6 +281,9 @@ struct AgentListItem {
     age_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attention_reason: Option<String>,
+    /// Auto-resume status of an agent cut off by a network drop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resume_note: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tasks: Vec<AgentTask>,
 }
@@ -606,14 +620,17 @@ fn codex_hook_session_pid(processes: &[ProcessInfo], service_pid: u32) -> u32 {
         return service_pid;
     };
 
+    // The session log lets auto-resume spot turns that failed on a network drop.
     if is_codex_session_id(session) && fs::create_dir_all(&sessions_dir).is_ok() {
-        let _ = fs::write(sessions_dir.join(session), pid.to_string());
+        let log = field("transcript_path").unwrap_or_default();
+        let _ = fs::write(sessions_dir.join(session), format!("{}\n{}", pid, log));
     }
     pid
 }
 
-/// Session → terminal process choices still valid (process alive and still
-/// a Codex session); stale ones are deleted on the way.
+/// Session → terminal process (first line) and session log (second line)
+/// choices still valid (process alive and still a Codex session); stale
+/// ones are deleted on the way.
 fn live_codex_session_claims(sessions_dir: &Path, processes: &[ProcessInfo]) -> HashMap<String, u32> {
     let codex_pids: HashSet<u32> = processes
         .iter()
@@ -625,7 +642,7 @@ fn live_codex_session_claims(sessions_dir: &Path, processes: &[ProcessInfo]) -> 
         let session = entry.file_name().to_string_lossy().into_owned();
         let pid = fs::read_to_string(entry.path())
             .ok()
-            .and_then(|content| content.trim().parse::<u32>().ok());
+            .and_then(|content| content.lines().next()?.trim().parse::<u32>().ok());
         match pid {
             Some(pid) if codex_pids.contains(&pid) => {
                 claims.insert(session, pid);
@@ -780,9 +797,10 @@ fn working_pid_ages() -> HashMap<u32, u64> {
 }
 
 fn count_active_pids() -> usize {
-    fs::read_dir(runtime_dir::pids_dir())
+    let working = fs::read_dir(runtime_dir::pids_dir())
         .map(|entries| entries.filter_map(|e| e.ok()).count())
-        .unwrap_or(0)
+        .unwrap_or(0);
+    working + auto_resume::keep_awake_count()
 }
 
 fn set_sleep_disabled(disabled: bool) -> Result<()> {
@@ -1414,6 +1432,7 @@ fn cmd_start(pid: Option<u32>) -> Result<()> {
     fs::write(&pid_file, "working").context("Failed to write PID file")?;
     // The agent is working again, so it is no longer waiting on the user.
     clear_attention_marker(agent_pid);
+    auto_resume::turn_started(agent_pid);
 
     sync_sleep_state("hook-start", sleep_prevention_enabled_from_settings())
 }
@@ -1468,8 +1487,39 @@ fn cmd_stop(pid: Option<u32>) -> Result<()> {
         }
     }
     clear_attention_marker(agent_pid);
+    auto_resume::turn_finished(agent_pid);
 
     sync_sleep_state("hook-stop", sleep_prevention_enabled_from_settings())
+}
+
+/// Claude Code "StopFailure" hook: the turn ended on an API error (network
+/// drop, overload…) instead of Stop. The turn is over, so the working marker
+/// goes like on Stop, without the "finished" notification; auto-resume takes
+/// it from there.
+fn cmd_interrupted() -> Result<()> {
+    logging::init_quiet();
+    let hook = read_hook_input().unwrap_or(serde_json::Value::Null);
+    let agent_pid = find_agent_ancestor().unwrap_or_else(std::process::id);
+    let _ = fs::remove_file(get_pid_file(agent_pid));
+    auto_resume::record_claude_failure(agent_pid, &hook);
+    sync_sleep_state("hook-interrupted", sleep_prevention_enabled_from_settings())
+}
+
+fn cmd_auto_resume(state: Option<String>) -> Result<()> {
+    let mut app_settings = settings::AppSettings::load();
+    if let Some(state) = state {
+        app_settings.auto_resume.enabled = match state.as_str() {
+            "on" => true,
+            "off" => false,
+            other => anyhow::bail!("Unknown state \"{}\": use on or off", other),
+        };
+        app_settings.save().map_err(anyhow::Error::msg)?;
+    }
+    println!(
+        "Auto-resume: {}",
+        if app_settings.auto_resume.enabled { "on" } else { "off" }
+    );
+    Ok(())
 }
 
 /// Whether a marker was flagged end-of-turn by cmd_stop while its process
@@ -1639,6 +1689,7 @@ fn build_agent_list_items(
     attention: &HashMap<u32, String>,
     cwds: &HashMap<u32, String>,
 ) -> Vec<AgentListItem> {
+    let resume_notes = auto_resume::menu_notes();
     let process_by_pid = processes
         .iter()
         .map(|process| (process.pid, process))
@@ -1687,6 +1738,7 @@ fn build_agent_list_items(
                     .get(&pid)
                     .filter(|reason| !reason.is_empty())
                     .cloned(),
+                resume_note: resume_notes.get(&pid).cloned(),
                 tasks: agent_tasks(processes, pid),
             }
         })
@@ -1777,6 +1829,7 @@ fn cmd_list() -> Result<()> {
         "manual_enabled": sleep_prevention_enabled_from_settings(),
         "force": sleep_override_from_settings().as_str(),
         "sleep_by": settings::AppSettings::load().sleep_prevention.sleep_by,
+        "auto_resume": settings::AppSettings::load().auto_resume.enabled,
         "thermal_warning": check_thermal_warning(),
     });
     println!("{}", payload);
@@ -2243,6 +2296,7 @@ fn install_claude_hooks(settings_file: &Path, hooks_dir: &Path) -> Result<()> {
     let refresh_path = hooks_dir.join("refresh-sleep.sh");
     let allow_path = hooks_dir.join("allow-sleep.sh");
     let attention_path = hooks_dir.join("agent-attention.sh");
+    let interrupted_path = hooks_dir.join("agent-interrupted.sh");
 
     let hooks = hooks
         .as_object_mut()
@@ -2253,6 +2307,7 @@ fn install_claude_hooks(settings_file: &Path, hooks_dir: &Path) -> Result<()> {
     }
     append_hook_group(hooks, "Notification", claude_hook_group(&attention_path));
     append_hook_group(hooks, "Stop", claude_hook_group(&allow_path));
+    append_hook_group(hooks, "StopFailure", claude_hook_group(&interrupted_path));
 
     fs::create_dir_all(settings_file.parent().unwrap())?;
     fs::write(settings_file, serde_json::to_string_pretty(&json)?)
@@ -2279,13 +2334,51 @@ fn claude_config_dirs(home: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// Up to date: the latest events ASP hooks (SubagentStop, then StopFailure
+/// for auto-resume) are there.
 fn claude_settings_have_asp_hooks(settings_file: &Path) -> bool {
+    let Some(hooks) = fs::read_to_string(settings_file)
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .and_then(|json| json.get("hooks").cloned())
+    else {
+        return false;
+    };
+    let has = |event: &str, marker: &str| {
+        hooks
+            .get(event)
+            .is_some_and(|groups| hook_value_contains_marker(groups, &[marker]))
+    };
+    has("SubagentStop", ".claude/hooks/refresh-sleep.sh")
+        && has("StopFailure", ".claude/hooks/agent-interrupted.sh")
+}
+
+/// Any ASP hook at all: the user installed ASP for this profile.
+fn claude_settings_mention_asp(settings_file: &Path) -> bool {
     fs::read_to_string(settings_file)
         .ok()
         .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-        .and_then(|json| json.get("hooks").and_then(|hooks| hooks.get("SubagentStop")).cloned())
-        .map(|groups| hook_value_contains_marker(&groups, &[".claude/hooks/refresh-sleep.sh"]))
-        .unwrap_or(false)
+        .and_then(|json| json.get("hooks").cloned())
+        .is_some_and(|hooks| hook_value_contains_marker(&hooks, &CLAUDE_HOOK_MARKERS))
+}
+
+/// StopFailure → `asp interrupted`, forwarding the hook JSON (error type and
+/// message) from stdin.
+fn write_interrupted_hook_script(hooks_dir: &Path) -> std::io::Result<()> {
+    let path = hooks_dir.join("agent-interrupted.sh");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/bash\n[ -x \"{}\" ] && cat | \"{}\" interrupted 2>/dev/null || true\n",
+            APP_BINARY_PATH, APP_BINARY_PATH
+        ),
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
 }
 
 /// Sessions started with another CLAUDE_CONFIG_DIR read that profile's
@@ -2296,10 +2389,22 @@ fn install_claude_profile_hooks(home: &Path) -> Vec<PathBuf> {
     if !hooks_dir.join("prevent-sleep.sh").exists() {
         return Vec::new();
     }
+    // Upgrades from versions without auto-resume get its hook script here,
+    // with no setup prompt.
+    if !hooks_dir.join("agent-interrupted.sh").exists() {
+        if let Err(e) = write_interrupted_hook_script(&hooks_dir) {
+            logging::log(&format!("[hooks] Could not write agent-interrupted.sh: {}", e));
+        }
+    }
     let mut updated = Vec::new();
-    for dir in claude_config_dirs(home).into_iter().skip(1) {
+    for (index, dir) in claude_config_dirs(home).into_iter().enumerate() {
         let settings_file = dir.join("settings.json");
         if claude_settings_have_asp_hooks(&settings_file) {
+            continue;
+        }
+        // ~/.claude itself is set up by `asp install`; here it only gets
+        // the newer events added, never hooks the user removed.
+        if index == 0 && !claude_settings_mention_asp(&settings_file) {
             continue;
         }
         match install_claude_hooks(&settings_file, &hooks_dir) {
@@ -4041,6 +4146,8 @@ fn cmd_agent() -> Result<()> {
         }
     }
 
+    auto_resume::spawn();
+
     let mut settings_modified = settings_modified_time();
     let home = resolve_user_home().ok();
     let mut tick_counter = 0u64;
@@ -4214,6 +4321,7 @@ fn cmd_install(auto_yes: bool) -> Result<()> {
     fs::write(hooks_dir.join("refresh-sleep.sh"), refresh_script)?;
     fs::write(hooks_dir.join("allow-sleep.sh"), allow_script)?;
     fs::write(hooks_dir.join("agent-attention.sh"), attention_script)?;
+    write_interrupted_hook_script(&hooks_dir)?;
 
     #[cfg(unix)]
     {
@@ -4395,6 +4503,7 @@ fn cmd_uninstall(keep_model: bool, keep_hooks: bool, keep_data: bool) -> Result<
         let _ = fs::remove_file(hooks_dir.join("refresh-sleep.sh"));
         let _ = fs::remove_file(hooks_dir.join("allow-sleep.sh"));
         let _ = fs::remove_file(hooks_dir.join("agent-attention.sh"));
+        let _ = fs::remove_file(hooks_dir.join("agent-interrupted.sh"));
 
         // Remove ASP-owned hooks from every Claude profile, preserving user hooks
         for dir in claude_config_dirs(&home) {
