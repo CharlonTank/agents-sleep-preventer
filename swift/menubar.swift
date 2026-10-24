@@ -79,6 +79,13 @@ struct InstanceList {
     var sleepBy: Date? = nil
     /// Type "continue" into agents a network drop cut off.
     var autoResume: Bool = true
+    /// Nightly sleep time ("HH:MM"), nil when off.
+    var bedtime: String? = nil
+    /// Sleep on battery at or below this charge (%), nil when off.
+    var lowBatterySleep: Int? = 10
+    /// On battery at or below that charge right now: agents no longer keep
+    /// the Mac awake.
+    var lowBattery: Bool = false
 
     static let empty = InstanceList(
         agents: [], activeCount: 0, hooksInstalled: true, sleepDisabled: false,
@@ -89,7 +96,8 @@ struct InstanceList {
             agents: agents, activeCount: activeCount, hooksInstalled: hooksInstalled,
             sleepDisabled: sleepDisabled, manualEnabled: manualEnabled,
             force: value, thermalWarning: thermalWarning, sleepBy: sleepBy,
-            autoResume: autoResume)
+            autoResume: autoResume, bedtime: bedtime, lowBatterySleep: lowBatterySleep,
+            lowBattery: lowBattery)
     }
 
     func agents(in state: AgentState) -> [AgentInstance] {
@@ -750,6 +758,9 @@ private final class AgentPopoverViewController: NSViewController {
         if list.thermalWarning {
             text = "THERMAL"
             color = .systemRed
+        } else if list.lowBattery {
+            text = "LOW BATTERY"
+            color = .systemRed
         } else if list.force == .awake {
             text = "FORCED AWAKE"
             color = .systemIndigo
@@ -1062,25 +1073,124 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let repositoryURL = URL(string: "https://github.com/CharlonTank/agents-sleep-preventer")!
 
     @objc private func toggleAutoResume() {
+        runSettingCommand(["auto-resume", latestList.autoResume ? "off" : "on"])
+    }
+
+    private static let bedtimeChoices = ["22:00", "23:00", "00:00", "01:00", "02:00", "03:00"]
+    private static let lowBatteryChoices = [5, 10, 15, 20]
+
+    private func bedtimeMenuItem() -> NSMenuItem {
+        let current = latestList.bedtime
+        let item = NSMenuItem(
+            title: "Nightly Sleep: \(current ?? "Off")", action: nil, keyEquivalent: "")
+        item.toolTip = "Every night from this time, the Mac goes to sleep as soon as nobody is using it, even with agents still working."
+        let submenu = NSMenu()
+        var choices = ["off"] + Self.bedtimeChoices
+        if let current, !choices.contains(current) {
+            choices.append(current)
+        }
+        for choice in choices {
+            let choiceItem = NSMenuItem(
+                title: choice == "off" ? "Off" : choice,
+                action: #selector(setBedtimeAction(_:)),
+                keyEquivalent: "")
+            choiceItem.target = self
+            choiceItem.representedObject = choice
+            choiceItem.state = choice == (current ?? "off") ? .on : .off
+            submenu.addItem(choiceItem)
+        }
+        submenu.addItem(.separator())
+        let custom = NSMenuItem(
+            title: "Custom…", action: #selector(promptCustomBedtime), keyEquivalent: "")
+        custom.target = self
+        submenu.addItem(custom)
+        item.submenu = submenu
+        return item
+    }
+
+    private func lowBatteryMenuItem() -> NSMenuItem {
+        let current = latestList.lowBatterySleep
+        let item = NSMenuItem(
+            title: "Sleep on Low Battery: \(current.map { "\($0)%" } ?? "Off")",
+            action: nil, keyEquivalent: "")
+        item.toolTip = "On battery at or below this charge, agents no longer keep the Mac awake and it sleeps as soon as nobody is using it."
+        let submenu = NSMenu()
+        var choices: [Int?] = [nil] + Self.lowBatteryChoices.map { $0 }
+        if let current, !Self.lowBatteryChoices.contains(current) {
+            choices.append(current)
+        }
+        for choice in choices {
+            let choiceItem = NSMenuItem(
+                title: choice.map { "\($0)%" } ?? "Off",
+                action: #selector(setLowBatterySleepAction(_:)),
+                keyEquivalent: "")
+            choiceItem.target = self
+            choiceItem.representedObject = choice.map(String.init) ?? "off"
+            choiceItem.state = choice == current ? .on : .off
+            submenu.addItem(choiceItem)
+        }
+        item.submenu = submenu
+        return item
+    }
+
+    @objc private func setBedtimeAction(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? String else { return }
+        runSettingCommand(["bedtime", value])
+    }
+
+    /// "Custom…": the user types any time of day (23:30, 2h, 1am).
+    @objc private func promptCustomBedtime() {
+        popover.performClose(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Put the Mac to sleep every night at…"
+        alert.informativeText = "From this time on, the Mac sleeps as soon as nobody is using it, even with agents still working: 23:30, 2h, 1am."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+        field.placeholderString = "23:30"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Set")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        runSettingCommand(["bedtime", text]) {
+            self.showAlert(
+                "Couldn't set the nightly sleep",
+                "\"\(text)\" isn't a time ASP understands. Try 23:30, 2h or 1am.")
+        }
+    }
+
+    @objc private func setLowBatterySleepAction(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? String else { return }
+        runSettingCommand(["low-battery", value])
+    }
+
+    /// Runs `asp <arguments>` off the main thread, then refreshes the menu.
+    private func runSettingCommand(_ arguments: [String], onFailure: (() -> Void)? = nil) {
         if isPreview { return }
         let cliPath = Bundle.main.bundleURL
             .appendingPathComponent("Contents/MacOS/asp")
-        let enable = !latestList.autoResume
 
         DispatchQueue.global(qos: .userInitiated).async {
             let process = Process()
             process.executableURL = cliPath
-            process.arguments = ["auto-resume", enable ? "on" : "off"]
+            process.arguments = arguments
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
+            var succeeded = false
             do {
                 try process.run()
                 process.waitUntilExit()
+                succeeded = process.terminationStatus == 0
             } catch {
-                NSLog("Failed to set auto-resume: \(error)")
+                NSLog("Failed to run asp \(arguments.joined(separator: " ")): \(error)")
             }
             DispatchQueue.main.async {
                 self.refreshMenu()
+                if !succeeded {
+                    onFailure?()
+                }
             }
         }
     }
@@ -1373,12 +1483,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let sleepBy = (json["sleep_by"] as? NSNumber)
             .map { Date(timeIntervalSince1970: $0.doubleValue) }
         let autoResume = (json["auto_resume"] as? NSNumber)?.boolValue ?? true
+        let bedtime = json["bedtime"] as? String
+        let lowBatterySleep = (json["low_battery_sleep"] as? NSNumber)?.intValue
+        let lowBattery = (json["low_battery"] as? NSNumber)?.boolValue ?? false
 
         return InstanceList(
             agents: agents, activeCount: activeCount, hooksInstalled: hooksInstalled,
             sleepDisabled: sleepDisabled, manualEnabled: manualEnabled,
             force: force, thermalWarning: thermalWarning, sleepBy: sleepBy,
-            autoResume: autoResume)
+            autoResume: autoResume, bedtime: bedtime, lowBatterySleep: lowBatterySleep,
+            lowBattery: lowBattery)
     }
 
     private func parseAgents(from json: [String: Any]) -> [AgentInstance] {
@@ -1551,6 +1665,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         autoResume.state = latestList.autoResume ? .on : .off
         autoResume.toolTip = "When a network drop or an API error cuts an agent off, type \"continue\" in its terminal once the connection is back."
         menu.addItem(autoResume)
+        menu.addItem(bedtimeMenuItem())
+        menu.addItem(lowBatteryMenuItem())
         menu.addItem(.separator())
 
         let issue = NSMenuItem(

@@ -14,8 +14,8 @@ use crate::objc_utils::{
 };
 
 use super::{
-    AppSettings, ResolvedHotkey, CG_FLAG_COMMAND, CG_FLAG_CONTROL, CG_FLAG_FN, CG_FLAG_OPTION,
-    CG_FLAG_SHIFT,
+    AppSettings, ResolvedHotkey, SleepPreventionSettings, CG_FLAG_COMMAND, CG_FLAG_CONTROL,
+    CG_FLAG_FN, CG_FLAG_OPTION, CG_FLAG_SHIFT,
 };
 
 const NS_WINDOW_STYLE_MASK_TITLED: usize = 1 << 0;
@@ -1103,13 +1103,14 @@ pub fn show_settings() -> Option<AppSettings> {
     let mut result = window.run_modal();
 
     if let Some(ref mut settings) = result {
-        // The window doesn't edit the force override, its time limit or
-        // auto-resume; keep whatever the menu set while the window was open.
+        // The window only edits whether sleep prevention is enabled; keep
+        // whatever the menu set while it was open (force override, time
+        // limit, bedtime, low battery, auto-resume).
         let saved = AppSettings::load();
-        let current = saved.sleep_prevention;
-        settings.sleep_prevention.force = current.force;
-        settings.sleep_prevention.sleep_by = current.sleep_by;
-        settings.sleep_prevention.sleep_until_user_returns = current.sleep_until_user_returns;
+        settings.sleep_prevention = SleepPreventionSettings {
+            enabled: settings.sleep_prevention.enabled,
+            ..saved.sleep_prevention
+        };
         settings.auto_resume = saved.auto_resume;
         if let Err(e) = settings.save() {
             crate::logging::log(&format!("[settings] Failed to save settings: {}", e));

@@ -48,6 +48,7 @@ Install this tool. Your computer stays awake while your agent works; normal slee
 - Sleep prevention while supported coding agents are active, on macOS and Windows
 - A macOS menu bar app or Windows tray app, with automatic and manual sleep controls
 - Auto-resume on macOS: when a network drop cuts Claude Code or Codex off, it types "continue" into the agent's terminal once the connection is back
+- Safety nets on macOS: a nightly sleep time, and sleep at low battery (10% by default), even with agents still working
 
 - Local voice dictation with a customizable hotkey: hold Fn+Shift on macOS, toggle Ctrl+Alt+Space on Windows
 - Two dictation engines: Whisper (best accuracy, custom vocabulary) or Parakeet v3 (near-instant transcription)
@@ -113,6 +114,13 @@ You send a prompt
 
 Sleep prevention works automatically after setup.
 
+### Nightly Sleep and Low Battery (macOS)
+
+Two safety nets, set from the menu's **…** button, put the Mac to sleep even while agents are still working:
+
+- **Nightly Sleep** (off by default): every night from the time you choose, the Mac goes to sleep the first time nobody is using it (no input for a minute and no video playing), even when forced awake. Agents can't keep it awake again until you come back. `asp bedtime 2:00`, `asp bedtime off`.
+- **Sleep on Low Battery** (10% by default): on battery at or below that charge, agents no longer keep the Mac awake, and it goes to sleep as soon as nobody is using it instead of draining to zero. `asp low-battery 15`, `asp low-battery off`.
+
 ### Auto-Resume After Network Drops (macOS)
 
 On a train or a flaky Wi-Fi, an agent's turn can end on a network error and the work stalls until you type "continue". Agents Sleep Preventer does it for you:
@@ -149,6 +157,8 @@ asp status     # Check current state
 asp settings   # Open sleep prevention and dictation settings
 asp cleanup    # Clean up after interrupts
 asp auto-resume on|off  # Type "continue" after a network drop (macOS)
+asp bedtime 2:00|off    # Sleep every night from this time, agents or not (macOS)
+asp low-battery 10|off  # Sleep on battery at or below this charge (macOS)
 asp uninstall  # Remove completely
 ```
 
@@ -157,7 +167,7 @@ asp uninstall  # Remove completely
 ## FAQ
 
 **Does it drain my battery?**
-No more than usual. Your Mac just stays awake instead of sleeping.
+No more than usual. Your Mac just stays awake instead of sleeping. On battery at 10% or less (adjustable), agents no longer keep it awake and it goes to sleep once you step away.
 
 **What if I interrupt an agent with Ctrl+C?**
 Run `asp cleanup` or the tool auto-detects idle sessions after 30 seconds.

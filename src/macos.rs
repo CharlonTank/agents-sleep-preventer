@@ -174,6 +174,19 @@ enum Commands {
         #[arg(long, value_name = "DURATION")]
         within: Option<String>,
     },
+    /// Put the Mac to sleep every night: once past this time, the first time
+    /// nobody is using it, agents working or not
+    Bedtime {
+        /// Local time (23:30, 2h, 1am) | off (prints the current setting
+        /// when omitted)
+        time: Option<String>,
+    },
+    /// Sleep on battery at or below this charge, agents working or not
+    LowBattery {
+        /// Percentage (10, 15%) | off (prints the current setting when
+        /// omitted)
+        percent: Option<String>,
+    },
     /// Force reset: clear all PIDs and re-enable sleep
     Reset,
     /// Check thermal state
@@ -221,6 +234,8 @@ fn main() -> Result<()> {
         Commands::Agent => cmd_agent()?,
         Commands::Menubar => cmd_menubar()?,
         Commands::Force { mode, within } => cmd_force(mode, within)?,
+        Commands::Bedtime { time } => cmd_bedtime(time)?,
+        Commands::LowBattery { percent } => cmd_low_battery(percent)?,
         Commands::Reset => cmd_reset()?,
         Commands::Thermal => cmd_thermal()?,
         Commands::Install { yes } => cmd_install(yes)?,
@@ -824,12 +839,6 @@ fn sleep_prevention_enabled_from_settings() -> bool {
     settings::AppSettings::load().sleep_prevention.enabled
 }
 
-/// Read fresh on every sync so the popover control takes effect instantly in
-/// every asp process (hooks, agent loop, menubar) without a settings reload.
-fn sleep_override_from_settings() -> settings::SleepOverride {
-    settings::AppSettings::load().sleep_prevention.force
-}
-
 fn sync_sleep_state(source: &str, manual_enabled: bool) -> Result<()> {
     sync_sleep_state_impl(source, manual_enabled, false)
 }
@@ -843,14 +852,11 @@ fn sync_sleep_state_impl(source: &str, manual_enabled: bool, interactive: bool) 
     let thermal_warning = check_thermal_warning();
     let prevention = settings::AppSettings::load().sleep_prevention;
     let force = prevention.force;
+    // Battery last: it spawns pmset, only worth it when something wants the Mac awake
     let should_prevent = !thermal_warning
         && !prevention.sleep_until_user_returns
-        && match force {
-            settings::SleepOverride::ForceAwake => true,
-            settings::SleepOverride::ForceSleep => false,
-            settings::SleepOverride::SleepWhenDone => active > 0,
-            settings::SleepOverride::Auto => manual_enabled && active > 0,
-        };
+        && wants_awake(force, manual_enabled, active)
+        && !on_low_battery(prevention.low_battery_sleep);
 
     if should_prevent && !sleep_disabled {
         set_sleep_disabled(true)?;
@@ -872,10 +878,22 @@ fn sync_sleep_state_impl(source: &str, manual_enabled: bool, interactive: bool) 
     Ok(())
 }
 
+/// Whether the mode asks to keep the Mac awake, safety overrides aside.
+fn wants_awake(force: settings::SleepOverride, manual_enabled: bool, active: usize) -> bool {
+    match force {
+        settings::SleepOverride::ForceAwake => true,
+        settings::SleepOverride::ForceSleep => false,
+        settings::SleepOverride::SleepWhenDone => active > 0,
+        settings::SleepOverride::Auto => manual_enabled && active > 0,
+    }
+}
+
 fn menubar_sync_sleep() {
     let manual_enabled = MANUAL_SLEEP_PREVENTION.load(Ordering::SeqCst);
     let _ = sync_sleep_state("sync", manual_enabled);
     sleep_when_done_tick();
+    bedtime_tick();
+    low_battery_tick(manual_enabled);
 }
 
 /// Covers the gap between an agent's turns (and the Stop hook racing the
@@ -950,6 +968,269 @@ fn sleep_when_done_tick() {
         logging::log("[when-done] All agents done, mode back to auto, sleeping now");
     }
     force_sleep_now();
+}
+
+/// "Nightly sleep": every day from the bedtime on, the first time nobody is
+/// using the Mac it goes to sleep, agents working or not (even forced awake),
+/// and they can't keep it awake again until someone uses it. A night the Mac
+/// already slept (or rebooted) past the bedtime is done.
+fn bedtime_tick() {
+    let mut app_settings = settings::AppSettings::load();
+    let prevention = &app_settings.sleep_prevention;
+    let Some(bedtime) = prevention.bedtime.as_deref().and_then(parse_clock_time) else {
+        return;
+    };
+    let now = unix_now();
+    let Some(last_bedtime) = last_daily_occurrence(bedtime, now) else {
+        return;
+    };
+    let action = bedtime_action(
+        last_bedtime,
+        prevention.bedtime_done_at,
+        last_wake_or_boot(),
+        nobody_at_the_mac,
+    );
+    if action == BedtimeAction::Wait {
+        return;
+    }
+
+    app_settings.sleep_prevention.bedtime_done_at = Some(now);
+    if action == BedtimeAction::AlreadySlept {
+        if let Err(e) = app_settings.save() {
+            logging::log(&format!("[bedtime] Failed to save: {}", e));
+        }
+        return;
+    }
+    app_settings.sleep_prevention.sleep_until_user_returns = true;
+    if app_settings.sleep_prevention.force == settings::SleepOverride::SleepWhenDone {
+        app_settings.sleep_prevention.force = settings::SleepOverride::Auto;
+        app_settings.sleep_prevention.sleep_by = None;
+    }
+    if let Err(e) = app_settings.save() {
+        // Unsaved, the next tick would sleep it again right after a wake
+        logging::log(&format!("[bedtime] Failed to save: {}", e));
+        return;
+    }
+    // Working agents hold `pmset disablesleep 1`, which sleepnow obeys.
+    if let Err(e) = set_sleep_disabled(false) {
+        logging::log(&format!("[bedtime] Failed to re-enable sleep: {}", e));
+    }
+    logging::log("[bedtime] Bedtime passed and nobody at the Mac, sleeping until someone uses it");
+    force_sleep_now();
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BedtimeAction {
+    /// No bedtime left to do, or someone is still using the Mac.
+    Wait,
+    /// The Mac slept (or rebooted) since the bedtime: that night is done.
+    AlreadySlept,
+    SleepNow,
+}
+
+/// `nobody_there` runs last: it spawns pmset.
+fn bedtime_action(
+    last_bedtime: u64,
+    done_at: Option<u64>,
+    last_wake: Option<u64>,
+    nobody_there: impl FnOnce() -> bool,
+) -> BedtimeAction {
+    if done_at.is_some_and(|done_at| done_at >= last_bedtime) {
+        BedtimeAction::Wait
+    } else if last_wake.is_some_and(|wake| wake > last_bedtime) {
+        BedtimeAction::AlreadySlept
+    } else if nobody_there() {
+        BedtimeAction::SleepNow
+    } else {
+        BedtimeAction::Wait
+    }
+}
+
+/// Don't retry `pmset sleepnow` more often than this for low battery.
+const LOW_BATTERY_RETRY: Duration = Duration::from_secs(120);
+
+static LOW_BATTERY_SLEPT_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// On battery at or below the threshold, sync_sleep_state already stops
+/// preventing sleep; this also puts the Mac to sleep when the mode wanted it
+/// awake (Claude Code's own `caffeinate` would otherwise hold it up) and
+/// nobody is using it.
+fn low_battery_tick(manual_enabled: bool) {
+    let prevention = settings::AppSettings::load().sleep_prevention;
+    let Some(threshold) = prevention.low_battery_sleep else {
+        return;
+    };
+    if !wants_awake(prevention.force, manual_enabled, count_active_pids()) {
+        return;
+    }
+    let mut slept_at = LOW_BATTERY_SLEPT_AT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if slept_at.is_some_and(|at| at.elapsed() < LOW_BATTERY_RETRY) {
+        return;
+    }
+    if seconds_since_last_user_input() < RECENT_INPUT_SECS {
+        return;
+    }
+    let Some(battery) = read_battery() else {
+        return;
+    };
+    if !battery.is_low(threshold) || !nobody_at_the_mac() {
+        return;
+    }
+    *slept_at = Some(Instant::now());
+    logging::log(&format!(
+        "[battery] {}% left on battery (limit {}%), sleeping now",
+        battery.percent, threshold
+    ));
+    force_sleep_now();
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BatteryState {
+    percent: u8,
+    on_battery: bool,
+}
+
+impl BatteryState {
+    fn is_low(&self, threshold: u8) -> bool {
+        self.on_battery && self.percent <= threshold
+    }
+}
+
+fn on_low_battery(threshold: Option<u8>) -> bool {
+    threshold.is_some_and(|threshold| read_battery().is_some_and(|battery| battery.is_low(threshold)))
+}
+
+fn read_battery() -> Option<BatteryState> {
+    let output = Command::new("pmset").args(["-g", "batt"]).output().ok()?;
+    parse_pmset_battery(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// `pmset -g batt`: "Now drawing from 'Battery Power'" then
+/// " -InternalBattery-0 (id=…)\t41%; discharging; …". None without a battery.
+fn parse_pmset_battery(output: &str) -> Option<BatteryState> {
+    let on_battery = output.contains("'Battery Power'");
+    let battery_line = output.lines().find(|line| line.contains("InternalBattery"))?;
+    let (before_percent, _) = battery_line.split_once('%')?;
+    let digits: String = before_percent
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    Some(BatteryState {
+        percent: digits.parse().ok()?,
+        on_battery,
+    })
+}
+
+/// No input for a minute, and no video or presentation keeping the display
+/// on (someone watching a film doesn't touch the trackpad either).
+fn nobody_at_the_mac() -> bool {
+    seconds_since_last_user_input() >= RECENT_INPUT_SECS && !display_kept_awake()
+}
+
+fn display_kept_awake() -> bool {
+    Command::new("pmset")
+        .args(["-g", "assertions"])
+        .output()
+        .is_ok_and(|output| {
+            assertion_held(
+                &String::from_utf8_lossy(&output.stdout),
+                "PreventUserIdleDisplaySleep",
+            )
+        })
+}
+
+/// In `pmset -g assertions`' system-wide status ("   Name    1").
+fn assertion_held(output: &str, name: &str) -> bool {
+    output.lines().any(|line| {
+        let mut words = line.split_whitespace();
+        words.next() == Some(name) && words.next().is_some_and(|count| count != "0")
+    })
+}
+
+/// When the Mac last woke from sleep or booted (unix seconds).
+fn last_wake_or_boot() -> Option<u64> {
+    ["kern.waketime", "kern.boottime"]
+        .into_iter()
+        .filter_map(sysctl_seconds)
+        .max()
+}
+
+fn sysctl_seconds(name: &str) -> Option<u64> {
+    let name = std::ffi::CString::new(name).ok()?;
+    let mut value: libc::timeval = unsafe { std::mem::zeroed() };
+    let mut size = std::mem::size_of::<libc::timeval>();
+    let status = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut value as *mut libc::timeval as *mut libc::c_void,
+            &mut size,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    (status == 0 && value.tv_sec > 0).then_some(value.tv_sec as u64)
+}
+
+/// The latest moment at or before `now` when the local clock read
+/// `minutes` past midnight (today's, else yesterday's).
+fn last_daily_occurrence(minutes: u32, now: u64) -> Option<u64> {
+    for days_back in 0..=1 {
+        let mut local: libc::tm = unsafe { std::mem::zeroed() };
+        let now_t = now as libc::time_t;
+        if unsafe { libc::localtime_r(&now_t, &mut local) }.is_null() {
+            return None;
+        }
+        local.tm_mday -= days_back;
+        local.tm_hour = (minutes / 60) as i32;
+        local.tm_min = (minutes % 60) as i32;
+        local.tm_sec = 0;
+        local.tm_isdst = -1;
+        let occurrence = unsafe { libc::mktime(&mut local) };
+        if occurrence >= 0 && occurrence as u64 <= now {
+            return Some(occurrence as u64);
+        }
+    }
+    None
+}
+
+/// Minutes past midnight in a clock time: `23:30`, `2`, `02:00`, `2h`,
+/// `23h30`, `1am`, `11:30 pm`.
+fn parse_clock_time(text: &str) -> Option<u32> {
+    let text = text.trim().to_lowercase().replace(' ', "");
+    let (text, meridiem) = if let Some(rest) = text.strip_suffix("am") {
+        (rest, Some(false))
+    } else if let Some(rest) = text.strip_suffix("pm") {
+        (rest, Some(true))
+    } else {
+        (text.as_str(), None)
+    };
+    let (hours, minutes) = match text.split_once([':', 'h']) {
+        Some((hours, "")) => (hours, "0"),
+        Some((hours, minutes)) => (hours, minutes),
+        None => (text, "0"),
+    };
+    let mut hours: u32 = hours.parse().ok()?;
+    let minutes: u32 = minutes.parse().ok()?;
+    if minutes >= 60 {
+        return None;
+    }
+    match meridiem {
+        Some(_) if hours == 0 || hours > 12 => return None,
+        Some(pm) => hours = hours % 12 + if pm { 12 } else { 0 },
+        None if hours >= 24 => return None,
+        None => {}
+    }
+    Some(hours * 60 + minutes)
+}
+
+fn format_clock_time(minutes: u32) -> String {
+    format!("{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
 fn unix_now() -> u64 {
@@ -1821,15 +2102,20 @@ fn cmd_list() -> Result<()> {
         .collect::<Vec<_>>();
 
     let sleep_disabled = is_sleep_disabled();
+    let app_settings = settings::AppSettings::load();
+    let prevention = &app_settings.sleep_prevention;
     let payload = json!({
         "agents": agents,
         "active": active,
         "inactive": inactive,
         "sleep_disabled": sleep_disabled,
-        "manual_enabled": sleep_prevention_enabled_from_settings(),
-        "force": sleep_override_from_settings().as_str(),
-        "sleep_by": settings::AppSettings::load().sleep_prevention.sleep_by,
-        "auto_resume": settings::AppSettings::load().auto_resume.enabled,
+        "manual_enabled": prevention.enabled,
+        "force": prevention.force.as_str(),
+        "sleep_by": prevention.sleep_by,
+        "bedtime": prevention.bedtime,
+        "low_battery_sleep": prevention.low_battery_sleep,
+        "low_battery": on_low_battery(prevention.low_battery_sleep),
+        "auto_resume": app_settings.auto_resume.enabled,
         "thermal_warning": check_thermal_warning(),
     });
     println!("{}", payload);
@@ -2095,6 +2381,67 @@ fn describe_sleep_override(prevention: &settings::SleepPreventionSettings) -> St
         ),
         _ => format!("force: {}", prevention.force.as_str()),
     }
+}
+
+fn cmd_bedtime(time: Option<String>) -> Result<()> {
+    logging::init_quiet();
+    let mut app_settings = settings::AppSettings::load();
+    let bedtime = match time.as_deref() {
+        None => {
+            println!(
+                "bedtime: {}",
+                app_settings.sleep_prevention.bedtime.as_deref().unwrap_or("off")
+            );
+            return Ok(());
+        }
+        Some("off") => None,
+        Some(text) => Some(format_clock_time(parse_clock_time(text).ok_or_else(|| {
+            anyhow::anyhow!("Invalid time '{}': use e.g. 23:30, 2h, 1am", text)
+        })?)),
+    };
+    app_settings.sleep_prevention.bedtime = bedtime.clone();
+    // Only bedtimes from now on count: setting 2:00 in the afternoon must
+    // not put the Mac to sleep right away.
+    app_settings.sleep_prevention.bedtime_done_at = bedtime.as_ref().map(|_| unix_now());
+    app_settings.save().map_err(anyhow::Error::msg)?;
+    let described = bedtime.as_deref().unwrap_or("off");
+    logging::log(&format!("[bedtime] set to {}", described));
+    println!("bedtime: {}", described);
+    Ok(())
+}
+
+fn cmd_low_battery(percent: Option<String>) -> Result<()> {
+    logging::init_quiet();
+    let mut app_settings = settings::AppSettings::load();
+    let describe = |threshold: Option<u8>| {
+        threshold.map_or("off".to_string(), |percent| format!("{}%", percent))
+    };
+    let threshold = match percent.as_deref() {
+        None => {
+            println!(
+                "low battery sleep: {}",
+                describe(app_settings.sleep_prevention.low_battery_sleep)
+            );
+            return Ok(());
+        }
+        Some("off") => None,
+        Some(text) => {
+            let percent = text
+                .trim()
+                .trim_end_matches('%')
+                .parse::<u8>()
+                .ok()
+                .filter(|percent| (1..=99).contains(percent))
+                .ok_or_else(|| anyhow::anyhow!("Invalid charge '{}': use 1 to 99, or off", text))?;
+            Some(percent)
+        }
+    };
+    app_settings.sleep_prevention.low_battery_sleep = threshold;
+    app_settings.save().map_err(anyhow::Error::msg)?;
+    logging::log(&format!("[battery] low battery sleep set to {}", describe(threshold)));
+    sync_sleep_state_impl("low-battery", app_settings.sleep_prevention.enabled, true)?;
+    println!("low battery sleep: {}", describe(threshold));
+    Ok(())
 }
 
 /// Thermal recovery: clear the working markers and re-enable sleep, but keep
@@ -3141,6 +3488,95 @@ hooks = false
         assert_eq!(parse_duration_minutes("0m"), None);
         assert_eq!(parse_duration_minutes("-1h"), None);
         assert_eq!(parse_duration_minutes("soon"), None);
+    }
+
+    #[test]
+    fn parse_clock_time_accepts_the_menu_and_cli_forms() {
+        assert_eq!(parse_clock_time("02:00"), Some(2 * 60));
+        assert_eq!(parse_clock_time("2"), Some(2 * 60));
+        assert_eq!(parse_clock_time("2h"), Some(2 * 60));
+        assert_eq!(parse_clock_time("23h30"), Some(23 * 60 + 30));
+        assert_eq!(parse_clock_time(" 23:30 "), Some(23 * 60 + 30));
+        assert_eq!(parse_clock_time("00:00"), Some(0));
+        assert_eq!(parse_clock_time("1am"), Some(60));
+        assert_eq!(parse_clock_time("11:30 PM"), Some(23 * 60 + 30));
+        assert_eq!(parse_clock_time("12am"), Some(0));
+        assert_eq!(parse_clock_time("12pm"), Some(12 * 60));
+        assert_eq!(parse_clock_time("24:00"), None);
+        assert_eq!(parse_clock_time("2:60"), None);
+        assert_eq!(parse_clock_time("13pm"), None);
+        assert_eq!(parse_clock_time("midnight"), None);
+        assert_eq!(parse_clock_time(""), None);
+        assert_eq!(format_clock_time(2 * 60 + 5), "02:05");
+    }
+
+    #[test]
+    fn last_daily_occurrence_is_the_latest_one_not_after_now() {
+        let now = unix_now();
+        for minutes in [0, 2 * 60, 12 * 60 + 30, 23 * 60 + 59] {
+            let occurrence = last_daily_occurrence(minutes, now).unwrap();
+            assert!(occurrence <= now);
+            // Within a day, give or take a DST hour
+            assert!(now - occurrence < 25 * 3600);
+            let mut local: libc::tm = unsafe { std::mem::zeroed() };
+            let occurrence_t = occurrence as libc::time_t;
+            unsafe { libc::localtime_r(&occurrence_t, &mut local) };
+            assert_eq!((local.tm_hour * 60 + local.tm_min) as u32, minutes);
+            assert_eq!(local.tm_sec, 0);
+        }
+        // Exactly at the time, it is today's
+        let today = last_daily_occurrence(2 * 60, now).unwrap();
+        assert_eq!(last_daily_occurrence(2 * 60, today), Some(today));
+        assert!(last_daily_occurrence(2 * 60, today - 1).unwrap() < today);
+    }
+
+    #[test]
+    fn bedtime_sleeps_once_per_night_and_only_when_nobody_is_there() {
+        let bedtime = 1_800_000_000;
+        let awake_since = Some(bedtime - 3600);
+        let nobody = || true;
+        let someone = || false;
+        // Awake through the bedtime, nobody there: sleep
+        assert_eq!(bedtime_action(bedtime, Some(bedtime - 10), awake_since, nobody), BedtimeAction::SleepNow);
+        // Someone still at the Mac: wait for them to leave
+        assert_eq!(bedtime_action(bedtime, Some(bedtime - 10), awake_since, someone), BedtimeAction::Wait);
+        // Already slept for it, or set after it (2:00 set in the afternoon)
+        assert_eq!(bedtime_action(bedtime, Some(bedtime + 60), awake_since, nobody), BedtimeAction::Wait);
+        // Asleep at the bedtime and opened in the morning: done, no sleep
+        // at the first coffee break
+        assert_eq!(bedtime_action(bedtime, None, Some(bedtime + 6 * 3600), someone), BedtimeAction::AlreadySlept);
+        // Hand-edited settings without done_at still work
+        assert_eq!(bedtime_action(bedtime, None, awake_since, nobody), BedtimeAction::SleepNow);
+        // A done night never asks who is there (pmset spawn)
+        assert_eq!(
+            bedtime_action(bedtime, Some(bedtime), awake_since, || panic!("checked presence")),
+            BedtimeAction::Wait
+        );
+    }
+
+    #[test]
+    fn parse_pmset_battery_reads_charge_and_power_source() {
+        let on_ac = "Now drawing from 'AC Power'\n -InternalBattery-0 (id=38994019)\t41%; charging; 1:25 remaining present: true\n";
+        assert_eq!(
+            parse_pmset_battery(on_ac),
+            Some(BatteryState { percent: 41, on_battery: false })
+        );
+        let on_battery = "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=38994019)\t9%; discharging; 0:20 remaining present: true\n";
+        let battery = parse_pmset_battery(on_battery).unwrap();
+        assert_eq!(battery, BatteryState { percent: 9, on_battery: true });
+        assert!(battery.is_low(10));
+        assert!(!battery.is_low(5));
+        assert!(!parse_pmset_battery(on_ac).unwrap().is_low(50));
+        // A Mac mini has no battery
+        assert_eq!(parse_pmset_battery("Now drawing from 'AC Power'\n"), None);
+    }
+
+    #[test]
+    fn assertion_held_reads_the_system_wide_count() {
+        let output = "Assertion status system-wide:\n   PreventUserIdleDisplaySleep    0\n   PreventUserIdleSystemSleep     1\nListed by owning process:\n   pid 1(x): PreventUserIdleDisplaySleep named: \"y\"\n";
+        assert!(!assertion_held(output, "PreventUserIdleDisplaySleep"));
+        assert!(assertion_held(output, "PreventUserIdleSystemSleep"));
+        assert!(last_wake_or_boot().is_some_and(|wake| wake <= unix_now()));
     }
 
     #[test]

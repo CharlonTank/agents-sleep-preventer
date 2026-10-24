@@ -51,6 +51,18 @@ pub struct SleepPreventionSettings {
     /// uses the Mac.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sleep_until_user_returns: bool,
+    /// Nightly sleep, local "HH:MM": every day from then on, the first time
+    /// nobody is using the Mac it goes to sleep, agents working or not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bedtime: Option<String>,
+    /// Bedtimes up to this moment (unix seconds) are done: the Mac slept
+    /// for them, or the bedtime was set after them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bedtime_done_at: Option<u64>,
+    /// On battery at or below this charge (%), agents no longer keep the Mac
+    /// awake and it sleeps as soon as nobody is using it. None = off.
+    #[serde(default = "default_low_battery_sleep")]
+    pub low_battery_sleep: Option<u8>,
 }
 
 impl Default for SleepPreventionSettings {
@@ -60,6 +72,9 @@ impl Default for SleepPreventionSettings {
             force: SleepOverride::Auto,
             sleep_by: None,
             sleep_until_user_returns: false,
+            bedtime: None,
+            bedtime_done_at: None,
+            low_battery_sleep: default_low_battery_sleep(),
         }
     }
 }
@@ -274,6 +289,10 @@ pub struct AppSettings {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_low_battery_sleep() -> Option<u8> {
+    Some(10)
 }
 
 fn default_language() -> String {
@@ -505,6 +524,35 @@ mod tests {
         assert_eq!(settings.sleep_prevention.force.as_str(), "when-done");
         let saved = serde_json::to_string(&settings).unwrap();
         assert!(saved.contains(r#""force":"sleep_when_done""#));
+    }
+
+    #[test]
+    fn test_low_battery_sleep_defaults_on_and_stays_off() {
+        // Older settings files get the 10% default
+        let json = r#"{"sleep_prevention": {"enabled": true}}"#;
+        let settings: AppSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.sleep_prevention.low_battery_sleep, Some(10));
+        assert_eq!(settings.sleep_prevention.bedtime, None);
+
+        // Turned off, it must not come back on at the next load
+        let mut settings = AppSettings::default();
+        settings.sleep_prevention.low_battery_sleep = None;
+        let saved = serde_json::to_string(&settings).unwrap();
+        let loaded: AppSettings = serde_json::from_str(&saved).unwrap();
+        assert_eq!(loaded.sleep_prevention.low_battery_sleep, None);
+    }
+
+    #[test]
+    fn test_bedtime_round_trip() {
+        let mut settings = AppSettings::default();
+        assert!(!serde_json::to_string(&settings).unwrap().contains("bedtime"));
+
+        settings.sleep_prevention.bedtime = Some("02:00".to_string());
+        settings.sleep_prevention.bedtime_done_at = Some(1_790_000_000);
+        let saved = serde_json::to_string(&settings).unwrap();
+        let loaded: AppSettings = serde_json::from_str(&saved).unwrap();
+        assert_eq!(loaded.sleep_prevention.bedtime.as_deref(), Some("02:00"));
+        assert_eq!(loaded.sleep_prevention.bedtime_done_at, Some(1_790_000_000));
     }
 
     #[test]
