@@ -15,8 +15,9 @@
 //! members' messages go straight to that session's inbox, signed with who
 //! speaks; everyone else's, and unknown groups', are only journaled.
 //!
-//! On-disk names (`from: "charles"`, the `how` labels) are the ones the
-//! Python sync-telegram writes, so both can share one data folder.
+//! On-disk names (the `how` labels, files, locks) are the ones the Python
+//! sync-telegram writes, so both can share one data folder; its journals
+//! mark the owner's messages `from: "charles"`, read like `"owner"`.
 
 use super::api::{ApiError, Params, Telegram};
 use super::store::{now, Fields, Lock, Object, Store};
@@ -102,6 +103,14 @@ pub struct Bot {
     /// Listeners still running a build older than the installed one.
     old_listeners: Listeners,
     identity: OnceCell<(bool, String)>,
+}
+
+/// `from` of the owner's messages in the journal and inboxes.
+pub(crate) const FROM_OWNER: &str = "owner";
+
+/// The owner's message (sync-telegram's journals say "charles").
+pub(crate) fn from_owner(entry: &Object) -> bool {
+    matches!(entry.text("from"), Some(FROM_OWNER) | Some("charles"))
 }
 
 fn api_error(error: &anyhow::Error) -> Option<&ApiError> {
@@ -973,7 +982,7 @@ impl Bot {
                 "• Each session has its own topic, under its name: write in the project's topic. In a new topic I ask once which project it is for, then it stays with it."
             ));
         }
-        let example = tag("cleemo-lamdera");
+        let example = tag("my-project");
         lines.push(say!(
             self,
             "• Hors fil, chaque message d’une session commence par son nom ({example}).",
@@ -981,8 +990,8 @@ impl Bot {
         ));
         lines.push(say!(
             self,
-            "• Pour écrire à une session : commence par « nom: » (un bout du nom suffit, « lamdera: … »), ou réponds à un de ses messages.",
-            "• To write to a session: start with \"name:\" (part of the name is enough, \"lamdera: …\"), or reply to one of its messages."
+            "• Pour écrire à une session : commence par « nom: » (un bout du nom suffit, « project: … »), ou réponds à un de ses messages.",
+            "• To write to a session: start with \"name:\" (part of the name is enough, \"project: …\"), or reply to one of its messages."
         ));
         lines.push(say!(
             self,
@@ -1079,8 +1088,8 @@ impl Bot {
     }
 
     /// The sessions "name:" designates: the exact name or an alias,
-    /// otherwise the start of the name or of one of its parts ("lamdera" for
-    /// cleemo-lamdera), 3 letters at least.
+    /// otherwise the start of the name or of one of its parts ("backend" for
+    /// acme-backend), 3 letters at least.
     fn resolve(typed: &str, known: &BTreeMap<String, Object>, live: &BTreeMap<String, Object>) -> Vec<String> {
         if typed.is_empty() {
             return Vec::new();
@@ -1116,7 +1125,7 @@ impl Bot {
     /// The session of the owner's last message, if routed under 3 min ago.
     fn last_routed(&self, at: f64) -> Option<String> {
         let entries = self.store.entries();
-        let entry = entries.iter().rev().find(|e| e.text("from") == Some("charles"))?;
+        let entry = entries.iter().rev().find(|e| from_owner(e))?;
         let session = entry.text("session").filter(|s| !s.is_empty())?;
         (at - entry.float("routed_at") < FOLLOW_UP).then(|| session.to_string())
     }
@@ -1809,7 +1818,7 @@ impl Bot {
         let body = if edited { say!(self, "(message modifié) {body}", "(edited message) {body}") } else { body };
         let entry = obj(json!({
             "at": message.int("edit_date").or_else(|| message.int("date")),
-            "from": "charles", "message_id": message.int("message_id"), "update_id": update_id,
+            "from": FROM_OWNER, "message_id": message.int("message_id"), "update_id": update_id,
             "text": body, "thread_id": topic_of(message),
         }));
         match name {

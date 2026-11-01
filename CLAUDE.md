@@ -146,6 +146,27 @@ The app requests only TWO permissions: Microphone and Accessibility.
 - **Accessibility**: Check with `AXIsProcessTrusted()`. Request (Swift panel) with `AXIsProcessTrustedWithOptions` + `kAXTrustedCheckOptionPrompt` — this shows the system dialog AND auto-adds the app to the Accessibility list (user just flips the switch, no manual "+"). The prompt shows only once per app; later calls are no-ops, so also open `x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility` as fallback.
 - **Input Monitoring is NOT requested**: in TCC, Accessibility is a superset that covers listen-only CGEventTaps (same model as espanso/Hammerspoon). Since text injection via CGEventPost needs Accessibility anyway, Input Monitoring would be redundant. Do not re-add it.
 
+## Telegram, Monitor, Workshop (macOS)
+
+`config.toml` in Application Support (or `ASP_CONFIG`) holds `[telegram]`, `[monitor]` and `[workshop]`; every key has a default.
+
+- **`asp telegram`** (`src/telegram/`) is a port of the Python sync-telegram bot.
+  - Disk protocol: identical file for file (bot.json, sessions/, inbox/, pending/, groups.json, journal.jsonl, offset) with the same flock locks (`poll`, `session.<name>`, `registre`, `fils`). A Python and a Rust listener can share a folder and hand the `getUpdates` reading to each other. Keep the on-disk names (the French `how` labels) for that reason; the owner's messages are `from: "owner"`, and sync-telegram's `"charles"` reads the same (`from_owner`).
+  - Settings: `[telegram] data_dir` / `keychain_service` point at an existing sync-telegram folder and its Keychain item. bot.json `name` and `language` (fr|en) set the owner's name and the messages' language.
+  - Tests: `src/telegram/tests.rs` runs the routing, topics, groups and listener scenarios against a `Fake` Telegram.
+  - Voice notes: Core Audio's `ExtAudioFile` decodes Ogg Opus natively. `dictation::transcribe_recording` cuts at pauses about every 15 s and loads the model once (6 min 20 transcribed in 17 s).
+  - `asp telegram skill` writes the generic `src/telegram/SKILL.md` into every Claude profile and never overwrites a user's own telegram skill.
+- **`asp monitor`** (`src/monitor.rs`) is a port of claude-atelier's moniteur.
+  - Memory is `phys_footprint` (`proc_pid_rusage`), never RSS, which misses compressed memory.
+  - A session's `procStart` is compared with `pbi_start_tvsec` formatted in UTC, English and ps lstart style.
+  - The agent runs it in its own thread (`monitor::spawn`). `deliver` posts a notification and drops the alert in the culprit session's inbox (`Bot::drop_in_inbox`, speaker "ASP"). The session is found through the `telegram listen --session` process in its tree. The owner is told when nobody can be, or when it is critical.
+  - Alert JSON keys (`gravite`, `valeur`, `processus`…) are the Python tool's.
+- **`asp workshop`** (`src/workshop.rs`) is a port of claude-atelier's atelier.
+  - Sessions are resumed by id (a duplicate name opens a picker), using `custom-title.json` or the last custom-title line.
+  - The detached `workshop-pilot` walks down to "Yes, I trust this folder" before Enter, and types texts with `write text … without newline`, then character 13.
+- **The `asp` CLI on the PATH** (`/usr/local/bin/asp`) is a symlink to the app's binary (`sync_installed_cli`; the agent fixes old copies at startup).
+- **A fresh target dir** (worktree) fails to build `coreaudio-sys` with the MacOSX27 SDK ("KernelKit requires -fdefine_target_os_macros"). Build with `COREAUDIO_SDK_PATH=/Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk`.
+
 ## AppleScript Gotchas
 
 - `--` in AppleScript starts a comment. Use short flags like `-y` instead of `--yes` when running commands via AppleScript.

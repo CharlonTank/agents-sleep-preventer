@@ -49,6 +49,9 @@ Install this tool. Your computer stays awake while your agent works; normal slee
 - A macOS menu bar app or Windows tray app, with automatic and manual sleep controls
 - Auto-resume on macOS: when a network drop cuts Claude Code or Codex off, it types "continue" into the agent's terminal once the connection is back
 - Safety nets on macOS: a nightly sleep time, and sleep at low battery (10% by default), even with agents still working
+- Telegram on macOS: talk to every Claude Code session from your phone through your own bot (`asp telegram setup`, then `/telegram` in a session), voice notes transcribed locally
+- RAM and disk watch on macOS: names the session behind a memory or disk drift, by notification and on Telegram
+- Workshop on macOS: `asp workshop` opens your named Claude Code sessions in iTerm in one go
 
 - Local voice dictation with a customizable hotkey: hold Fn+Shift on macOS, toggle Ctrl+Alt+Space on Windows
 - Two dictation engines: Whisper (best accuracy, custom vocabulary) or Parakeet v3 (near-instant transcription)
@@ -159,7 +162,28 @@ asp cleanup    # Clean up after interrupts
 asp auto-resume on|off  # Type "continue" after a network drop (macOS)
 asp bedtime 2:00|off    # Sleep every night from this time, agents or not (macOS)
 asp low-battery 10|off  # Sleep on battery at or below this charge (macOS)
+asp telegram setup      # Connect your own Telegram bot (macOS)
+asp monitor status      # RAM of each Claude Code session, memory and disk (macOS)
+asp workshop            # Open your named sessions in iTerm, from config.toml (macOS)
 asp uninstall  # Remove completely
+```
+
+---
+
+## Configuration (optional, macOS)
+
+Everything works without a config file. To change the defaults, create `~/Library/Application Support/AgentsSleepPreventer/config.toml`:
+
+```toml
+[monitor]
+session_gb = 8            # alert when a session's process tree passes this (critical: session_critical_gb = 16)
+disk_free_gb = 30         # alert under this much free disk (critical: disk_free_critical_gb = 15)
+
+[workshop]
+projects_dir = "~/projects"
+
+[[workshop.tab]]          # one tab; two panes side by side
+panes = [{ dir = "my-app", session = "dev" }, { dir = "my-app", session = "review" }]
 ```
 
 ---

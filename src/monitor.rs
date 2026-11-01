@@ -1163,11 +1163,11 @@ mod tests {
     fn the_session_reads_the_problem_first() {
         let alert = Alert { session: Some("dev".into()), pid: Some(1), kind: "ram_session".into(), gravite: 2, valeur: 17.2,
             resume: "arbre de 17,2 Go (seuil 16,0 Go)".into(), processus: vec![Top { pid: 2, go: 12.5, nom: "node".into() }] };
-        let text = session_message(&alert, "Charles", true);
+        let text = session_message(&alert, "Sam", true);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "mémoire de ta session (critique) : arbre de 17,2 Go (seuil 16,0 Go)");
         assert_eq!(lines[1], "Plus gros processus : node (pid 2, 12,5 Go)");
-        assert!(lines[3].contains("pas un message de Charles"));
+        assert!(lines[3].contains("pas un message de Sam"));
     }
 
     /// Drops a real alert in the inbox of the Telegram session listening in

@@ -477,7 +477,7 @@ fn group(bot: &Bot, command: GroupCommand) -> Result<i32> {
                     .and_then(|(uid, who)| Some((uid.trim().parse::<i64>().ok()?, who.trim())))
                     .filter(|(uid, who)| *uid > 0 && !who.is_empty());
                 let Some((uid, who)) = parsed else {
-                    bail!(say!(bot, "--member {item:?} : attendu ID=Nom, ID positif (par exemple 123456789=Marie)", "--member {item:?}: expected ID=Name, positive ID (for example 123456789=Marie)"));
+                    bail!(say!(bot, "--member {item:?} : attendu ID=Nom, ID positif (par exemple 123456789=Alice)", "--member {item:?}: expected ID=Name, positive ID (for example 123456789=Alice)"));
                 };
                 members.insert(uid, who.to_string());
             }
@@ -620,12 +620,12 @@ fn read(bot: &Bot, name: Option<&str>, limit: usize) {
         let from = entry.text("from").unwrap_or("");
         let session = entry.text("session").filter(|s| !s.is_empty());
         let mut who = match from {
-            "charles" => owner.clone(),
+            _ if bot::from_owner(entry) => owner.clone(),
             "bot" => "Bot".to_string(),
             _ => session.unwrap_or("Claude").to_string(),
         };
-        let mut target = match (from, session) {
-            ("charles", Some(session)) => format!(" → {session}"),
+        let mut target = match session {
+            Some(session) if bot::from_owner(entry) => format!(" → {session}"),
             _ => String::new(),
         };
         if from == "groupe" {

@@ -12,8 +12,8 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
-const CHARLES: i64 = 42;
-const MARIE: i64 = 8521109840;
+const OWNER: i64 = 42;
+const ALICE: i64 = 7000000001;
 const GROUP: i64 = -1001234;
 const QUESTION: &str =
     "Plusieurs sessions Claude Code t’écoutent, une par projet : pour laquelle est ce message ?";
@@ -78,7 +78,7 @@ impl Telegram for Fake {
                     .collect();
                 Ok(Value::Array(fresh))
             }
-            "getMe" => Ok(json!({"id": 8419331841i64, "username": "TestBot", "has_topics_enabled": state.topics})),
+            "getMe" => Ok(json!({"id": 1000000001i64, "username": "TestBot", "has_topics_enabled": state.topics})),
             "getChatMember" => Ok(json!({"status": "administrator"})),
             "createForumTopic" => {
                 state.next_thread += 1;
@@ -116,7 +116,7 @@ fn harness() -> Harness {
     store
         .write(
             &store.path(&["bot.json"]),
-            &json!({"user_id": CHARLES, "chat_id": CHARLES, "name": "Charles", "language": "fr",
+            &json!({"user_id": OWNER, "chat_id": OWNER, "name": "Sam", "language": "fr",
                     "username": "TestBot", "topics": {"enabled": false, "checked_at": now()}}),
         )
         .unwrap();
@@ -130,8 +130,8 @@ fn harness() -> Harness {
 }
 
 fn message(update_id: i64, message_id: i64, text: &str, extra: Value) -> Value {
-    let mut message = json!({"message_id": message_id, "date": now() as i64, "from": {"id": CHARLES},
-                             "chat": {"id": CHARLES, "type": "private"}, "text": text});
+    let mut message = json!({"message_id": message_id, "date": now() as i64, "from": {"id": OWNER},
+                             "chat": {"id": OWNER, "type": "private"}, "text": text});
     message.as_object_mut().unwrap().extend(obj(extra));
     json!({"update_id": update_id, "message": message})
 }
@@ -139,13 +139,13 @@ fn message(update_id: i64, message_id: i64, text: &str, extra: Value) -> Value {
 fn group_message(update_id: i64, message_id: i64, text: &str, sender: i64, name: &str, chat: i64, extra: Value) -> Value {
     let mut message = json!({"message_id": message_id, "date": now() as i64,
                              "from": {"id": sender, "first_name": name},
-                             "chat": {"id": chat, "type": "supergroup", "title": "Site de Marie"}, "text": text});
+                             "chat": {"id": chat, "type": "supergroup", "title": "Site d’Alice"}, "text": text});
     message.as_object_mut().unwrap().extend(obj(extra));
     json!({"update_id": update_id, "message": message})
 }
 
-fn marie(update_id: i64, message_id: i64, text: &str) -> Value {
-    group_message(update_id, message_id, text, MARIE, "Marie", GROUP, json!({}))
+fn alice(update_id: i64, message_id: i64, text: &str) -> Value {
+    group_message(update_id, message_id, text, ALICE, "Alice", GROUP, json!({}))
 }
 
 fn buttons(params: &Params) -> Vec<String> {
@@ -192,7 +192,7 @@ impl Harness {
 
     fn choose(&self, update_id: i64, data: &str) {
         self.dispatch(json!({"update_id": update_id, "callback_query": {
-            "id": format!("q{update_id}"), "from": {"id": CHARLES}, "data": data, "message": {"message_id": 900}}}));
+            "id": format!("q{update_id}"), "from": {"id": OWNER}, "data": data, "message": {"message_id": 900}}}));
     }
 
     fn calls(&self, method: &str) -> Vec<Params> {
@@ -224,8 +224,8 @@ impl Harness {
     }
 
     fn group(&self) {
-        let members = BTreeMap::from([(MARIE, "Marie".to_string()), (CHARLES, "Charles".to_string())]);
-        self.bot.group_add(GROUP, "astrale", &members, Some("Site de Marie"), false).unwrap();
+        let members = BTreeMap::from([(ALICE, "Alice".to_string()), (OWNER, "Sam".to_string())]);
+        self.bot.group_add(GROUP, "alice-site", &members, Some("Site d’Alice"), false).unwrap();
     }
 
     fn offset(&self) -> String {
@@ -238,95 +238,95 @@ impl Harness {
 #[test]
 fn a_leading_name_picks_the_session_and_is_dropped() {
     let mut h = harness();
-    h.live("cleemo-lamdera");
-    h.live("evo-atelier");
-    h.dispatch(message(1, 10, "lamdera : déploie la v336", json!({})));
-    h.dispatch(message(2, 11, "@evo relance la campagne", json!({})));
-    assert_eq!(h.inbox("cleemo-lamdera"), ["déploie la v336"]);
-    assert_eq!(h.inbox("evo-atelier"), ["relance la campagne"]);
+    h.live("acme-backend");
+    h.live("nova-studio");
+    h.dispatch(message(1, 10, "backend : déploie la v336", json!({})));
+    h.dispatch(message(2, 11, "@nova relance la campagne", json!({})));
+    assert_eq!(h.inbox("acme-backend"), ["déploie la v336"]);
+    assert_eq!(h.inbox("nova-studio"), ["relance la campagne"]);
 }
 
 #[test]
 fn an_exact_alias_beats_an_ambiguous_start() {
     let mut h = harness();
-    h.session("cleemo-lamdera", true, json!({"aliases": ["cleemo"]}));
-    h.live("cleemo-landing");
-    h.dispatch(message(1, 12, "cleemo: le point FL IMMO", json!({})));
-    assert_eq!(h.inbox("cleemo-lamdera"), ["le point FL IMMO"]);
+    h.session("acme-backend", true, json!({"aliases": ["acme"]}));
+    h.live("acme-landing");
+    h.dispatch(message(1, 12, "acme: le point client", json!({})));
+    assert_eq!(h.inbox("acme-backend"), ["le point client"]);
 }
 
 #[test]
 fn an_ambiguous_start_offers_only_the_sessions_it_matches() {
     let mut h = harness();
-    h.live("cleemo-lamdera");
-    h.live("cleemo-landing");
-    h.live("evo-atelier");
-    h.dispatch(message(1, 13, "cleemo: on déploie ?", json!({})));
-    assert_eq!(buttons(&h.last_sent()), ["to:1:cleemo-lamdera", "to:1:cleemo-landing", "no:1"]);
-    h.choose(2, "to:1:cleemo-landing");
-    assert_eq!(h.inbox("cleemo-landing"), ["on déploie ?"]);
+    h.live("acme-backend");
+    h.live("acme-landing");
+    h.live("nova-studio");
+    h.dispatch(message(1, 13, "acme: on déploie ?", json!({})));
+    assert_eq!(buttons(&h.last_sent()), ["to:1:acme-backend", "to:1:acme-landing", "no:1"]);
+    h.choose(2, "to:1:acme-landing");
+    assert_eq!(h.inbox("acme-landing"), ["on déploie ?"]);
 }
 
 #[test]
 fn an_ordinary_colon_is_not_an_address() {
     let mut h = harness();
-    h.live("cleemo-lamdera");
-    let text = "Question : on livre ce soir ? https://meet.cleemo.com";
+    h.live("acme-backend");
+    let text = "Question : on livre ce soir ? https://meet.example.com";
     h.dispatch(message(1, 14, text, json!({})));
-    assert_eq!(h.inbox("cleemo-lamdera"), [text]);
+    assert_eq!(h.inbox("acme-backend"), [text]);
 }
 
 #[test]
 fn a_reply_goes_to_its_session_with_the_quote() {
     let mut h = harness();
-    h.live("cleemo-lamdera");
-    h.live("evo-atelier");
-    let sent = h.bot.send("Fiche AR24 prête, je l’envoie ?", "evo-atelier", false).unwrap()[0];
-    let quoted = json!({"message_id": sent, "text": format!("{}\nFiche AR24 prête, je l’envoie ?", tag("evo-atelier"))});
+    h.live("acme-backend");
+    h.live("nova-studio");
+    let sent = h.bot.send("Fiche client prête, je l’envoie ?", "nova-studio", false).unwrap()[0];
+    let quoted = json!({"message_id": sent, "text": format!("{}\nFiche client prête, je l’envoie ?", tag("nova-studio"))});
     h.dispatch(message(1, 20, "oui", json!({"reply_to_message": quoted})));
-    assert_eq!(h.inbox("evo-atelier"), ["[en réponse à « Fiche AR24 prête, je l’envoie ? »]\noui"]);
-    assert!(h.inbox("cleemo-lamdera").is_empty());
+    assert_eq!(h.inbox("nova-studio"), ["[en réponse à « Fiche client prête, je l’envoie ? »]\noui"]);
+    assert!(h.inbox("acme-backend").is_empty());
 }
 
 #[test]
 fn without_an_address_and_two_sessions_the_bot_asks_once() {
     let mut h = harness();
-    h.live("cleemo-lamdera");
-    h.live("evo-atelier");
+    h.live("acme-backend");
+    h.live("nova-studio");
     h.dispatch(message(1, 30, "tu en es où ?", json!({})));
     let prompt = h.last_sent();
     assert_eq!(Harness::text_of(&prompt), QUESTION);
     let reply: Value = serde_json::from_str(prompt.get("reply_parameters").unwrap()).unwrap();
     assert_eq!(reply["message_id"], 30);
-    assert!(buttons(&prompt).contains(&"to:1:evo-atelier".to_string()));
-    assert!(h.inbox("evo-atelier").is_empty());
-    h.choose(2, "to:1:evo-atelier");
-    assert_eq!(h.inbox("evo-atelier"), ["tu en es où ?"]);
+    assert!(buttons(&prompt).contains(&"to:1:nova-studio".to_string()));
+    assert!(h.inbox("nova-studio").is_empty());
+    h.choose(2, "to:1:nova-studio");
+    assert_eq!(h.inbox("nova-studio"), ["tu en es où ?"]);
     let edits = h.calls("editMessageText");
-    assert_eq!(edits.last().unwrap().get("text").unwrap(), format!("→ {}", tag("evo-atelier")));
-    h.choose(3, "to:1:evo-atelier"); // a second tap: nothing more
-    assert!(h.inbox("evo-atelier").is_empty());
+    assert_eq!(edits.last().unwrap().get("text").unwrap(), format!("→ {}", tag("nova-studio")));
+    h.choose(3, "to:1:nova-studio"); // a second tap: nothing more
+    assert!(h.inbox("nova-studio").is_empty());
 }
 
 #[test]
 fn leaving_it_aside_delivers_nothing() {
     let mut h = harness();
-    h.live("cleemo-lamdera");
-    h.live("evo-atelier");
+    h.live("acme-backend");
+    h.live("nova-studio");
     h.dispatch(message(1, 31, "brouillon", json!({})));
     h.choose(2, "no:1");
-    assert!(h.inbox("evo-atelier").is_empty() && h.inbox("cleemo-lamdera").is_empty());
+    assert!(h.inbox("nova-studio").is_empty() && h.inbox("acme-backend").is_empty());
     assert!(h.bot.store.json_files(&h.dir.path().join("pending")).is_empty());
 }
 
 #[test]
 fn a_conversation_follows_for_three_minutes() {
     let mut h = harness();
-    h.live("cleemo-lamdera");
-    h.live("evo-atelier");
-    h.dispatch(message(1, 40, "evo: première consigne", json!({})));
+    h.live("acme-backend");
+    h.live("nova-studio");
+    h.dispatch(message(1, 40, "nova: première consigne", json!({})));
     h.dispatch(message(2, 41, "et la deuxième", json!({})));
-    assert_eq!(h.inbox("evo-atelier"), ["première consigne", "et la deuxième"]);
+    assert_eq!(h.inbox("nova-studio"), ["première consigne", "et la deuxième"]);
     h.dispatch_at(message(3, 42, "autre chose", json!({})), now() + 600.0);
     assert_eq!(Harness::text_of(&h.last_sent()), QUESTION);
 }
@@ -334,19 +334,19 @@ fn a_conversation_follows_for_three_minutes() {
 #[test]
 fn the_only_active_session_gets_unaddressed_messages() {
     let mut h = harness();
-    h.live("cleemo-lamdera");
-    h.session("evo-atelier", false, json!({"last_listen": now() - 3600.0}));
+    h.live("acme-backend");
+    h.session("nova-studio", false, json!({"last_listen": now() - 3600.0}));
     h.dispatch(message(1, 43, "tu peux regarder ?", json!({})));
-    assert_eq!(h.inbox("cleemo-lamdera"), ["tu peux regarder ?"]);
+    assert_eq!(h.inbox("acme-backend"), ["tu peux regarder ?"]);
 }
 
 #[test]
 fn outside_topics_a_message_carries_the_session_name() {
     let h = harness();
-    h.bot.send("a < b & c", "evo-atelier", false).unwrap();
+    h.bot.send("a < b & c", "nova-studio", false).unwrap();
     let last = h.last_sent();
     assert_eq!(last.get("parse_mode"), Some("HTML"));
-    assert_eq!(Harness::text_of(&last), format!("<b>{}</b>\na &lt; b &amp; c", tag("evo-atelier")));
+    assert_eq!(Harness::text_of(&last), format!("<b>{}</b>\na &lt; b &amp; c", tag("nova-studio")));
     assert!(last.get("message_thread_id").is_none());
 }
 
@@ -354,17 +354,17 @@ fn outside_topics_a_message_carries_the_session_name() {
 fn threaded_mode_one_topic_per_session() {
     let mut h = harness();
     h.topics();
-    h.live("cleemo-lamdera");
-    h.live("evo-atelier");
-    h.bot.send("Bonjour", "evo-atelier", false).unwrap();
-    h.bot.send("Encore", "evo-atelier", false).unwrap();
+    h.live("acme-backend");
+    h.live("nova-studio");
+    h.bot.send("Bonjour", "nova-studio", false).unwrap();
+    h.bot.send("Encore", "nova-studio", false).unwrap();
     let created = h.calls("createForumTopic");
-    assert_eq!(created.iter().map(|p| p.get("name").unwrap()).collect::<Vec<_>>(), ["evo-atelier"]);
+    assert_eq!(created.iter().map(|p| p.get("name").unwrap()).collect::<Vec<_>>(), ["nova-studio"]);
     let last = h.last_sent();
     assert_eq!((last.get("message_thread_id"), last.get("text")), (Some("77"), Some("Encore")));
     assert!(last.get("parse_mode").is_none());
     h.dispatch(message(1, 50, "vas-y", json!({"message_thread_id": 77, "is_topic_message": true})));
-    assert_eq!(h.inbox("evo-atelier"), ["vas-y"]);
+    assert_eq!(h.inbox("nova-studio"), ["vas-y"]);
 }
 
 #[test]
@@ -373,7 +373,7 @@ fn a_file_goes_to_the_session_topic_with_its_caption() {
     h.topics();
     let pdf = h.dir.path().join("INV-000155-octobre-2026.pdf");
     std::fs::write(&pdf, b"%PDF-1.4").unwrap();
-    h.bot.send_document(&pdf, "facturation", "INV-000155 (brouillon)", false).unwrap();
+    h.bot.send_document(&pdf, "invoices", "INV-000155 (brouillon)", false).unwrap();
     let sent = h.calls("sendDocument").pop().unwrap();
     assert_eq!(
         (sent.get("message_thread_id"), sent.get("caption"), sent.get("document")),
@@ -389,10 +389,10 @@ fn a_file_goes_to_the_session_topic_with_its_caption() {
 fn a_deleted_topic_is_created_again() {
     let h = harness();
     h.topics();
-    h.bot.send("Bonjour", "evo-atelier", false).unwrap();
+    h.bot.send("Bonjour", "nova-studio", false).unwrap();
     h.tg.borrow_mut().lost_thread = true;
-    h.bot.send("Toujours là", "evo-atelier", false).unwrap();
-    assert_eq!(h.bot.sessions()["evo-atelier"].int("thread_id"), Some(78));
+    h.bot.send("Toujours là", "nova-studio", false).unwrap();
+    assert_eq!(h.bot.sessions()["nova-studio"].int("thread_id"), Some(78));
     assert_eq!(h.last_sent().get("message_thread_id"), Some("78"));
 }
 
@@ -400,18 +400,18 @@ fn a_deleted_topic_is_created_again() {
 fn an_unknown_topic_joins_the_chosen_session_and_is_renamed() {
     let mut h = harness();
     h.topics();
-    h.live("cleemo-lamdera");
-    h.live("evo-hub");
+    h.live("acme-backend");
+    h.live("nova-hub");
     h.dispatch(message(1, 60, "Bah je sais pas", json!({"message_thread_id": 35051, "is_topic_message": true})));
     let prompt = h.last_sent();
     assert_eq!((prompt.get("text"), prompt.get("message_thread_id")), (Some(QUESTION), Some("35051")));
-    h.choose(2, "to:1:cleemo-lamdera");
-    assert_eq!(h.inbox("cleemo-lamdera"), ["Bah je sais pas"]);
+    h.choose(2, "to:1:acme-backend");
+    assert_eq!(h.inbox("acme-backend"), ["Bah je sais pas"]);
     let renamed = h.calls("editForumTopic").pop().unwrap();
-    assert_eq!((renamed.get("message_thread_id"), renamed.get("name")), (Some("35051"), Some("cleemo-lamdera")));
+    assert_eq!((renamed.get("message_thread_id"), renamed.get("name")), (Some("35051"), Some("acme-backend")));
     h.dispatch(message(3, 61, "et maintenant ?", json!({"message_thread_id": 35051, "is_topic_message": true})));
-    assert_eq!(h.inbox("cleemo-lamdera"), ["et maintenant ?"]);
-    h.bot.send("Réponse", "cleemo-lamdera", false).unwrap();
+    assert_eq!(h.inbox("acme-backend"), ["et maintenant ?"]);
+    h.bot.send("Réponse", "acme-backend", false).unwrap();
     assert_eq!(h.last_sent().get("message_thread_id"), Some("35051"));
     assert!(h.calls("createForumTopic").is_empty());
 }
@@ -420,15 +420,15 @@ fn an_unknown_topic_joins_the_chosen_session_and_is_renamed() {
 fn the_session_answers_in_the_topic_it_was_written_in() {
     let mut h = harness();
     h.topics();
-    h.live("evo-hub");
-    h.bot.send("Bonjour", "evo-hub", false).unwrap(); // its topic: 77
-    h.dispatch(message(1, 62, "evo: dans un fil à moi", json!({"message_thread_id": 500, "is_topic_message": true})));
-    assert_eq!(h.inbox("evo-hub"), ["dans un fil à moi"]);
-    h.bot.send("Vu", "evo-hub", false).unwrap();
+    h.live("nova-hub");
+    h.bot.send("Bonjour", "nova-hub", false).unwrap(); // its topic: 77
+    h.dispatch(message(1, 62, "nova: dans un fil à moi", json!({"message_thread_id": 500, "is_topic_message": true})));
+    assert_eq!(h.inbox("nova-hub"), ["dans un fil à moi"]);
+    h.bot.send("Vu", "nova-hub", false).unwrap();
     assert_eq!(h.last_sent().get("message_thread_id"), Some("500"));
     h.dispatch(message(2, 63, "retour au premier fil", json!({"message_thread_id": 77, "is_topic_message": true})));
-    assert_eq!(h.inbox("evo-hub"), ["retour au premier fil"]);
-    h.bot.send("Vu aussi", "evo-hub", false).unwrap();
+    assert_eq!(h.inbox("nova-hub"), ["retour au premier fil"]);
+    h.bot.send("Vu aussi", "nova-hub", false).unwrap();
     assert_eq!(h.last_sent().get("message_thread_id"), Some("77"));
 }
 
@@ -436,24 +436,24 @@ fn the_session_answers_in_the_topic_it_was_written_in() {
 fn a_session_topic_beats_a_name() {
     let mut h = harness();
     h.topics();
-    h.live("cleemo-lamdera");
-    h.live("evo-hub");
-    h.bot.send("Bonjour", "evo-hub", false).unwrap(); // topic 77
-    h.dispatch(message(1, 64, "lamdera: écrit dans le fil evo", json!({"message_thread_id": 77, "is_topic_message": true})));
-    assert_eq!(h.inbox("evo-hub"), ["lamdera: écrit dans le fil evo"]);
-    assert!(h.inbox("cleemo-lamdera").is_empty());
-    assert_eq!(h.bot.sessions()["cleemo-lamdera"].int("thread_id"), None);
+    h.live("acme-backend");
+    h.live("nova-hub");
+    h.bot.send("Bonjour", "nova-hub", false).unwrap(); // topic 77
+    h.dispatch(message(1, 64, "backend: écrit dans le fil evo", json!({"message_thread_id": 77, "is_topic_message": true})));
+    assert_eq!(h.inbox("nova-hub"), ["backend: écrit dans le fil evo"]);
+    assert!(h.inbox("acme-backend").is_empty());
+    assert_eq!(h.bot.sessions()["acme-backend"].int("thread_id"), None);
 }
 
 #[test]
 fn outside_topics_the_last_session_to_write_gets_the_answer() {
     let mut h = harness();
-    h.live("cleemo-lamdera");
-    h.live("evo-hub");
-    h.bot.send("Active Threaded Mode puis dis-moi", "cleemo-lamdera", false).unwrap();
+    h.live("acme-backend");
+    h.live("nova-hub");
+    h.bot.send("Active Threaded Mode puis dis-moi", "acme-backend", false).unwrap();
     h.dispatch_at(message(1, 65, "C’est fait", json!({})), now() + 1000.0);
-    assert_eq!(h.inbox("cleemo-lamdera"), ["C’est fait"]);
-    h.bot.send("Merci", "evo-hub", false).unwrap();
+    assert_eq!(h.inbox("acme-backend"), ["C’est fait"]);
+    h.bot.send("Merci", "nova-hub", false).unwrap();
     h.dispatch_at(message(2, 66, "bien plus tard", json!({})), now() + 4000.0);
     assert_eq!(Harness::text_of(&h.last_sent()), QUESTION);
 }
@@ -461,79 +461,79 @@ fn outside_topics_the_last_session_to_write_gets_the_answer() {
 #[test]
 fn the_bot_own_messages_are_ignored_without_counting() {
     let mut h = harness();
-    h.live("evo-hub");
-    let own = message(1, 67, "", json!({"from": {"id": 8419331841i64, "is_bot": true}, "forum_topic_created": {"name": "evo-hub"}}));
+    h.live("nova-hub");
+    let own = message(1, 67, "", json!({"from": {"id": 1000000001i64, "is_bot": true}, "forum_topic_created": {"name": "nova-hub"}}));
     assert_eq!(h.dispatch(own), 0);
-    assert!(h.inbox("evo-hub").is_empty());
+    assert!(h.inbox("nova-hub").is_empty());
 }
 
 #[test]
 fn bot_commands_deliver_nothing() {
     let mut h = harness();
-    h.live("evo-atelier");
+    h.live("nova-studio");
     h.dispatch(message(1, 80, "/sessions", json!({})));
-    assert!(Harness::text_of(&h.last_sent()).contains(&format!("{} — à l’écoute", tag("evo-atelier"))));
+    assert!(Harness::text_of(&h.last_sent()).contains(&format!("{} — à l’écoute", tag("nova-studio"))));
     h.dispatch(message(2, 81, "/aide@TestBot", json!({})));
     assert!(Harness::text_of(&h.last_sent()).contains("/sessions"));
-    assert!(h.inbox("evo-atelier").is_empty());
+    assert!(h.inbox("nova-studio").is_empty());
 }
 
 #[test]
 fn other_accounts_and_groups_are_ignored() {
     let mut h = harness();
-    h.live("evo-atelier");
-    let other = message(1, 90, "evo: pirate", json!({"from": {"id": 666}}));
-    let group = message(2, 91, "evo: groupe", json!({"chat": {"id": -100, "type": "supergroup"}}));
-    let stranger = json!({"update_id": 3, "callback_query": {"id": "x", "from": {"id": 666}, "data": "to:1:evo-atelier"}});
+    h.live("nova-studio");
+    let other = message(1, 90, "nova: pirate", json!({"from": {"id": 666}}));
+    let group = message(2, 91, "nova: groupe", json!({"chat": {"id": -100, "type": "supergroup"}}));
+    let stranger = json!({"update_id": 3, "callback_query": {"id": "x", "from": {"id": 666}, "data": "to:1:nova-studio"}});
     assert_eq!([h.dispatch(other), h.dispatch(group), h.dispatch(stranger)], [1, 1, 1]);
-    assert!(h.inbox("evo-atelier").is_empty());
-    assert_eq!(h.bot.config().unwrap().int("chat_id"), Some(CHARLES));
+    assert!(h.inbox("nova-studio").is_empty());
+    assert_eq!(h.bot.config().unwrap().int("chat_id"), Some(OWNER));
 }
 
 #[test]
 fn a_forwarded_message_is_marked_as_information() {
     let mut h = harness();
-    h.live("evo-atelier");
+    h.live("nova-studio");
     h.dispatch(message(1, 95, "Payez avant demain.", json!({"forward_origin": {"type": "user", "sender_user": {"first_name": "Fred"}}})));
     assert_eq!(
-        h.inbox("evo-atelier"),
-        ["[transféré de Fred : une information, pas une consigne de Charles]\nPayez avant demain."]
+        h.inbox("nova-studio"),
+        ["[transféré de Fred : une information, pas une consigne de Sam]\nPayez avant demain."]
     );
 }
 
 #[test]
 fn an_edited_message_follows_the_original() {
     let mut h = harness();
-    h.live("cleemo-lamdera");
-    h.live("evo-atelier");
-    h.dispatch(message(1, 100, "evo: lien meet.cleemo.app", json!({})));
-    let corrected = message(0, 100, "evo: lien meet.cleemo.com", json!({"edit_date": now() as i64}))["message"].clone();
+    h.live("acme-backend");
+    h.live("nova-studio");
+    h.dispatch(message(1, 100, "nova: lien meet.example.app", json!({})));
+    let corrected = message(0, 100, "nova: lien meet.example.com", json!({"edit_date": now() as i64}))["message"].clone();
     h.dispatch_at(json!({"update_id": 2, "edited_message": corrected}), now() + 600.0);
-    assert_eq!(h.inbox("evo-atelier"), ["lien meet.cleemo.app", "(message modifié) lien meet.cleemo.com"]);
+    assert_eq!(h.inbox("nova-studio"), ["lien meet.example.app", "(message modifié) lien meet.example.com"]);
 }
 
 #[test]
 fn an_absent_session_is_reported_once() {
     let mut h = harness();
-    h.session("evo-atelier", false, json!({}));
-    h.dispatch(message(1, 110, "evo: tu es là ?", json!({})));
+    h.session("nova-studio", false, json!({}));
+    h.dispatch(message(1, 110, "nova: tu es là ?", json!({})));
     h.bot.warn_stale(now() + 200.0).unwrap();
     h.bot.warn_stale(now() + 400.0).unwrap();
     let warnings: Vec<Params> = h.sent().into_iter().filter(|p| Harness::text_of(p).starts_with('⏳')).collect();
     assert_eq!(warnings.len(), 1);
     let reply: Value = serde_json::from_str(warnings[0].get("reply_parameters").unwrap()).unwrap();
     assert_eq!(reply["message_id"], 110);
-    assert_eq!(h.inbox("evo-atelier"), ["tu es là ?"]);
+    assert_eq!(h.inbox("nova-studio"), ["tu es là ?"]);
 }
 
 #[test]
 fn an_unreadable_update_does_not_block_the_next_ones() {
     let mut h = harness();
-    h.live("evo-atelier");
+    h.live("nova-studio");
     let broken = json!({"update_id": 1, "message": {"message_id": 120, "chat": {"type": "supergroup"}, "text": "x"}});
-    h.tg.borrow_mut().updates = vec![broken, message(2, 121, "evo: deux", json!({}))];
+    h.tg.borrow_mut().updates = vec![broken, message(2, 121, "nova: deux", json!({}))];
     h.bot.poll_once(1).unwrap();
-    assert_eq!(h.inbox("evo-atelier"), ["deux"]);
+    assert_eq!(h.inbox("nova-studio"), ["deux"]);
     assert!(h.sent().iter().any(|p| Harness::text_of(p).starts_with("⚠️")));
     assert_eq!(h.offset(), "3");
 }
@@ -541,22 +541,22 @@ fn an_unreadable_update_does_not_block_the_next_ones() {
 #[test]
 fn a_replayed_reading_does_not_deliver_twice() {
     let mut h = harness();
-    h.live("evo-atelier");
-    h.tg.borrow_mut().updates = vec![message(5, 130, "evo: une fois", json!({}))];
+    h.live("nova-studio");
+    h.tg.borrow_mut().updates = vec![message(5, 130, "nova: une fois", json!({}))];
     h.bot.poll_once(1).unwrap();
     std::fs::write(h.dir.path().join("offset"), "0").unwrap(); // cut before the offset was written
     h.bot.poll_once(1).unwrap();
-    assert_eq!(h.inbox("evo-atelier"), ["une fois"]);
+    assert_eq!(h.inbox("nova-studio"), ["une fois"]);
 }
 
 #[test]
 fn a_file_too_big_is_reported_without_losing_the_text() {
     let mut h = harness();
-    h.live("evo-atelier");
+    h.live("nova-studio");
     h.tg.borrow_mut().refuse_download = Some("Bad Request: file is too big".to_string());
-    h.dispatch(message(1, 150, "", json!({"caption": "evo: le PV", "document": {"file_id": "x", "file_name": "pv.pdf", "file_size": 25_000_000}})));
+    h.dispatch(message(1, 150, "", json!({"caption": "nova: le PV", "document": {"file_id": "x", "file_name": "pv.pdf", "file_size": 25_000_000}})));
     assert_eq!(
-        h.inbox("evo-atelier"),
+        h.inbox("nova-studio"),
         ["le PV\n[document non téléchargé, 25 Mo : Telegram getFile: Bad Request: file is too big]"]
     );
 }
@@ -564,10 +564,10 @@ fn a_file_too_big_is_reported_without_losing_the_text() {
 #[test]
 fn attachments_are_downloaded_next_to_the_update() {
     let mut h = harness();
-    h.live("evo-atelier");
-    h.dispatch(message(1, 151, "", json!({"caption": "evo: regarde", "photo": [{"file_id": "petit"}, {"file_id": "grand"}]})));
+    h.live("nova-studio");
+    h.dispatch(message(1, 151, "", json!({"caption": "nova: regarde", "photo": [{"file_id": "petit"}, {"file_id": "grand"}]})));
     let photo = h.dir.path().join("attachments").join("1-photo.jpg");
-    assert_eq!(h.inbox("evo-atelier"), [format!("regarde\n[photo] {}", photo.display())]);
+    assert_eq!(h.inbox("nova-studio"), [format!("regarde\n[photo] {}", photo.display())]);
     let fetched = h.calls("getFile").pop().unwrap();
     assert_eq!(fetched.get("file_id"), Some("grand"));
 }
@@ -577,22 +577,22 @@ fn attachments_are_downloaded_next_to_the_update() {
 #[test]
 fn one_listener_reads_for_all_and_returns_its_own() {
     let mut h = harness();
-    h.live("evo-atelier");
+    h.live("nova-studio");
     h.bot
-        .update_session("cleemo-lamdera", obj(json!({"cwd": "/projets/cleemo-lamdera", "last_listen": now()})))
+        .update_session("acme-backend", obj(json!({"cwd": "/projets/acme-backend", "last_listen": now()})))
         .unwrap();
     h.tg.borrow_mut().updates = vec![
-        message(7, 60, "evo: pour toi", json!({})),
-        message(8, 61, "lamdera: pour moi", json!({})),
+        message(7, 60, "nova: pour toi", json!({})),
+        message(8, 61, "backend: pour moi", json!({})),
     ];
-    let (received, ignored) = h.bot.listen("cleemo-lamdera", 30).unwrap();
+    let (received, ignored) = h.bot.listen("acme-backend", 30).unwrap();
     let texts: Vec<&str> = received.iter().map(|e| e.text("text").unwrap()).collect();
     assert_eq!((texts, ignored), (vec!["pour moi"], 0));
-    assert_eq!(h.inbox("evo-atelier"), ["pour toi"]);
+    assert_eq!(h.inbox("nova-studio"), ["pour toi"]);
     assert_eq!(h.offset(), "9");
     let reactions = h.calls("setMessageReaction");
     assert_eq!(reactions.iter().map(|p| p.get("message_id").unwrap()).collect::<Vec<_>>(), ["61"]);
-    assert!(!h.bot.listening("cleemo-lamdera"));
+    assert!(!h.bot.listening("acme-backend"));
     assert!(!h.bot.store.held("poll"));
 }
 
@@ -601,18 +601,18 @@ fn without_the_reading_a_listener_waits_for_its_inbox() {
     let mut h = harness();
     h.locks.push(h.bot.store.lock("poll", false).unwrap());
     h.bot
-        .update_session("cleemo-lamdera", obj(json!({"cwd": "/projets/cleemo-lamdera", "last_listen": now()})))
+        .update_session("acme-backend", obj(json!({"cwd": "/projets/acme-backend", "last_listen": now()})))
         .unwrap();
     let root = h.dir.path().to_path_buf();
     // Another process (here a thread with its own store) files the message.
     let writer = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(500));
         let store = Store::new(root);
-        let entry = json!({"at": now(), "from": "charles", "message_id": 70, "update_id": 9, "text": "coucou",
-                           "session": "cleemo-lamdera", "how": "nom", "routed_at": now()});
-        store.write(&store.path(&["inbox", "cleemo-lamdera", "9.json"]), &entry).unwrap();
+        let entry = json!({"at": now(), "from": "owner", "message_id": 70, "update_id": 9, "text": "coucou",
+                           "session": "acme-backend", "how": "nom", "routed_at": now()});
+        store.write(&store.path(&["inbox", "acme-backend", "9.json"]), &entry).unwrap();
     });
-    let (received, _) = h.bot.listen("cleemo-lamdera", 10).unwrap();
+    let (received, _) = h.bot.listen("acme-backend", 10).unwrap();
     writer.join().unwrap();
     assert_eq!(received.iter().map(|e| e.text("text").unwrap()).collect::<Vec<_>>(), ["coucou"]);
     assert!(h.calls("getUpdates").is_empty());
@@ -622,30 +622,30 @@ fn without_the_reading_a_listener_waits_for_its_inbox() {
 fn a_409_conflict_gives_up_the_reading_then_resumes() {
     let h = harness();
     h.bot
-        .update_session("cleemo-lamdera", obj(json!({"cwd": "/projets/cleemo-lamdera", "last_listen": now()})))
+        .update_session("acme-backend", obj(json!({"cwd": "/projets/acme-backend", "last_listen": now()})))
         .unwrap();
-    h.tg.borrow_mut().updates = vec![message(1, 160, "lamdera: après le conflit", json!({}))];
+    h.tg.borrow_mut().updates = vec![message(1, 160, "backend: après le conflit", json!({}))];
     h.tg.borrow_mut().conflicts = 1;
-    let (received, _) = h.bot.listen("cleemo-lamdera", 30).unwrap();
+    let (received, _) = h.bot.listen("acme-backend", 30).unwrap();
     assert_eq!(received.iter().map(|e| e.text("text").unwrap()).collect::<Vec<_>>(), ["après le conflit"]);
 }
 
 #[test]
 fn two_listeners_for_one_session() {
     let mut h = harness();
-    h.live("evo-atelier");
-    let error = h.bot.listen("evo-atelier", 1).unwrap_err();
+    h.live("nova-studio");
+    let error = h.bot.listen("nova-studio", 1).unwrap_err();
     assert!(error.downcast_ref::<super::bot::Busy>().is_some());
-    assert!(h.bot.start("evo-atelier", &[], false).is_err());
+    assert!(h.bot.start("nova-studio", &[], false).is_err());
 }
 
 #[test]
 fn start_announces_the_session_and_its_aliases() {
     let h = harness();
-    h.bot.start("cleemo-lamdera", &["Cleemo".to_string()], false).unwrap();
-    let data = &h.bot.sessions()["cleemo-lamdera"];
-    assert_eq!(data.list("aliases"), [json!("cleemo")]);
-    assert!(Harness::text_of(&h.last_sent()).contains("commence ton message par « cleemo: »"));
+    h.bot.start("acme-backend", &["Acme".to_string()], false).unwrap();
+    let data = &h.bot.sessions()["acme-backend"];
+    assert_eq!(data.list("aliases"), [json!("acme")]);
+    assert!(Harness::text_of(&h.last_sent()).contains("commence ton message par « acme: »"));
     assert!(!h.calls("setMyCommands").is_empty());
 }
 
@@ -654,13 +654,13 @@ fn an_album_comes_back_in_one_wake_up() {
     let h = harness();
     h.group();
     h.bot
-        .update_session("astrale", obj(json!({"cwd": "/projets/astrale", "last_listen": now()})))
+        .update_session("alice-site", obj(json!({"cwd": "/projets/alice-site", "last_listen": now()})))
         .unwrap();
     h.tg.borrow_mut().updates = vec![
-        group_message(1, 1, "", MARIE, "Marie", GROUP, json!({"photo": [{"file_id": "a"}], "media_group_id": "album"})),
-        group_message(2, 2, "", MARIE, "Marie", GROUP, json!({"photo": [{"file_id": "b"}], "media_group_id": "album"})),
+        group_message(1, 1, "", ALICE, "Alice", GROUP, json!({"photo": [{"file_id": "a"}], "media_group_id": "album"})),
+        group_message(2, 2, "", ALICE, "Alice", GROUP, json!({"photo": [{"file_id": "b"}], "media_group_id": "album"})),
     ];
-    let (received, _) = h.bot.listen("astrale", 30).unwrap();
+    let (received, _) = h.bot.listen("alice-site", 30).unwrap();
     assert_eq!(received.len(), 2);
 }
 
@@ -691,7 +691,7 @@ fn the_registry_refuses_mistakes() {
     h.group();
     let paul = BTreeMap::from([(7, "P".to_string())]);
     assert!(h.bot.group_add(42, "x", &paul, None, false).is_err());
-    let error = h.bot.group_add(-1009, "astrale", &paul, None, false).unwrap_err();
+    let error = h.bot.group_add(-1009, "alice-site", &paul, None, false).unwrap_err();
     assert!(error.to_string().contains("déjà liée"));
     assert!(h.bot.group_remove(-555, None).is_err());
     let negative = BTreeMap::from([(-7, "P".to_string())]);
@@ -722,9 +722,9 @@ fn sending_to_a_migrated_group_follows_its_new_id() {
     let h = harness();
     h.group();
     h.tg.borrow_mut().migrated.insert(GROUP, -100999);
-    h.bot.send("C’est en ligne", "astrale", false).unwrap();
+    h.bot.send("C’est en ligne", "alice-site", false).unwrap();
     assert_eq!(h.last_sent().get("chat_id"), Some("-100999"));
-    assert_eq!(h.bot.groups()[&-100999].text("session"), Some("astrale"));
+    assert_eq!(h.bot.groups()[&-100999].text("session"), Some("alice-site"));
     assert!(!h.bot.groups().contains_key(&GROUP));
 }
 
@@ -732,26 +732,26 @@ fn sending_to_a_migrated_group_follows_its_new_id() {
 fn a_member_message_reaches_the_session_with_their_name() {
     let mut h = harness();
     h.group();
-    h.live("astrale");
-    h.live("cleemo-lamdera");
-    assert_eq!(h.dispatch(marie(1, 10, "Tu peux changer la photo d’accueil ?")), 0);
-    let entry = h.bot.take("astrale").remove(0);
+    h.live("alice-site");
+    h.live("acme-backend");
+    assert_eq!(h.dispatch(alice(1, 10, "Tu peux changer la photo d’accueil ?")), 0);
+    let entry = h.bot.take("alice-site").remove(0);
     assert_eq!(
         (entry.text("text"), entry.text("speaker"), entry.text("group"), entry.int("chat_id"), entry.text("how")),
-        (Some("Tu peux changer la photo d’accueil ?"), Some("Marie"), Some("Site de Marie"), Some(GROUP), Some("groupe"))
+        (Some("Tu peux changer la photo d’accueil ?"), Some("Alice"), Some("Site d’Alice"), Some(GROUP), Some("groupe"))
     );
-    assert!(h.inbox("cleemo-lamdera").is_empty());
-    assert_eq!(h.bot.config().unwrap().int("chat_id"), Some(CHARLES));
+    assert!(h.inbox("acme-backend").is_empty());
+    assert_eq!(h.bot.config().unwrap().int("chat_id"), Some(OWNER));
 }
 
 #[test]
 fn non_members_and_unknown_groups_are_journaled_only() {
     let mut h = harness();
     h.group();
-    h.live("astrale");
+    h.live("alice-site");
     assert_eq!(h.dispatch(group_message(1, 10, "salut", 666, "Intrus", GROUP, json!({}))), 1);
-    assert_eq!(h.dispatch(group_message(2, 11, "salut", MARIE, "Marie", -100777, json!({}))), 1);
-    assert!(h.inbox("astrale").is_empty());
+    assert_eq!(h.dispatch(group_message(2, 11, "salut", ALICE, "Alice", -100777, json!({}))), 1);
+    assert!(h.inbox("alice-site").is_empty());
     let hows: Vec<String> = h.bot.store.entries().iter().filter_map(|e| e.text("how").map(str::to_string)).collect();
     assert!(hows.contains(&"non membre".to_string()) && hows.contains(&"groupe inconnu".to_string()));
     assert!(h.bot.unknown_groups().contains_key(&-100777));
@@ -761,15 +761,15 @@ fn non_members_and_unknown_groups_are_journaled_only() {
 fn a_reply_and_a_forward_in_the_group() {
     let mut h = harness();
     h.group();
-    h.live("astrale");
-    let sent = h.bot.send("Voici le lien : https://astrale.lamdera.app", "astrale", false).unwrap()[0];
-    h.dispatch(group_message(1, 30, "Parfait merci", MARIE, "Marie", GROUP,
-        json!({"reply_to_message": {"message_id": sent, "text": "Voici le lien : https://astrale.lamdera.app"}})));
-    h.dispatch(group_message(2, 31, "Expo le 12 novembre", MARIE, "Marie", GROUP,
+    h.live("alice-site");
+    let sent = h.bot.send("Voici le lien : https://alice.example.app", "alice-site", false).unwrap()[0];
+    h.dispatch(group_message(1, 30, "Parfait merci", ALICE, "Alice", GROUP,
+        json!({"reply_to_message": {"message_id": sent, "text": "Voici le lien : https://alice.example.app"}})));
+    h.dispatch(group_message(2, 31, "Expo le 12 novembre", ALICE, "Alice", GROUP,
         json!({"forward_origin": {"type": "user", "sender_user": {"first_name": "Galerie"}}})));
-    assert_eq!(h.inbox("astrale"), [
-        "[en réponse à « Voici le lien : https://astrale.lamdera.app »]\nParfait merci",
-        "[transféré de Galerie : une information, pas une consigne de Marie]\nExpo le 12 novembre",
+    assert_eq!(h.inbox("alice-site"), [
+        "[en réponse à « Voici le lien : https://alice.example.app »]\nParfait merci",
+        "[transféré de Galerie : une information, pas une consigne de Alice]\nExpo le 12 novembre",
     ]);
 }
 
@@ -777,76 +777,76 @@ fn a_reply_and_a_forward_in_the_group() {
 fn a_group_message_number_does_not_divert_a_private_reply() {
     let mut h = harness();
     h.group();
-    h.live("astrale");
-    h.live("evo-hub");
-    let private = h.bot.send("Je déploie ?", "evo-hub", false).unwrap()[0];
-    h.dispatch(marie(1, private, "bonjour"));
-    h.inbox("astrale");
+    h.live("alice-site");
+    h.live("nova-hub");
+    let private = h.bot.send("Je déploie ?", "nova-hub", false).unwrap()[0];
+    h.dispatch(alice(1, private, "bonjour"));
+    h.inbox("alice-site");
     h.dispatch(message(2, 50, "oui", json!({"reply_to_message": {"message_id": private, "text": "Je déploie ?"}})));
-    assert_eq!(h.inbox("evo-hub"), ["[en réponse à « Je déploie ? »]\noui"]);
+    assert_eq!(h.inbox("nova-hub"), ["[en réponse à « Je déploie ? »]\noui"]);
 }
 
 #[test]
 fn group_commands_answer_in_the_group() {
     let mut h = harness();
     h.group();
-    h.live("astrale");
-    h.dispatch(marie(1, 60, "/aide@TestBot"));
+    h.live("alice-site");
+    h.dispatch(alice(1, 60, "/aide@TestBot"));
     let answer = h.last_sent();
     assert_eq!(answer.get("chat_id"), Some(GROUP.to_string().as_str()));
-    assert!(Harness::text_of(&answer).contains("Site de Marie"));
+    assert!(Harness::text_of(&answer).contains("Site d’Alice"));
     let reply: Value = serde_json::from_str(answer.get("reply_parameters").unwrap()).unwrap();
     assert_eq!(reply["message_id"], 60);
-    h.dispatch(marie(2, 61, "/sessions"));
-    assert!(Harness::text_of(&h.last_sent()).contains("astrale"));
+    h.dispatch(alice(2, 61, "/sessions"));
+    assert!(Harness::text_of(&h.last_sent()).contains("alice-site"));
     let before = h.sent().len();
     assert_eq!(h.dispatch(group_message(3, 62, "/aide", 666, "Intrus", GROUP, json!({}))), 1);
     assert_eq!(h.sent().len(), before);
-    assert!(h.inbox("astrale").is_empty());
+    assert!(h.inbox("alice-site").is_empty());
 }
 
 #[test]
 fn a_command_for_another_bot_is_ignored() {
     let mut h = harness();
     h.group();
-    h.live("astrale");
+    h.live("alice-site");
     let before = h.sent().len();
-    assert_eq!(h.dispatch(marie(1, 63, "/start@AutreBot")), 0);
+    assert_eq!(h.dispatch(alice(1, 63, "/start@AutreBot")), 0);
     assert_eq!(h.sent().len(), before);
-    assert!(h.inbox("astrale").is_empty());
+    assert!(h.inbox("alice-site").is_empty());
 }
 
 #[test]
 fn an_absent_group_session_is_reported_privately_without_quoting() {
     let mut h = harness();
     h.group();
-    h.session("astrale", false, json!({}));
-    h.dispatch(marie(1, 70, "tu es là ?"));
+    h.session("alice-site", false, json!({}));
+    h.dispatch(alice(1, 70, "tu es là ?"));
     h.bot.warn_stale(now() + 200.0).unwrap();
     let warnings: Vec<Params> = h.sent().into_iter().filter(|p| Harness::text_of(p).starts_with('⏳')).collect();
     assert_eq!(warnings.len(), 1);
-    assert_eq!(warnings[0].get("chat_id"), Some(CHARLES.to_string().as_str()));
+    assert_eq!(warnings[0].get("chat_id"), Some(OWNER.to_string().as_str()));
     assert!(warnings[0].get("reply_parameters").is_none());
-    assert!(Harness::text_of(&warnings[0]).contains("Marie") && Harness::text_of(&warnings[0]).contains("Site de Marie"));
+    assert!(Harness::text_of(&warnings[0]).contains("Alice") && Harness::text_of(&warnings[0]).contains("Site d’Alice"));
     // The group itself is told once that Claude isn't available.
     let told: Vec<Params> = h.sent().into_iter().filter(|p| p.get("chat_id") == Some(GROUP.to_string().as_str())).collect();
     assert_eq!(told.len(), 1);
-    assert!(Harness::text_of(&told[0]).contains("Charles est prévenu"));
+    assert!(Harness::text_of(&told[0]).contains("Sam est prévenu"));
 }
 
 #[test]
 fn sending_from_a_bound_session_goes_to_the_group_without_header() {
     let h = harness();
     h.group();
-    h.bot.send("C’est en ligne !", "astrale", false).unwrap();
+    h.bot.send("C’est en ligne !", "alice-site", false).unwrap();
     let last = h.last_sent();
     assert_eq!((last.get("chat_id"), last.get("text")), (Some(GROUP.to_string().as_str()), Some("C’est en ligne !")));
     assert!(last.get("parse_mode").is_none());
     assert_eq!(h.bot.store.entries().last().unwrap().int("chat_id"), Some(GROUP));
-    h.bot.send("Marie demande un achat", "astrale", true).unwrap();
+    h.bot.send("Alice demande un achat", "alice-site", true).unwrap();
     let private = h.last_sent();
-    assert_eq!(private.get("chat_id"), Some(CHARLES.to_string().as_str()));
-    assert_eq!(Harness::text_of(&private), format!("<b>{}</b>\nMarie demande un achat", tag("astrale")));
+    assert_eq!(private.get("chat_id"), Some(OWNER.to_string().as_str()));
+    assert_eq!(Harness::text_of(&private), format!("<b>{}</b>\nAlice demande un achat", tag("alice-site")));
 }
 
 #[test]
@@ -855,8 +855,8 @@ fn a_file_goes_to_the_group_or_privately() {
     h.group();
     let image = h.dir.path().join("apercu.png");
     std::fs::write(&image, b"png").unwrap();
-    h.bot.send_document(&image, "astrale", "La nouvelle page", false).unwrap();
-    h.bot.send_document(&image, "astrale", "pour toi", true).unwrap();
+    h.bot.send_document(&image, "alice-site", "La nouvelle page", false).unwrap();
+    h.bot.send_document(&image, "alice-site", "pour toi", true).unwrap();
     let sent = h.calls("sendDocument");
     assert_eq!(
         (sent[0].get("chat_id"), sent[0].get("caption"), sent[0].get("document")),
@@ -864,7 +864,7 @@ fn a_file_goes_to_the_group_or_privately() {
     );
     assert_eq!(
         (sent[1].get("chat_id"), sent[1].get("caption").map(str::to_string)),
-        (Some(CHARLES.to_string().as_str()), Some(format!("{}\npour toi", tag("astrale"))))
+        (Some(OWNER.to_string().as_str()), Some(format!("{}\npour toi", tag("alice-site"))))
     );
 }
 
@@ -872,9 +872,9 @@ fn a_file_goes_to_the_group_or_privately() {
 fn a_bound_session_alone_does_not_get_unaddressed_private_messages() {
     let mut h = harness();
     h.group();
-    h.live("astrale");
+    h.live("alice-site");
     h.dispatch(message(1, 80, "tu en es où ?", json!({})));
-    assert!(h.inbox("astrale").is_empty());
+    assert!(h.inbox("alice-site").is_empty());
     assert_eq!(Harness::text_of(&h.last_sent()), QUESTION);
 }
 
@@ -882,23 +882,23 @@ fn a_bound_session_alone_does_not_get_unaddressed_private_messages() {
 fn group_send_does_not_capture_private_messages() {
     let mut h = harness();
     h.group();
-    h.live("astrale");
-    h.live("evo-hub");
-    h.bot.send("Voilà Marie", "astrale", false).unwrap();
+    h.live("alice-site");
+    h.live("nova-hub");
+    h.bot.send("Voilà Alice", "alice-site", false).unwrap();
     h.dispatch(message(1, 80, "tu en es où ?", json!({})));
-    assert_eq!(h.inbox("evo-hub"), ["tu en es où ?"]);
-    assert!(h.inbox("astrale").is_empty());
+    assert_eq!(h.inbox("nova-hub"), ["tu en es où ?"]);
+    assert!(h.inbox("alice-site").is_empty());
 }
 
 #[test]
 fn start_and_stop_are_private_unless_announced() {
     let h = harness();
     h.group();
-    h.bot.start("astrale", &[], false).unwrap();
+    h.bot.start("alice-site", &[], false).unwrap();
     let hello = h.last_sent();
-    assert_eq!(hello.get("chat_id"), Some(CHARLES.to_string().as_str()));
-    assert!(Harness::text_of(&hello).contains("groupe « Site de Marie »"));
-    h.bot.start("astrale", &[], true).unwrap();
+    assert_eq!(hello.get("chat_id"), Some(OWNER.to_string().as_str()));
+    assert!(Harness::text_of(&hello).contains("groupe « Site d’Alice »"));
+    h.bot.start("alice-site", &[], true).unwrap();
     let hello = h.last_sent();
     assert_eq!(hello.get("chat_id"), Some(GROUP.to_string().as_str()));
     assert!(Harness::text_of(&hello).starts_with("Bonjour"));
@@ -908,14 +908,14 @@ fn start_and_stop_are_private_unless_announced() {
 fn an_anonymous_admin_is_journaled_and_reported_once() {
     let mut h = harness();
     h.group();
-    h.live("astrale");
+    h.live("alice-site");
     let anonymous = |update_id: i64| {
         group_message(update_id, update_id, "coucou", 1087968824, "Group", GROUP,
-            json!({"from": {"id": 1087968824, "is_bot": true, "first_name": "Group"}, "sender_chat": {"id": GROUP, "title": "Site de Marie"}}))
+            json!({"from": {"id": 1087968824, "is_bot": true, "first_name": "Group"}, "sender_chat": {"id": GROUP, "title": "Site d’Alice"}}))
     };
     assert_eq!(h.dispatch(anonymous(1)), 1);
     assert_eq!(h.dispatch(anonymous(2)), 1);
-    assert!(h.inbox("astrale").is_empty());
+    assert!(h.inbox("alice-site").is_empty());
     let notices: Vec<Params> = h.sent().into_iter().filter(|p| Harness::text_of(p).contains("anonyme")).collect();
     assert_eq!(notices.len(), 1);
 }
@@ -924,27 +924,27 @@ fn an_anonymous_admin_is_journaled_and_reported_once() {
 fn a_member_writing_privately_is_told_once_to_use_the_group() {
     let mut h = harness();
     h.group();
-    h.live("astrale");
+    h.live("alice-site");
     let private = |update_id: i64| {
         json!({"update_id": update_id, "message": {"message_id": update_id, "date": now() as i64,
-               "from": {"id": MARIE, "first_name": "Marie"}, "chat": {"id": MARIE, "type": "private"}, "text": "bonjour"}})
+               "from": {"id": ALICE, "first_name": "Alice"}, "chat": {"id": ALICE, "type": "private"}, "text": "bonjour"}})
     };
     assert_eq!(h.dispatch(private(1)), 1);
     assert_eq!(h.dispatch(private(2)), 1);
-    let told: Vec<Params> = h.sent().into_iter().filter(|p| p.get("chat_id") == Some(MARIE.to_string().as_str())).collect();
+    let told: Vec<Params> = h.sent().into_iter().filter(|p| p.get("chat_id") == Some(ALICE.to_string().as_str())).collect();
     assert_eq!(told.len(), 1);
-    assert!(Harness::text_of(&told[0]).contains("Site de Marie"));
-    assert!(h.inbox("astrale").is_empty());
+    assert!(Harness::text_of(&told[0]).contains("Site d’Alice"));
+    assert!(h.inbox("alice-site").is_empty());
 }
 
 #[test]
 fn group_topics_the_answer_goes_in_the_topic() {
     let mut h = harness();
     h.group();
-    h.live("astrale");
-    h.dispatch(group_message(1, 90, "dans le sujet", MARIE, "Marie", GROUP, json!({"message_thread_id": 12, "is_topic_message": true})));
-    assert_eq!(h.inbox("astrale"), ["dans le sujet"]);
-    h.bot.send("Réponse", "astrale", false).unwrap();
+    h.live("alice-site");
+    h.dispatch(group_message(1, 90, "dans le sujet", ALICE, "Alice", GROUP, json!({"message_thread_id": 12, "is_topic_message": true})));
+    assert_eq!(h.inbox("alice-site"), ["dans le sujet"]);
+    h.bot.send("Réponse", "alice-site", false).unwrap();
     assert_eq!(h.last_sent().get("message_thread_id"), Some("12"));
 }
 
@@ -952,7 +952,7 @@ fn group_topics_the_answer_goes_in_the_topic() {
 fn the_bot_added_to_a_group_is_journaled_and_the_owner_told() {
     let h = harness();
     let added = json!({"update_id": 1, "my_chat_member": {"chat": {"id": -100321, "type": "supergroup", "title": "Nouveau"},
-        "from": {"id": CHARLES, "first_name": "Charles"}, "date": now() as i64,
+        "from": {"id": OWNER, "first_name": "Sam"}, "date": now() as i64,
         "old_chat_member": {"status": "left"}, "new_chat_member": {"status": "member"}}});
     assert_eq!(h.dispatch(added), 0);
     let notice = Harness::text_of(&h.last_sent());
@@ -967,16 +967,16 @@ fn routing_is_unchanged_by_a_busy_group() {
     h.group();
     let at = now();
     for id in 1..1200 {
-        h.bot.store.journal(&json!({"at": at, "from": "groupe", "chat_id": GROUP, "group": "Site de Marie", "user_id": MARIE,
-            "speaker": "Marie", "message_id": id, "session": "astrale", "how": "groupe", "routed_at": at, "thread_id": null, "text": "x"}));
-        h.bot.store.journal(&json!({"at": at, "message_id": id, "from": "claude", "session": "astrale", "chat_id": GROUP,
-            "group": "Site de Marie", "thread_id": null, "text": "y"}));
+        h.bot.store.journal(&json!({"at": at, "from": "groupe", "chat_id": GROUP, "group": "Site d’Alice", "user_id": ALICE,
+            "speaker": "Alice", "message_id": id, "session": "alice-site", "how": "groupe", "routed_at": at, "thread_id": null, "text": "x"}));
+        h.bot.store.journal(&json!({"at": at, "message_id": id, "from": "claude", "session": "alice-site", "chat_id": GROUP,
+            "group": "Site d’Alice", "thread_id": null, "text": "y"}));
     }
-    h.live("cleemo-lamdera");
-    h.live("evo-atelier");
-    let sent = h.bot.send("Fiche prête ?", "evo-atelier", false).unwrap()[0];
+    h.live("acme-backend");
+    h.live("nova-studio");
+    let sent = h.bot.send("Fiche prête ?", "nova-studio", false).unwrap()[0];
     h.dispatch(message(1, 20, "oui", json!({"reply_to_message": {"message_id": sent, "text": "Fiche prête ?"}})));
-    assert_eq!(h.inbox("evo-atelier"), ["[en réponse à « Fiche prête ? »]\noui"]);
+    assert_eq!(h.inbox("nova-studio"), ["[en réponse à « Fiche prête ? »]\noui"]);
 }
 
 // Compatibility with a folder written by the Python sync-telegram.
@@ -987,25 +987,36 @@ fn reads_a_folder_written_by_sync_telegram() {
     let root = h.dir.path();
     std::fs::create_dir_all(root.join("sessions")).unwrap();
     std::fs::write(
-        root.join("sessions/evo-hub.json"),
-        "{\n  \"name\": \"evo-hub\",\n  \"created\": 1761990000.123456,\n  \"aliases\": [\n    \"evo\"\n  ],\n  \"thread_id\": null,\n  \"cwd\": \"/projets/evo-hub\",\n  \"last_listen\": 1761990100.5,\n  \"stopped\": false\n}\n",
+        root.join("sessions/nova-hub.json"),
+        "{\n  \"name\": \"nova-hub\",\n  \"created\": 1761990000.123456,\n  \"aliases\": [\n    \"evo\"\n  ],\n  \"thread_id\": null,\n  \"cwd\": \"/projets/nova-hub\",\n  \"last_listen\": 1761990100.5,\n  \"stopped\": false\n}\n",
     )
     .unwrap();
     std::fs::write(
         root.join("groups.json"),
-        format!("{{\n  \"chats\": {{\n    \"{GROUP}\": {{\n      \"added\": 1761990000.0,\n      \"members\": {{\n        \"{MARIE}\": \"Marie\"\n      }},\n      \"session\": \"astrale\",\n      \"title\": \"Site de Marie\"\n    }}\n  }},\n  \"migrations\": {{\n    \"-555\": {GROUP}\n  }}\n}}\n"),
+        format!("{{\n  \"chats\": {{\n    \"{GROUP}\": {{\n      \"added\": 1761990000.0,\n      \"members\": {{\n        \"{ALICE}\": \"Alice\"\n      }},\n      \"session\": \"alice-site\",\n      \"title\": \"Site d’Alice\"\n    }}\n  }},\n  \"migrations\": {{\n    \"-555\": {GROUP}\n  }}\n}}\n"),
     )
     .unwrap();
     std::fs::write(
         root.join("journal.jsonl"),
-        "{\"at\": 1761990200.0, \"message_id\": 900, \"from\": \"claude\", \"session\": \"evo-hub\", \"thread_id\": null, \"text\": \"Bonjour\"}\n",
+        "{\"at\": 1761990200.0, \"message_id\": 900, \"from\": \"claude\", \"session\": \"nova-hub\", \"thread_id\": null, \"text\": \"Bonjour\"}\n",
     )
     .unwrap();
-    assert_eq!(h.bot.sessions()["evo-hub"].list("aliases"), [json!("evo")]);
-    assert_eq!(h.bot.group_of("astrale").map(|(chat, _)| chat), Some(GROUP));
+    assert_eq!(h.bot.sessions()["nova-hub"].list("aliases"), [json!("evo")]);
+    assert_eq!(h.bot.group_of("alice-site").map(|(chat, _)| chat), Some(GROUP));
     assert_eq!(h.bot.latest(-555, None), GROUP);
     let mut h = h;
-    h.locks.push(h.bot.store.lock("session.evo-hub", false).unwrap());
+    h.locks.push(h.bot.store.lock("session.nova-hub", false).unwrap());
     h.dispatch(message(1, 20, "oui", json!({"reply_to_message": {"message_id": 900, "text": "Bonjour"}})));
-    assert_eq!(h.inbox("evo-hub"), ["[en réponse à « Bonjour »]\noui"]);
+    assert_eq!(h.inbox("nova-hub"), ["[en réponse à « Bonjour »]\noui"]);
+}
+
+#[test]
+fn a_follow_up_counts_a_message_routed_by_sync_telegram() {
+    let mut h = harness();
+    h.live("acme-backend");
+    h.live("nova-studio");
+    h.bot.store.journal(&json!({"at": now(), "from": "charles", "session": "nova-studio", "how": "nom",
+                                "routed_at": now(), "message_id": 5, "update_id": 5, "text": "première consigne"}));
+    h.dispatch(message(6, 6, "et la deuxième", json!({})));
+    assert_eq!(h.inbox("nova-studio"), ["et la deuxième"]);
 }

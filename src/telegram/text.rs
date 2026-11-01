@@ -9,7 +9,7 @@ use unicode_normalization::UnicodeNormalization;
 pub const LIMIT: usize = 3800;
 const EMOJIS: [&str; 6] = ["🟦", "🟩", "🟧", "🟪", "🟨", "🟫"];
 
-/// "Cleemo Lamdéra" → "cleemo-lamdera": lowercase ASCII, no accents or
+/// "Acme Backénd" → "acme-backend": lowercase ASCII, no accents or
 /// spaces, at most 40 characters.
 pub fn normal(name: &str) -> String {
     let plain: String = name.nfkd().filter(char::is_ascii).collect();
@@ -43,7 +43,7 @@ pub fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-/// "🟪 cleemo-lamdera": the header of a session's messages outside topics.
+/// "🟪 acme-backend": the header of a session's messages outside topics.
 pub fn tag(name: &str) -> String {
     format!("{} {name}", EMOJIS[crc32(name.as_bytes()) as usize % EMOJIS.len()])
 }
@@ -150,8 +150,8 @@ mod tests {
 
     #[test]
     fn names_are_plain_ascii() {
-        assert_eq!(normal("Cleemo Lamdéra"), "cleemo-lamdera");
-        assert_eq!(normal("  --Évo / Atelier.."), "evo-atelier");
+        assert_eq!(normal("Acme Backénd"), "acme-backend");
+        assert_eq!(normal("  --Nóva / Studio.."), "nova-studio");
         assert_eq!(normal("agents-sleep-preventer"), "agents-sleep-preventer");
         assert_eq!(normal("ŒUVRE"), "uvre");
         assert_eq!(normal(&"x".repeat(60)).len(), 40);
@@ -165,10 +165,10 @@ mod tests {
 
     #[test]
     fn addresses() {
-        let found = address("lamdera : déploie la v336").unwrap();
-        assert_eq!((found.typed.as_str(), found.rest.as_str()), ("lamdera", "déploie la v336"));
-        let found = address("@evo relance la campagne").unwrap();
-        assert_eq!((found.typed.as_str(), found.rest.as_str()), ("evo", "relance la campagne"));
+        let found = address("backend : déploie la v336").unwrap();
+        assert_eq!((found.typed.as_str(), found.rest.as_str()), ("backend", "déploie la v336"));
+        let found = address("@nova relance la campagne").unwrap();
+        assert_eq!((found.typed.as_str(), found.rest.as_str()), ("nova", "relance la campagne"));
         assert!(address("pas d'adresse ici").is_none());
     }
 
