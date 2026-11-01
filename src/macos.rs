@@ -13,8 +13,11 @@ mod settings;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use core_foundation::base::{kCFAllocatorDefault, TCFType};
+use core_foundation::array::CFArray;
+use core_foundation::base::{kCFAllocatorDefault, CFType, TCFType};
 use core_foundation::boolean::CFBoolean;
+use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+use core_foundation::number::CFNumber;
 use core_foundation::runloop::{
     kCFRunLoopDefaultMode, CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRun,
 };
@@ -43,7 +46,11 @@ use std::time::{Duration, Instant};
 use sysinfo::System;
 
 #[link(name = "IOKit", kind = "framework")]
-extern "C" {}
+extern "C" {
+    fn IOPMGetThermalWarningLevel(level: *mut u32) -> i32;
+    fn IOPMCopyCPUPowerStatus(status: *mut CFDictionaryRef) -> i32;
+    fn IOPMCopyAssertionsStatus(status: *mut CFDictionaryRef) -> i32;
+}
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
@@ -262,7 +269,13 @@ enum AgentKind {
 struct ProcessInfo {
     pid: u32,
     ppid: u32,
-    comm: String,
+    /// argv[0] whole. `ps` cut it to 16 characters (comm), and splitting its
+    /// args on spaces broke a path like the Claude Code that Claude Desktop
+    /// runs from "Application Support", so those sessions went unseen. Not
+    /// the executable file: Claude Code's binary also runs its bundled
+    /// `ugrep` under that name.
+    arg0: String,
+    /// argv joined with spaces, on one line, as `ps -o args` shows it.
     args: String,
 }
 
@@ -323,28 +336,244 @@ enum ClaudeAttentionStatus {
     NotWaiting,
 }
 
+/// Every process, read from the kernel (libproc) like `ps` does but without
+/// spawning it: on a busy Mac (a thousand processes, a dozen agents)
+/// `ps -eo args` took most of a second, and every hook, so every tool call
+/// of every agent, waited for it.
 fn load_process_table() -> Vec<ProcessInfo> {
-    Command::new("ps")
-        .args(["-eo", "pid=,ppid=,comm=,args="])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.lines().filter_map(parse_process_line).collect())
-        .unwrap_or_default()
+    let mut reader = ProcessReader::new();
+    all_pids()
+        .into_iter()
+        .filter_map(|pid| reader.read(pid))
+        .collect()
 }
 
-fn parse_process_line(line: &str) -> Option<ProcessInfo> {
-    let mut parts = line.split_whitespace();
-    let pid = parts.next()?.parse().ok()?;
-    let ppid = parts.next()?.parse().ok()?;
-    let comm = parts.next()?.to_string();
-    let args = parts.collect::<Vec<_>>().join(" ");
-    Some(ProcessInfo {
-        pid,
-        ppid,
-        comm,
-        args,
-    })
+/// The processes under `root`, itself included, reading arguments only for
+/// those: the Stop hook and the stale-marker sweep look at one agent's tree,
+/// not at the thousand processes of a busy Mac.
+fn load_process_subtree(root: u32) -> Vec<ProcessInfo> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for pid in all_pids() {
+        if let Some(info) = bsd_info(pid) {
+            children.entry(info.pbi_ppid).or_default().push(pid);
+        }
+    }
+    let mut reader = ProcessReader::new();
+    let mut seen = HashSet::new();
+    let mut pending = vec![root];
+    let mut processes = Vec::new();
+    while let Some(pid) = pending.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        processes.extend(reader.read(pid));
+        pending.extend(children.get(&pid).into_iter().flatten().copied());
+    }
+    processes
+}
+
+fn agent_kind_of(pid: u32) -> Option<AgentKind> {
+    ProcessReader::new()
+        .read(pid)
+        .and_then(|process| classify_agent_process(&process))
+}
+
+fn all_pids() -> Vec<u32> {
+    let count = unsafe { libc::proc_listallpids(ptr::null_mut(), 0) };
+    if count <= 0 {
+        return Vec::new();
+    }
+    // Room for processes started between the two calls
+    let mut pids = vec![0 as libc::pid_t; count as usize + 64];
+    let written = unsafe {
+        libc::proc_listallpids(
+            pids.as_mut_ptr() as *mut libc::c_void,
+            (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int,
+        )
+    };
+    pids.truncate(written.max(0) as usize);
+    pids.into_iter()
+        .filter(|&pid| pid > 0)
+        .map(|pid| pid as u32)
+        .collect()
+}
+
+/// Reads processes one by one, reusing the argument buffer (`kern.argmax`,
+/// 1 MB) across a whole table.
+struct ProcessReader {
+    uid: libc::uid_t,
+    args_buffer: Vec<u8>,
+}
+
+impl ProcessReader {
+    fn new() -> Self {
+        Self {
+            uid: unsafe { libc::getuid() },
+            args_buffer: vec![0; argument_space()],
+        }
+    }
+
+    fn read(&mut self, pid: u32) -> Option<ProcessInfo> {
+        let info = bsd_info(pid)?;
+        // Other users' arguments are off limits (and never agents); a zombie
+        // has none left.
+        let argv = (info.pbi_uid == self.uid)
+            .then(|| read_argv(pid, &mut self.args_buffer))
+            .flatten()
+            .filter(|argv| !argv.is_empty())
+            .unwrap_or_else(|| vec![c_chars_to_string(&info.pbi_comm)]);
+        Some(ProcessInfo {
+            pid,
+            ppid: info.pbi_ppid,
+            arg0: one_line(&argv[0]),
+            args: one_line(&argv.join(" ")),
+        })
+    }
+}
+
+/// Arguments keep the newlines and tabs of inline scripts; `ps` showed them
+/// on one line, and so does the menu.
+fn one_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut libc::proc_bsdinfo as *mut libc::c_void,
+            size,
+        )
+    };
+    (written == size).then_some(info)
+}
+
+fn c_chars_to_string(chars: &[libc::c_char]) -> String {
+    let bytes = chars
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect::<Vec<_>>();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Size of the largest argument area (`kern.argmax`).
+fn argument_space() -> usize {
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    let mut argmax: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    let status = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            2,
+            &mut argmax as *mut libc::c_int as *mut libc::c_void,
+            &mut size,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if status == 0 && argmax > 0 {
+        argmax as usize
+    } else {
+        1 << 20
+    }
+}
+
+fn read_argv(pid: u32, buffer: &mut [u8]) -> Option<Vec<String>> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut size = buffer.len();
+    let status = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buffer.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    parse_procargs(&buffer[..size])
+}
+
+/// `KERN_PROCARGS2`: argc, the executable path, NUL padding, then the
+/// NUL-terminated arguments (the environment follows).
+fn parse_procargs(buffer: &[u8]) -> Option<Vec<String>> {
+    let argc = i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?);
+    let rest = &buffer[4..];
+    let path_end = rest.iter().position(|&b| b == 0)?;
+    let rest = &rest[path_end..];
+    let args_start = rest.iter().position(|&b| b != 0)?;
+    Some(
+        rest[args_start..]
+            .split(|&b| b == 0)
+            .take(argc.max(0) as usize)
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect(),
+    )
+}
+
+/// %CPU like `ps` shows it: the sum of the threads' recent CPU usage, read
+/// from libproc (`ps -p` took half a second on a busy Mac). None when the
+/// process is gone or belongs to another user.
+fn process_cpu_percent(pid: u32) -> Option<f32> {
+    const PROC_PIDLISTTHREADS: libc::c_int = 6;
+    const TH_USAGE_SCALE: f32 = 1000.0;
+    let mut task: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let task_size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTASKINFO,
+            0,
+            &mut task as *mut libc::proc_taskinfo as *mut libc::c_void,
+            task_size,
+        )
+    };
+    if written != task_size {
+        return None;
+    }
+    // Room for threads started in between
+    let mut threads = vec![0u64; task.pti_threadnum.max(0) as usize + 16];
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            PROC_PIDLISTTHREADS,
+            0,
+            threads.as_mut_ptr() as *mut libc::c_void,
+            (threads.len() * std::mem::size_of::<u64>()) as libc::c_int,
+        )
+    };
+    if bytes <= 0 {
+        return None;
+    }
+    threads.truncate(bytes as usize / std::mem::size_of::<u64>());
+    let size = std::mem::size_of::<libc::proc_threadinfo>() as libc::c_int;
+    let usage: i64 = threads
+        .iter()
+        .filter_map(|&thread| {
+            let mut info: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
+            let written = unsafe {
+                libc::proc_pidinfo(
+                    pid as libc::c_int,
+                    libc::PROC_PIDTHREADINFO,
+                    thread,
+                    &mut info as *mut libc::proc_threadinfo as *mut libc::c_void,
+                    size,
+                )
+            };
+            (written == size).then_some(info.pth_cpu_usage as i64)
+        })
+        .sum();
+    Some(usage as f32 / TH_USAGE_SCALE * 100.0)
 }
 
 fn executable_basename(token: &str) -> &str {
@@ -356,8 +585,14 @@ fn executable_name_is(token: &str, expected: &str) -> bool {
     basename == expected || basename == format!("{}.exe", expected)
 }
 
+/// argv[0] whole, then the rest of the arguments split on whitespace.
 fn process_tokens(process: &ProcessInfo) -> Vec<&str> {
-    process.args.split_whitespace().collect()
+    match process.args.strip_prefix(process.arg0.as_str()) {
+        Some(rest) if !process.arg0.is_empty() => std::iter::once(process.arg0.as_str())
+            .chain(rest.split_whitespace())
+            .collect(),
+        _ => process.args.split_whitespace().collect(),
+    }
 }
 
 fn codex_command_index(tokens: &[&str]) -> Option<usize> {
@@ -424,9 +659,8 @@ fn is_codex_wrapper_process(process: &ProcessInfo) -> bool {
 
 fn is_codex_native_process(process: &ProcessInfo) -> bool {
     let tokens = process_tokens(process);
-    let arg0 = tokens.first().copied().unwrap_or(&process.comm);
-    (executable_name_is(arg0, "codex") || executable_name_is(&process.comm, "codex"))
-        && !is_codex_service(&tokens)
+    let arg0 = tokens.first().copied().unwrap_or(&process.arg0);
+    executable_name_is(arg0, "codex") && !is_codex_service(&tokens)
 }
 
 fn is_python_executable(token: &str) -> bool {
@@ -442,12 +676,10 @@ fn is_hermes_python_module(tokens: &[&str]) -> bool {
 
 fn is_hermes_process(process: &ProcessInfo) -> bool {
     let tokens = process_tokens(process);
-    let arg0 = tokens.first().copied().unwrap_or(&process.comm);
+    let arg0 = tokens.first().copied().unwrap_or(&process.arg0);
 
     executable_name_is(arg0, "hermes")
-        || executable_name_is(&process.comm, "hermes")
-        || ((is_python_executable(arg0) || is_python_executable(&process.comm))
-            && is_hermes_python_module(&tokens))
+        || (is_python_executable(arg0) && is_hermes_python_module(&tokens))
 }
 
 /// Claude Code's native installer keeps each release at
@@ -469,12 +701,9 @@ fn is_claude_versioned_binary(token: &str) -> bool {
 
 fn classify_agent_process(process: &ProcessInfo) -> Option<AgentKind> {
     let tokens = process_tokens(process);
-    let arg0 = tokens.first().copied().unwrap_or(&process.comm);
+    let arg0 = tokens.first().copied().unwrap_or(&process.arg0);
 
-    if executable_name_is(arg0, "claude")
-        || executable_name_is(&process.comm, "claude")
-        || is_claude_versioned_binary(arg0)
-    {
+    if executable_name_is(arg0, "claude") || is_claude_versioned_binary(arg0) {
         // Chrome launches `claude --chrome-native-host` as the browser
         // extension's messaging bridge: a helper, not a session.
         if tokens.contains(&"--chrome-native-host") {
@@ -552,29 +781,27 @@ fn select_agent_processes(processes: &[ProcessInfo]) -> Vec<ProcessInfo> {
     agents
 }
 
+/// Walks up from the hook process only: hooks run on every tool call, and
+/// reading the whole process table there is what made them slow.
 fn find_agent_ancestor() -> Option<u32> {
-    let processes = load_process_table();
-    let by_pid: HashMap<u32, &ProcessInfo> = processes
-        .iter()
-        .map(|process| (process.pid, process))
-        .collect();
+    let mut reader = ProcessReader::new();
     let this_pid = std::process::id();
     let mut current_pid = this_pid;
 
     for _ in 0..20 {
-        let Some(process) = by_pid.get(&current_pid) else {
+        let Some(process) = reader.read(current_pid) else {
             break;
         };
 
         if current_pid != this_pid {
-            if classify_agent_process(process).is_some() {
+            if classify_agent_process(&process).is_some() {
                 return Some(current_pid);
             }
             // Since Codex 0.160 the CLI hands its turns to a shared
             // `codex app-server` daemon, which runs the hooks: the session's
             // terminal process is not among our ancestors.
-            if is_codex_service(&process_tokens(process)) {
-                return Some(codex_hook_session_pid(&processes, current_pid));
+            if is_codex_service(&process_tokens(&process)) {
+                return Some(codex_hook_session_pid(&load_process_table(), current_pid));
             }
         }
 
@@ -1102,29 +1329,68 @@ fn on_low_battery(threshold: Option<u8>) -> bool {
     threshold.is_some_and(|threshold| read_battery().is_some_and(|battery| battery.is_low(threshold)))
 }
 
+/// The internal battery from IOKit's power sources (what `pmset -g batt`
+/// shows, without spawning it on every hook). None on a Mac without one.
 fn read_battery() -> Option<BatteryState> {
-    let output = Command::new("pmset").args(["-g", "batt"]).output().ok()?;
-    parse_pmset_battery(&String::from_utf8_lossy(&output.stdout))
+    use io_kit_sys::ps::power_sources::{
+        IOPSCopyPowerSourcesInfo, IOPSCopyPowerSourcesList, IOPSGetPowerSourceDescription,
+    };
+    let info = unsafe { IOPSCopyPowerSourcesInfo() };
+    if info.is_null() {
+        return None;
+    }
+    let info = unsafe { CFType::wrap_under_create_rule(info) };
+    let sources = unsafe { IOPSCopyPowerSourcesList(info.as_CFTypeRef()) };
+    if sources.is_null() {
+        return None;
+    }
+    let sources = unsafe { CFArray::<CFType>::wrap_under_create_rule(sources) };
+    sources.iter().find_map(|source| {
+        let description =
+            unsafe { IOPSGetPowerSourceDescription(info.as_CFTypeRef(), source.as_CFTypeRef()) };
+        if description.is_null() {
+            return None;
+        }
+        let description =
+            unsafe { CFDictionary::<CFString, CFType>::wrap_under_get_rule(description) };
+        if dictionary_string(&description, "Type").as_deref() != Some("InternalBattery") {
+            return None;
+        }
+        let current = dictionary_number(&description, "Current Capacity")?;
+        let max = dictionary_number(&description, "Max Capacity").filter(|&max| max > 0)?;
+        Some(BatteryState {
+            percent: (current * 100 / max).clamp(0, 100) as u8,
+            on_battery: dictionary_string(&description, "Power Source State").as_deref()
+                == Some("Battery Power"),
+        })
+    })
 }
 
-/// `pmset -g batt`: "Now drawing from 'Battery Power'" then
-/// " -InternalBattery-0 (id=…)\t41%; discharging; …". None without a battery.
-fn parse_pmset_battery(output: &str) -> Option<BatteryState> {
-    let on_battery = output.contains("'Battery Power'");
-    let battery_line = output.lines().find(|line| line.contains("InternalBattery"))?;
-    let (before_percent, _) = battery_line.split_once('%')?;
-    let digits: String = before_percent
-        .chars()
-        .rev()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    Some(BatteryState {
-        percent: digits.parse().ok()?,
-        on_battery,
-    })
+fn dictionary_number(dictionary: &CFDictionary<CFString, CFType>, key: &'static str) -> Option<i64> {
+    dictionary
+        .find(CFString::from_static_string(key))?
+        .downcast::<CFNumber>()?
+        .to_i64()
+}
+
+fn dictionary_string(
+    dictionary: &CFDictionary<CFString, CFType>,
+    key: &'static str,
+) -> Option<String> {
+    dictionary
+        .find(CFString::from_static_string(key))?
+        .downcast::<CFString>()
+        .map(|value| value.to_string())
+}
+
+/// An IOKit "copy" call that fills a dictionary the caller then owns.
+fn copied_dictionary(
+    copy: unsafe extern "C" fn(*mut CFDictionaryRef) -> i32,
+) -> Option<CFDictionary<CFString, CFType>> {
+    let mut dictionary: CFDictionaryRef = ptr::null();
+    let status = unsafe { copy(&mut dictionary) };
+    (status == 0 && !dictionary.is_null())
+        .then(|| unsafe { CFDictionary::wrap_under_create_rule(dictionary) })
 }
 
 /// No input for a minute, and no video or presentation keeping the display
@@ -1133,23 +1399,11 @@ fn nobody_at_the_mac() -> bool {
     seconds_since_last_user_input() >= RECENT_INPUT_SECS && !display_kept_awake()
 }
 
+/// The system-wide PreventUserIdleDisplaySleep assertion (`pmset -g
+/// assertions`), held by video players and presentations.
 fn display_kept_awake() -> bool {
-    Command::new("pmset")
-        .args(["-g", "assertions"])
-        .output()
-        .is_ok_and(|output| {
-            assertion_held(
-                &String::from_utf8_lossy(&output.stdout),
-                "PreventUserIdleDisplaySleep",
-            )
-        })
-}
-
-/// In `pmset -g assertions`' system-wide status ("   Name    1").
-fn assertion_held(output: &str, name: &str) -> bool {
-    output.lines().any(|line| {
-        let mut words = line.split_whitespace();
-        words.next() == Some(name) && words.next().is_some_and(|count| count != "0")
+    copied_dictionary(IOPMCopyAssertionsStatus).is_some_and(|status| {
+        dictionary_number(&status, "PreventUserIdleDisplaySleep").is_some_and(|level| level > 0)
     })
 }
 
@@ -1296,32 +1550,10 @@ fn descendant_pids(processes: &[ProcessInfo], pid: u32) -> Vec<u32> {
     descendants
 }
 
-/// %CPU per PID in a single ps call.
 fn process_cpu_by_pid(pids: &[u32]) -> HashMap<u32, f32> {
-    if pids.is_empty() {
-        return HashMap::new();
-    }
-    let list = pids
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    Command::new("ps")
-        .args(["-o", "pid=,%cpu=", "-p", &list])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| {
-            s.lines()
-                .filter_map(|line| {
-                    let mut parts = line.split_whitespace();
-                    let pid = parts.next()?.parse().ok()?;
-                    let cpu = parts.next()?.parse().ok()?;
-                    Some((pid, cpu))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    pids.iter()
+        .filter_map(|&pid| Some((pid, process_cpu_percent(pid)?)))
+        .collect()
 }
 
 /// Whether the agent process tree is still actively working: the agent
@@ -1331,9 +1563,10 @@ fn process_cpu_by_pid(pids: &[u32]) -> HashMap<u32, f32> {
 /// Claude Code runs every Bash tool command through a shell that sources
 /// `<config dir>/shell-snapshots/snapshot-*.sh`. One still alive after the
 /// turn ended is a background task (a benchmark waiting on the network, a
-/// polling `sleep`) even when it uses no CPU.
+/// polling `sleep`) even when it uses no CPU. The login shell that writes
+/// the snapshot (`SNAPSHOT_FILE=…`) before the first command is not one.
 fn is_claude_bash_task(process: &ProcessInfo) -> bool {
-    process.args.contains("/shell-snapshots/snapshot-")
+    process.args.contains("/shell-snapshots/snapshot-") && !process.args.contains("SNAPSHOT_FILE=")
 }
 
 /// The agent's Bash tasks, outermost wrapper only (what it spawns is part of
@@ -1361,16 +1594,13 @@ fn agent_tasks(processes: &[ProcessInfo], agent_pid: u32) -> Vec<AgentTask> {
 
 /// The command Claude asked for, out of its wrapper
 /// `zsh -c source <snapshot> … && eval '<command>' < /dev/null && pwd -P >| <file>`,
-/// on one line (ps escapes newlines and tabs as `\012`/`\011`), minus a
-/// leading `cd <dir> &&` that only repeats the project.
+/// minus a leading `cd <dir> &&` that only repeats the project.
 fn claude_task_command(args: &str) -> String {
     let command = args
         .split_once("eval '")
         .and_then(|(_, rest)| rest.rsplit_once('\''))
         .map(|(command, _)| command.replace("'\\''", "'"))
-        .unwrap_or_else(|| args.to_string())
-        .replace("\\012", " ")
-        .replace("\\011", " ");
+        .unwrap_or_else(|| args.to_string());
     let without_cd = command.strip_prefix("cd ").and_then(|rest| {
         ["&& ", "; "]
             .iter()
@@ -1445,8 +1675,6 @@ fn cleanup_stale_pids() {
 
     let mut removed = 0;
     let mut total = 0;
-    // Loaded lazily: only needed when a marker has aged past the timeout.
-    let mut process_table: Option<Vec<ProcessInfo>> = None;
 
     for entry in entries.filter_map(|e| e.ok()) {
         let pid: u32 = match entry.file_name().to_string_lossy().parse() {
@@ -1476,8 +1704,8 @@ fn cleanup_stale_pids() {
 
         let age = get_file_age(&path).unwrap_or(0);
         if age >= IDLE_TIMEOUT_SECS {
-            let processes = process_table.get_or_insert_with(load_process_table);
-            let busy = process_tree_is_busy(processes, pid, &HashSet::new());
+            let processes = load_process_subtree(pid);
+            let busy = process_tree_is_busy(&processes, pid, &HashSet::new());
             if !busy || age >= TREE_BUSY_MAX_AGE_SECS {
                 let stopped = marker_is_stopped(&path);
                 let elapsed = marker_elapsed_secs(&path);
@@ -1538,77 +1766,48 @@ fn is_sleep_disabled() -> bool {
     }
 }
 
+/// The Mac is throttling for heat, as `pmset -g therm` reports it but read
+/// from IOKit instead of spawning pmset on every hook: a thermal warning
+/// level is published, or the scheduler gets less than all of the CPU time
+/// (100 at normal operation).
 fn check_thermal_warning() -> bool {
-    Command::new("pmset")
-        .args(["-g", "therm"])
-        .output()
-        .ok()
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|s| {
-            (s.contains("CPU_Scheduler_Limit") && !s.contains("No CPU"))
-                || (s.contains("thermal warning level") && !s.contains("No thermal warning"))
+    const THERMAL_LEVEL_NORMAL: u32 = 0;
+    const THERMAL_LEVEL_UNKNOWN: u32 = 255;
+    let mut level = THERMAL_LEVEL_NORMAL;
+    let warning_level = unsafe { IOPMGetThermalWarningLevel(&mut level) } == 0
+        && level != THERMAL_LEVEL_NORMAL
+        && level != THERMAL_LEVEL_UNKNOWN;
+    warning_level
+        || copied_dictionary(IOPMCopyCPUPowerStatus).is_some_and(|status| {
+            dictionary_number(&status, "CPU_Scheduler_Limit").is_some_and(|limit| limit < 100)
         })
-        .unwrap_or(false)
 }
 
+/// A process's working directory, from libproc: `lsof` took tens of
+/// milliseconds on every menu refresh and every Codex hook.
 fn get_process_cwd(pid: u32) -> Option<String> {
-    Command::new("lsof")
-        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with('n'))
-                .map(|l| l[1..].to_string())
-        })
-}
-
-fn parse_lsof_cwds(output: &str) -> HashMap<u32, String> {
-    let mut cwds = HashMap::new();
-    let mut current_pid = None;
-
-    for line in output.lines() {
-        if let Some(pid) = line
-            .strip_prefix('p')
-            .and_then(|value| value.parse::<u32>().ok())
-        {
-            current_pid = Some(pid);
-        } else if let (Some(pid), Some(cwd)) = (current_pid, line.strip_prefix('n')) {
-            if !cwd.is_empty() {
-                cwds.insert(pid, cwd.to_string());
-            }
-        }
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            &mut info as *mut libc::proc_vnodepathinfo as *mut libc::c_void,
+            size,
+        )
+    };
+    if written != size {
+        return None;
     }
-
-    cwds
+    let path = c_chars_to_string(info.pvi_cdir.vip_path.as_flattened());
+    (!path.is_empty()).then_some(path)
 }
 
 fn get_process_cwds(pids: &[u32]) -> HashMap<u32, String> {
-    const LSOF_BATCH_SIZE: usize = 128;
-    let mut cwds = HashMap::new();
-
-    for batch in pids.chunks(LSOF_BATCH_SIZE) {
-        if batch.is_empty() {
-            continue;
-        }
-        let pid_list = batch
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let Some(stdout) = Command::new("lsof")
-            .args(["-a", "-d", "cwd", "-p", &pid_list, "-Fpn"])
-            .output()
-            .ok()
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-        else {
-            continue;
-        };
-        cwds.extend(parse_lsof_cwds(&stdout));
-    }
-
-    cwds
+    pids.iter()
+        .filter_map(|&pid| Some((pid, get_process_cwd(pid)?)))
+        .collect()
 }
 
 fn path_display_name(path: &Path) -> String {
@@ -1749,7 +1948,7 @@ fn cmd_stop(pid: Option<u32>) -> Result<()> {
     // Keep the marker (flagged "stopped") while the tree is busy; the stale
     // cleanup removes it — and fires the task-done notification — once the
     // tree quiets down.
-    let processes = load_process_table();
+    let processes = load_process_subtree(agent_pid);
     let excluded = own_call_chain(&processes, agent_pid);
     if pid_file.exists() && process_tree_is_busy(&processes, agent_pid, &excluded) {
         let _ = fs::write(&pid_file, "stopped");
@@ -1828,10 +2027,7 @@ fn spool_task_done(agent_pid: u32, elapsed_secs: u64) {
         return;
     }
 
-    let agent_name = load_process_table()
-        .iter()
-        .find(|p| p.pid == agent_pid)
-        .and_then(classify_agent_process)
+    let agent_name = agent_kind_of(agent_pid)
         .map(agent_kind_name)
         .unwrap_or("Agent");
 
@@ -1865,12 +2061,7 @@ fn cmd_attention() -> Result<()> {
 
     let agent_pid = find_agent_ancestor();
     let agent_name = agent_pid
-        .and_then(|pid| {
-            load_process_table()
-                .iter()
-                .find(|p| p.pid == pid)
-                .and_then(classify_agent_process)
-        })
+        .and_then(agent_kind_of)
         .map(agent_kind_name)
         .unwrap_or("Agent");
 
@@ -2133,13 +2324,7 @@ fn get_file_age(path: &PathBuf) -> Option<u64> {
 }
 
 fn get_process_cpu(pid: u32) -> f32 {
-    Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "%cpu="])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0.0)
+    process_cpu_percent(pid).unwrap_or(0.0)
 }
 
 fn is_process_alive(pid: u32) -> bool {
@@ -3180,7 +3365,7 @@ mod tests {
         ProcessInfo {
             pid: 42,
             ppid: 1,
-            comm: "Python".to_string(),
+            arg0: args.split_whitespace().next().unwrap_or_default().to_string(),
             args: args.to_string(),
         }
     }
@@ -3299,7 +3484,7 @@ hooks = false
         let process = ProcessInfo {
             pid: 42,
             ppid: 1,
-            comm: "hermes".to_string(),
+            arg0: "/opt/homebrew/bin/hermes".to_string(),
             args: "/opt/homebrew/bin/hermes --profile agents-sleep-preventer gateway run"
                 .to_string(),
         };
@@ -3312,7 +3497,7 @@ hooks = false
         let process = ProcessInfo {
             pid: 42,
             ppid: 1,
-            comm: "Python".to_string(),
+            arg0: "/usr/bin/python3".to_string(),
             args:
                 "/usr/bin/python3 -m hermes_cli.main --profile agents-sleep-preventer gateway run"
                     .to_string(),
@@ -3365,7 +3550,7 @@ hooks = false
         let teammate = ProcessInfo {
             pid: 42,
             ppid: 1,
-            comm: "/Users/x/.local/share/claude/versions/2.1.282".to_string(),
+            arg0: "/Users/x/.local/share/claude/versions/2.1.282".to_string(),
             args: "/Users/x/.local/share/claude/versions/2.1.282 --agent-id voice-bench@session-e6da8370 --agent-name voice-bench"
                 .to_string(),
         };
@@ -3374,7 +3559,7 @@ hooks = false
         let unrelated = ProcessInfo {
             pid: 43,
             ppid: 1,
-            comm: "/opt/tool/versions/2.1.282".to_string(),
+            arg0: "/opt/tool/versions/2.1.282".to_string(),
             args: "/opt/tool/versions/2.1.282 serve".to_string(),
         };
         assert_eq!(classify_agent_process(&unrelated), None);
@@ -3387,13 +3572,13 @@ hooks = false
         let mcp_server = ProcessInfo {
             pid: 9_000_002,
             ppid: agent,
-            comm: "node".to_string(),
+            arg0: "node".to_string(),
             args: "node /Users/x/.claude/plugins/cache/mcp-wrapper/index.mjs".to_string(),
         };
         let bench_shell = ProcessInfo {
             pid: 9_000_003,
             ppid: agent,
-            comm: "/bin/zsh".to_string(),
+            arg0: "/bin/zsh".to_string(),
             args: "/bin/zsh -c source /Users/x/.claude/shell-snapshots/snapshot-zsh-1790455727484-5v3tzd.sh && eval 'python3 scripts/bench.py'"
                 .to_string(),
         };
@@ -3411,7 +3596,7 @@ hooks = false
         let process = |pid, ppid, args: &str| ProcessInfo {
             pid,
             ppid,
-            comm: "/bin/zsh".to_string(),
+            arg0: args.split_whitespace().next().unwrap_or_default().to_string(),
             args: args.to_string(),
         };
         let server = process(
@@ -3431,9 +3616,15 @@ hooks = false
             9_000_099,
             "/bin/zsh -c source /Users/x/.claude/shell-snapshots/snapshot-zsh-3-c.sh && eval 'sleep 60'",
         );
+        // Claude Code writing its shell snapshot before the first command
+        let snapshot = process(
+            9_000_008,
+            agent,
+            "/bin/zsh -c -l SNAPSHOT_FILE=/Users/x/.claude/shell-snapshots/snapshot-zsh-4-d.sh  source \"/Users/x/.zshrc\" < /dev/null",
+        );
 
         assert_eq!(
-            agent_tasks(&[server, nested, python, mcp, other_agent_task], agent),
+            agent_tasks(&[server, nested, python, mcp, other_agent_task, snapshot], agent),
             vec![AgentTask {
                 pid: 9_000_003,
                 command: "python3 server.py > log 2>&1".to_string(),
@@ -3463,10 +3654,11 @@ hooks = false
             claude_task_command("/bin/zsh -c cd /x; for i in 1 2; do sleep 1; done"),
             "/bin/zsh -c cd /x; for i in 1 2; do sleep 1; done"
         );
+        // An inline script's newlines and tabs, as the process table reads them
         assert_eq!(
-            claude_task_command(
-                "/bin/zsh -c source /x/shell-snapshots/snapshot-zsh-1-a.sh && eval 'python3 -c \"\\012import sys\\012\\011print(1)\"'"
-            ),
+            claude_task_command(&one_line(
+                "/bin/zsh -c source /x/shell-snapshots/snapshot-zsh-1-a.sh && eval 'python3 -c \"\nimport sys\n\tprint(1)\"'"
+            )),
             "python3 -c \" import sys  print(1)\""
         );
     }
@@ -3555,28 +3747,126 @@ hooks = false
     }
 
     #[test]
-    fn parse_pmset_battery_reads_charge_and_power_source() {
-        let on_ac = "Now drawing from 'AC Power'\n -InternalBattery-0 (id=38994019)\t41%; charging; 1:25 remaining present: true\n";
-        assert_eq!(
-            parse_pmset_battery(on_ac),
-            Some(BatteryState { percent: 41, on_battery: false })
-        );
-        let on_battery = "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=38994019)\t9%; discharging; 0:20 remaining present: true\n";
-        let battery = parse_pmset_battery(on_battery).unwrap();
-        assert_eq!(battery, BatteryState { percent: 9, on_battery: true });
-        assert!(battery.is_low(10));
-        assert!(!battery.is_low(5));
-        assert!(!parse_pmset_battery(on_ac).unwrap().is_low(50));
-        // A Mac mini has no battery
-        assert_eq!(parse_pmset_battery("Now drawing from 'AC Power'\n"), None);
+    fn battery_is_low_only_on_battery_at_or_below_the_threshold() {
+        let on_battery = BatteryState { percent: 9, on_battery: true };
+        assert!(on_battery.is_low(10));
+        assert!(on_battery.is_low(9));
+        assert!(!on_battery.is_low(5));
+        let charging = BatteryState { percent: 9, on_battery: false };
+        assert!(!charging.is_low(50));
+    }
+
+    /// IOKit readings agree with what pmset prints on this Mac.
+    #[test]
+    fn power_readings_match_pmset() {
+        let pmset = |args: &[&str]| {
+            String::from_utf8_lossy(&Command::new("pmset").args(args).output().unwrap().stdout)
+                .into_owned()
+        };
+        let batt = pmset(&["-g", "batt"]);
+        let pmset_percent = batt
+            .lines()
+            .find(|line| line.contains("InternalBattery"))
+            .and_then(|line| line.split_once('%'))
+            .and_then(|(before, _)| before.rsplit(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|digits| digits.parse::<u8>().ok());
+        let battery = read_battery();
+        assert_eq!(battery.map(|battery| battery.percent), pmset_percent);
+        if let Some(battery) = battery {
+            assert_eq!(battery.on_battery, batt.contains("'Battery Power'"));
+        }
+
+        let therm = pmset(&["-g", "therm"]);
+        if therm.contains("No thermal warning level") && therm.contains("No CPU power status") {
+            assert!(!check_thermal_warning());
+        }
+        assert!(last_wake_or_boot().is_some_and(|wake| wake <= unix_now()));
     }
 
     #[test]
-    fn assertion_held_reads_the_system_wide_count() {
-        let output = "Assertion status system-wide:\n   PreventUserIdleDisplaySleep    0\n   PreventUserIdleSystemSleep     1\nListed by owning process:\n   pid 1(x): PreventUserIdleDisplaySleep named: \"y\"\n";
-        assert!(!assertion_held(output, "PreventUserIdleDisplaySleep"));
-        assert!(assertion_held(output, "PreventUserIdleSystemSleep"));
-        assert!(last_wake_or_boot().is_some_and(|wake| wake <= unix_now()));
+    fn parse_procargs_reads_argv_after_the_executable_path() {
+        let mut buffer = 3i32.to_ne_bytes().to_vec();
+        buffer.extend_from_slice(b"/Users/x/Library/Application Support/claude\0\0\0\0");
+        buffer.extend_from_slice(b"/Users/x/Library/Application Support/claude\0--resume\0abc\0");
+        buffer.extend_from_slice(b"HOME=/Users/x\0");
+        assert_eq!(
+            parse_procargs(&buffer),
+            Some(vec![
+                "/Users/x/Library/Application Support/claude".to_string(),
+                "--resume".to_string(),
+                "abc".to_string(),
+            ])
+        );
+        assert_eq!(parse_procargs(&[1, 0]), None);
+    }
+
+    /// argv[0] stays whole even with spaces (ps cut it at 16 characters).
+    #[test]
+    fn process_table_keeps_argv0_whole() {
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new("/bin/sleep")
+            .arg0("/Users/x/Library/Application Support/Fancy/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        // The arguments are in place once exec has run
+        let mut process = None;
+        for _ in 0..50 {
+            process = ProcessReader::new().read(child.id());
+            if process.as_ref().is_some_and(|p| p.args.ends_with(" 30")) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let process = process.unwrap();
+        assert_eq!(process.arg0, "/Users/x/Library/Application Support/Fancy/sleep");
+        assert_eq!(
+            process_tokens(&process),
+            vec!["/Users/x/Library/Application Support/Fancy/sleep", "30"]
+        );
+        assert_eq!(process.ppid, std::process::id());
+
+        let table = load_process_table();
+        let own = table
+            .iter()
+            .find(|process| process.pid == std::process::id())
+            .unwrap();
+        assert_eq!(own.ppid, std::os::unix::process::parent_id());
+        assert_eq!(own.arg0, std::env::args().next().unwrap());
+        assert!(process_cpu_percent(std::process::id()).is_some_and(|cpu| cpu >= 0.0));
+        assert_eq!(process_cpu_percent(u32::MAX >> 1), None);
+    }
+
+    #[test]
+    fn claude_is_recognized_by_its_whole_argv0() {
+        // Claude Desktop runs its own copy from Application Support
+        let desktop = "/Users/x/Library/Application Support/Claude/claude-code/2.1.308/a93ded4b1b47/claude.app/Contents/MacOS/claude";
+        let process = ProcessInfo {
+            pid: 42,
+            ppid: 1,
+            arg0: desktop.to_string(),
+            args: format!("{} --output-format stream-json", desktop),
+        };
+        assert_eq!(classify_agent_process(&process), Some(AgentKind::Claude));
+
+        // Claude Code's binary runs its bundled ugrep under that name
+        let ugrep = ProcessInfo {
+            pid: 43,
+            ppid: 1,
+            arg0: "ugrep".to_string(),
+            args: "ugrep -G --ignore-files --hidden -I -E FAIL|passed".to_string(),
+        };
+        assert_eq!(classify_agent_process(&ugrep), None);
+
+        let desktop_app = ProcessInfo {
+            pid: 44,
+            ppid: 1,
+            arg0: "/Applications/Claude.app/Contents/MacOS/Claude".to_string(),
+            args: "/Applications/Claude.app/Contents/MacOS/Claude".to_string(),
+        };
+        assert_eq!(classify_agent_process(&desktop_app), None);
     }
 
     #[test]
@@ -3584,7 +3874,7 @@ hooks = false
         let process = ProcessInfo {
             pid: 42,
             ppid: 1,
-            comm: "/Users/x/.local/bin/claude".to_string(),
+            arg0: "/Users/x/.local/bin/claude".to_string(),
             args: "/Users/x/.local/bin/claude --chrome-native-host".to_string(),
         };
 
@@ -3595,7 +3885,7 @@ hooks = false
         ProcessInfo {
             pid: 42,
             ppid: 1,
-            comm: args.split_whitespace().next().unwrap_or_default().to_string(),
+            arg0: args.split_whitespace().next().unwrap_or_default().to_string(),
             args: args.to_string(),
         }
     }
@@ -3648,7 +3938,7 @@ hooks = false
         let process = ProcessInfo {
             pid: 42,
             ppid: 1,
-            comm: "Python".to_string(),
+            arg0: "/usr/bin/python3".to_string(),
             args: "/usr/bin/python3 -m http.server".to_string(),
         };
 
@@ -3686,18 +3976,15 @@ hooks = false
     }
 
     #[test]
-    fn parse_lsof_cwds_associates_each_path_with_its_pid() {
-        let output = "p1097\nfcwd\nn/Users/example/.hermes/hermes-agent\np12110\nfcwd\nn/Users/example/projects/cleemo-lamdera\n";
-
-        let parsed = parse_lsof_cwds(output);
-
+    fn process_cwd_reads_the_working_directory() {
+        let cwd = std::env::current_dir().unwrap();
         assert_eq!(
-            parsed.get(&1097).map(String::as_str),
-            Some("/Users/example/.hermes/hermes-agent")
+            get_process_cwd(std::process::id()).map(PathBuf::from),
+            Some(cwd.clone())
         );
         assert_eq!(
-            parsed.get(&12110).map(String::as_str),
-            Some("/Users/example/projects/cleemo-lamdera")
+            get_process_cwds(&[std::process::id(), u32::MAX >> 1]),
+            HashMap::from([(std::process::id(), cwd.to_string_lossy().into_owned())])
         );
     }
 
@@ -5113,8 +5400,8 @@ fn cmd_debug() -> Result<()> {
             None => "unknown",
         };
         println!(
-            "  PID {}: kind={}, ppid={}, comm={}, args={}",
-            process.pid, kind, process.ppid, process.comm, process.args
+            "  PID {}: kind={}, ppid={}, args={}",
+            process.pid, kind, process.ppid, process.args
         );
     }
 
