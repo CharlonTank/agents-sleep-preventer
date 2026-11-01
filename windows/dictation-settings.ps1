@@ -8,7 +8,7 @@ if (Test-Path -LiteralPath $settingsPath) {
     try { $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json } catch { }
 }
 $form = New-Object Windows.Forms.Form
-$form.Text = 'Agents Sleep Preventer - Dictation'
+$form.Text = 'Agent Session Pilot - Dictation'
 $form.ClientSize = New-Object Drawing.Size(490, 590)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'

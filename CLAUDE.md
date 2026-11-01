@@ -2,6 +2,8 @@
 
 ## Meta
 
+- **Name**: the product is shown as **Agent Session Pilot** (ASP), formerly Agents Sleep Preventer. Technical names stay as they were, so updates, permissions and installs keep working: the bundle id `com.charlontank.agents-sleep-preventer`, `AgentsSleepPreventer.app`, the DMG and asset names, the data and log folders, the Windows shortcut file and hook script header (`# Agents Sleep Preventer Windows`), the GitHub repo and the Homebrew cask token.
+
 - **Keep this file updated**: When you add new scripts, processes, or important patterns, update this CLAUDE.md file so future sessions have accurate context.
 
 ## Code Quality
@@ -177,4 +179,4 @@ The app requests only TWO permissions: Microphone and Accessibility.
 
 - `--` in AppleScript starts a comment. Use short flags like `-y` instead of `--yes` when running commands via AppleScript.
 - Use `osascript -e "..."` via `Command::new()` instead of `NSAppleScript` - it's more reliable.
-- `asp agent` lives in the app bundle, so LaunchServices registers it as a second "Agents Sleep Preventer" (`lsappinfo list` shows two UIElement apps with the bundle id): `quit app "AgentsSleepPreventer"`, launchers' Quit and `NSRunningApplication.terminate()` by bundle id reach it. It pumps events itself (`pump_run_loop_once`, no `[NSApp run]`, so AppKit never installs its quit handler) and refused the quit (-1708). `forward_quit_to_menu_bar_app` installs a quit Apple Event handler that asks the parent menu bar app to terminate (its `applicationWillTerminate` stops the agent), or exits when the agent runs on its own.
+- `asp agent` lives in the app bundle, so LaunchServices registers it as a second "Agent Session Pilot" (`lsappinfo list` shows two UIElement apps with the bundle id): `quit app "AgentsSleepPreventer"`, launchers' Quit and `NSRunningApplication.terminate()` by bundle id reach it. It pumps events itself (`pump_run_loop_once`, no `[NSApp run]`, so AppKit never installs its quit handler) and refused the quit (-1708). `forward_quit_to_menu_bar_app` installs a quit Apple Event handler that asks the parent menu bar app to terminate (its `applicationWillTerminate` stops the agent), or exits when the agent runs on its own.

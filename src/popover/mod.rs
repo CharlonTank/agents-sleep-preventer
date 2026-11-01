@@ -118,7 +118,7 @@ impl PopoverWindow {
         let mut y = POPOVER_HEIGHT - 40.0;
 
         // Title
-        let title = ui::create_label("Agents Sleep Preventer", 20.0, y, 240.0, 24.0, true);
+        let title = ui::create_label("Agent Session Pilot", 20.0, y, 240.0, 24.0, true);
         let _: () = msg_send![content_view, addSubview: title];
         y -= 40.0;
 

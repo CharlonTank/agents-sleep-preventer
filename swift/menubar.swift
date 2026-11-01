@@ -978,7 +978,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.target = self
             button.action = #selector(togglePopover(_:))
             button.sendAction(on: [.leftMouseUp])
-            button.toolTip = "Agents Sleep Preventer"
+            button.toolTip = "Agent Session Pilot"
         }
         statusItem = item
 
@@ -1946,7 +1946,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         alert.messageText = "Move to Applications?"
         alert.informativeText = """
-            Agents Sleep Preventer is running from:
+            Agent Session Pilot is running from:
             \(bundleURL.path)
 
             From a disk image or Downloads, macOS doesn't reliably honour the Accessibility permission: the switch in System Settings can be on while dictation still has no access.
@@ -1978,7 +1978,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if let error {
                     self.showAlert(
                         "Moved, but couldn't relaunch",
-                        "Open Agents Sleep Preventer from your Applications folder.\n\n\(error.localizedDescription)"
+                        "Open Agent Session Pilot from your Applications folder.\n\n\(error.localizedDescription)"
                     )
                 }
                 NSApp.terminate(nil)
@@ -2462,7 +2462,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showUninstallDialog() {
         let alert = NSAlert()
-        alert.messageText = "Uninstall Agents Sleep Preventer"
+        alert.messageText = "Uninstall Agent Session Pilot"
         alert.informativeText = "Select what to remove:"
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Uninstall")
@@ -2561,7 +2561,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showUninstallSuccess() {
         let alert = NSAlert()
         alert.messageText = "Uninstall complete"
-        alert.informativeText = "Agents Sleep Preventer has been removed."
+        alert.informativeText = "Agent Session Pilot has been removed."
         alert.addButton(withTitle: "OK")
         alert.runModal()
     }

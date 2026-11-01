@@ -23,7 +23,7 @@ This is a one-person project. You can expect:
 
 ## What counts as a vulnerability
 
-Agents Sleep Preventer runs with a few privileges that matter:
+Agent Session Pilot runs with a few privileges that matter:
 
 - **A sudoers rule** (`/etc/sudoers.d/agents-pmset`) that lets the app run `pmset -a disablesleep 0|1`, `pmset -a sleep 5` and `pmset sleepnow` without a password, and nothing else.
 - **Agent hooks** it adds to `~/.claude/settings.json` (and the other Claude Code profiles) and to `~/.codex/hooks.json`.

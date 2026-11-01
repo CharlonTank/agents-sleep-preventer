@@ -25,4 +25,4 @@ fn main() -> anyhow::Result<()> {
 include!("linux.rs");
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-compile_error!("Agents Sleep Preventer supports macOS, Linux and Windows.");
+compile_error!("Agent Session Pilot supports macOS, Linux and Windows.");

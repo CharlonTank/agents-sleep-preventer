@@ -2150,7 +2150,7 @@ fn cmd_status() -> Result<()> {
     let thermal_warning = check_thermal_warning();
     let agent_count = count_agent_processes();
 
-    println!("Agents Sleep Preventer v{}", env!("CARGO_PKG_VERSION"));
+    println!("Agent Session Pilot v{}", env!("CARGO_PKG_VERSION"));
     println!("==========================================");
     println!("Working instances: {}", active_count);
     println!("Agent processes: {}", agent_count);
@@ -4304,7 +4304,7 @@ fn is_installed() -> bool {
 }
 
 fn run_first_time_setup() -> Result<()> {
-    let message = "Agents Sleep Preventer needs to be configured for supported coding agents.
+    let message = "Agent Session Pilot needs to be configured for supported coding agents.
 
 This will:
 • Install the CLI tool
@@ -4313,7 +4313,7 @@ This will:
 
 Administrator password required.";
 
-    if !native_dialogs::show_confirm_dialog(message, "Agents Sleep Preventer", "Set Up", "Cancel") {
+    if !native_dialogs::show_confirm_dialog(message, "Agent Session Pilot", "Set Up", "Cancel") {
         return Ok(());
     }
 
@@ -4323,7 +4323,7 @@ Administrator password required.";
         Ok(true) => {
             native_dialogs::show_dialog(
                 "Setup complete!\n\nRestart your coding agents to activate sleep prevention.",
-                "Agents Sleep Preventer",
+                "Agent Session Pilot",
             );
             relaunch_app_after_install();
         }
@@ -4331,7 +4331,7 @@ Administrator password required.";
             // User cancelled
         }
         Err(e) => {
-            native_dialogs::show_dialog(&format!("Setup failed: {}", e), "Agents Sleep Preventer");
+            native_dialogs::show_dialog(&format!("Setup failed: {}", e), "Agent Session Pilot");
         }
     }
 
@@ -4359,7 +4359,7 @@ fn ensure_running_from_applications() {
     ));
 
     let message = format!(
-        "Agents Sleep Preventer is running from:\n{}\n\nmacOS permissions (Accessibility, Microphone) only stay granted reliably when the app runs from /Applications — otherwise they can silently reset and the dictation shortcut stops working.\n\nMove it to /Applications and relaunch now?",
+        "Agent Session Pilot is running from:\n{}\n\nmacOS permissions (Accessibility, Microphone) only stay granted reliably when the app runs from /Applications — otherwise they can silently reset and the dictation shortcut stops working.\n\nMove it to /Applications and relaunch now?",
         bundle_path
     );
 
@@ -4625,7 +4625,7 @@ fn cmd_menubar() -> Result<()> {
         .with_menu(Box::new(minimal_menu))
         .with_menu_on_left_click(false) // Left-click shows popover, right-click shows menu
         .with_title(&create_tray_title(initial_instances.len(), manual_enabled))
-        .with_tooltip("Agents Sleep Preventer")
+        .with_tooltip("Agent Session Pilot")
         .build()?;
 
     let menu_channel = MenuEvent::receiver();
@@ -4973,7 +4973,7 @@ fn cmd_agent() -> Result<()> {
 }
 
 /// The agent lives in the app bundle, so LaunchServices lists it as a second
-/// "Agents Sleep Preventer" and `quit app "AgentsSleepPreventer"` (AppleScript,
+/// "Agent Session Pilot" and `quit app "AgentsSleepPreventer"` (AppleScript,
 /// launchers, logout) reaches it. It pumps events itself instead of running
 /// NSApplication, which is what installs AppKit's quit handler, so the quit
 /// was refused (-1708) and the app kept running. Hand it to the menu bar app

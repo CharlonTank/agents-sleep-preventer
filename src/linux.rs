@@ -151,7 +151,7 @@ fn service(command: ServiceCommand) -> Result<()> {
             std::fs::write(
                 &file,
                 format!(
-                    "[Unit]\nDescription=Agents Sleep Preventer: RAM and disk watch for coding agent sessions\nAfter=network-online.target\n\n[Service]\nExecStart={} serve\nRestart=always\nRestartSec=10\n\n[Install]\nWantedBy=default.target\n",
+                    "[Unit]\nDescription=Agent Session Pilot: RAM and disk watch for coding agent sessions\nAfter=network-online.target\n\n[Service]\nExecStart={} serve\nRestart=always\nRestartSec=10\n\n[Install]\nWantedBy=default.target\n",
                     exe.display()
                 ),
             )?;

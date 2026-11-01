@@ -1,11 +1,13 @@
 <div align="center">
 
-<img src="assets/logo-animated.svg" width="140" alt="Agents Sleep Preventer logo: a crescent moon cradling a terminal prompt">
+<img src="assets/logo-animated.svg" width="140" alt="Agent Session Pilot logo: a crescent moon cradling a terminal prompt">
 
-# Agents Sleep Preventer
+# Agent Session Pilot
 
-### Keep your computer awake while coding agents are working
-**Sleep prevention and local voice dictation on macOS and Windows.**
+### Your coding agents: awake, watched, and one message away
+**Sleep prevention, Telegram remote control, RAM and disk watch, and local voice dictation. macOS, Windows, and Linux servers.**
+
+<sub>Formerly Agents Sleep Preventer. Same app, same updates, same `asp` command.</sub>
 
 <br>
 
@@ -101,7 +103,7 @@ The menu bar app uses Sparkle for in-app updates and can download + install new 
 brew install --cask charlontank/tap/agents-sleep-preventer
 ```
 
-Then launch Agents Sleep Preventer from Applications: it sets up the agent hooks on first run.
+Then launch Agent Session Pilot from Applications: it sets up the agent hooks on first run.
 
 ### 🦀 Build from Source
 
@@ -137,7 +139,7 @@ Two safety nets, set from the menu's **…** button, put the Mac to sleep even w
 
 ### Auto-Resume After Network Drops (macOS)
 
-On a train or a flaky Wi-Fi, an agent's turn can end on a network error and the work stalls until you type "continue". Agents Sleep Preventer does it for you:
+On a train or a flaky Wi-Fi, an agent's turn can end on a network error and the work stalls until you type "continue". Agent Session Pilot does it for you:
 
 1. Claude Code reports the failure through its `StopFailure` hook; Codex records it in its session log.
 2. The menu shows the agent as cut off, and the Mac stays awake for up to 30 minutes.
@@ -147,7 +149,7 @@ It gives up after 3 tries in a row, never touches usage-limit, login or billing 
 
 ### Dictation
 
-Agents Sleep Preventer includes local speech-to-text dictation:
+Agent Session Pilot includes local speech-to-text dictation:
 
 1. Open the app and allow Microphone and Accessibility permissions.
 2. Download the local Whisper model when prompted.

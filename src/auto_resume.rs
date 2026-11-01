@@ -502,7 +502,7 @@ fn resume_prompt(record: &Interruption) -> String {
         Cause::Server => "an API error",
     };
     format!(
-        "continue: your previous turn was cut off by {} at {} and Agents Sleep Preventer resumed you automatically. Check what was already done before redoing anything.",
+        "continue: your previous turn was cut off by {} at {} and Agent Session Pilot resumed you automatically. Check what was already done before redoing anything.",
         what,
         clock(record.failed_at)
     )
@@ -586,7 +586,7 @@ fn tick(network: &mut NetworkWatch) {
                     notifications::spool(
                         &format!("{} can continue", record.agent.name()),
                         &format!(
-                            "The connection is back. Type “continue” in {}: Agents Sleep Preventer can't type in this terminal.",
+                            "The connection is back. Type “continue” in {}: Agent Session Pilot can't type in this terminal.",
                             project_name(pid)
                         ),
                         Some(pid),

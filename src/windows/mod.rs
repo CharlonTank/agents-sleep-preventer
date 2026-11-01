@@ -406,7 +406,7 @@ fn run_monitor(store: Store, tray: bool, interval: u64) -> Result<()> {
     let mut agent_awake = request.active;
     let mut allow_dictation_awake = true;
     let menu = Menu::new();
-    let status = MenuItem::new("Agents Sleep Preventer", false, None);
+    let status = MenuItem::new("Agent Session Pilot", false, None);
     let notice = MenuItem::new("Claude Code / Codex", false, None);
     let auto = MenuItem::new("Automatic", true, None);
     let awake = MenuItem::new("Keep awake", true, None);
@@ -443,7 +443,7 @@ fn run_monitor(store: Store, tray: bool, interval: u64) -> Result<()> {
     let icon = tray_icon(request.active)?;
     let tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("Agents Sleep Preventer")
+        .with_tooltip("Agent Session Pilot")
         .with_icon(icon)
         .build()?;
     // Detach only after startup succeeds, so CLI startup errors stay visible.

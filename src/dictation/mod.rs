@@ -414,7 +414,7 @@ impl DictationManager {
         if !self.accessibility_alert_shown {
             self.accessibility_alert_shown = true;
             if native_dialogs::show_confirm_dialog(
-                "macOS revoked Accessibility access for Agents Sleep Preventer, so the dictation shortcut no longer works.\n\nRe-enable it in System Settings > Privacy & Security > Accessibility.",
+                "macOS revoked Accessibility access for Agent Session Pilot, so the dictation shortcut no longer works.\n\nRe-enable it in System Settings > Privacy & Security > Accessibility.",
                 "Dictation Shortcut Disabled",
                 "Open Settings",
                 "Later",

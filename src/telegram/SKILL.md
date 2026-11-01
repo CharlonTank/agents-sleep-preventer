@@ -2,7 +2,7 @@
 name: telegram
 description: Listen to {{OWNER}} on Telegram from any project and answer them, through their bot @{{BOT}}. One session per project, each under a name; their messages reach the right session and every answer carries the project's name. Use for "/telegram", "listen to me on Telegram", "talk to me on Telegram", "I'm leaving, continue on Telegram", or when their messages already come from Telegram.
 ---
-<!-- Installed by Agents Sleep Preventer (asp telegram skill). -->
+<!-- Installed by Agent Session Pilot (asp telegram skill). -->
 
 # Telegram: {{OWNER}} talks to this session
 

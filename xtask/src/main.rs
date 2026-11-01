@@ -33,7 +33,7 @@ struct AppcastArtifacts {
 
 #[derive(Parser)]
 #[command(name = "xtask")]
-#[command(about = "Build tasks for Agents Sleep Preventer")]
+#[command(about = "Build tasks for Agent Session Pilot")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -387,7 +387,7 @@ fn release_tag_url(version: &str) -> String {
 }
 
 fn release_title(version: &str) -> String {
-    format!("Agents Sleep Preventer {}", version)
+    format!("Agent Session Pilot {}", version)
 }
 
 fn copy_with_ditto(src: &Path, dst: &Path) -> Result<()> {
@@ -616,7 +616,7 @@ fn build_release_notes(version: &str, output_path: &Path) -> Result<()> {
     }
 
     let notes = format!(
-        "# Agents Sleep Preventer {version}\n\nThis release includes improvements and fixes.\n\nSee the full release notes on GitHub:\n{release_url}\n",
+        "# Agent Session Pilot {version}\n\nThis release includes improvements and fixes.\n\nSee the full release notes on GitHub:\n{release_url}\n",
         release_url = release_tag_url(version)
     );
     fs::write(output_path, notes)?;
@@ -712,7 +712,7 @@ fn build_dmg(skip_notarize: bool) -> Result<()> {
     let sparkle_framework_slice = sparkle_root.join("Sparkle.xcframework/macos-arm64_x86_64");
     let sparkle_framework = sparkle_framework_slice.join("Sparkle.framework");
 
-    println!("=== Building Agents Sleep Preventer v{} DMG ===\n", version);
+    println!("=== Building Agent Session Pilot v{} DMG ===\n", version);
 
     // Step 1: Build release
     println!("[1/9] Building release...");
@@ -811,7 +811,7 @@ fn build_dmg(skip_notarize: bool) -> Result<()> {
         &[
             "create",
             "-volname",
-            "Agents Sleep Preventer",
+            "Agent Session Pilot",
             "-srcfolder",
             staging_dir.to_str().unwrap(),
             "-ov",
@@ -1037,7 +1037,7 @@ fn clean_codex_hooks(home: &Path) -> Result<()> {
 }
 
 fn clean(keep_model: bool) -> Result<()> {
-    println!("=== Agents Sleep Preventer Cleanup ===\n");
+    println!("=== Agent Session Pilot Cleanup ===\n");
     if keep_model {
         println!("(Keeping Whisper models)\n");
     }
@@ -1226,9 +1226,9 @@ fn clean(keep_model: bool) -> Result<()> {
 
     // Unmount any DMG
     println!("Unmounting DMG...");
-    if Path::new("/Volumes/Agents Sleep Preventer").exists() {
+    if Path::new("/Volumes/Agent Session Pilot").exists() {
         let _ = Command::new("hdiutil")
-            .args(["detach", "/Volumes/Agents Sleep Preventer"])
+            .args(["detach", "/Volumes/Agent Session Pilot"])
             .status();
     }
     if Path::new("/Volumes/Claude Sleep Preventer").exists() {

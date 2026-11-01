@@ -136,7 +136,7 @@ pub(crate) struct TelegramSettings {
 #[cfg(target_os = "macos")]
 const DEFAULT_KEYCHAIN_SERVICE: &str = "agents-sleep-preventer-telegram";
 const SKILL: &str = include_str!("SKILL.md");
-const SKILL_MARKER: &str = "Installed by Agents Sleep Preventer";
+const SKILL_MARKER: &str = "Installed by Agent Session Pilot";
 
 /// Installs the /telegram skill in every Claude Code profile. A telegram
 /// skill the user wrote themselves is left alone. Returns (file, written).
