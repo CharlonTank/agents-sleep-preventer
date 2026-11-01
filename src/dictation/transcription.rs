@@ -406,6 +406,39 @@ pub(crate) fn spawn_parakeet_stream(
 
 /// Transcribe in-process with Parakeet via ONNX Runtime (non-streaming path,
 /// used when transcribing a saved WAV, e.g. fallback flows).
+/// The downloaded Parakeet model folder, whichever model dictation uses.
+pub(crate) fn parakeet_model_dir() -> Option<PathBuf> {
+    let parakeet = AppSettings::supported_models()
+        .into_iter()
+        .find(|model| model.engine == ModelEngine::Parakeet)?;
+    WhisperTranscriber::model_dirs()
+        .into_iter()
+        .find(|dir| parakeet.is_downloaded_in(dir))
+        .map(|dir| dir.join(parakeet.filename))
+}
+
+/// Transcribes a whole 16 kHz mono recording (a voice message), cut at
+/// natural pauses about every 15 s like live dictation, so long notes stay
+/// accurate. The model loads once for all the cuts.
+pub(crate) fn transcribe_recording(model_dir: &std::path::Path, samples: &[f32]) -> Result<String, String> {
+    let mut model = ParakeetModel::load(model_dir, &Quantization::Int8)
+        .map_err(|e| format!("Failed to load Parakeet model: {}", e))?;
+    let target = COMMIT_TARGET_SECS * 16_000;
+    let search = COMMIT_SEARCH_SECS * 16_000;
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while samples.len() - start > target + search {
+        let cut = quietest_cut(samples, 1, 16_000, start + target - search, start + target);
+        parts.extend(transcribe_snippet(&mut model, &samples[start..cut]));
+        start = cut;
+    }
+    parts.extend(transcribe_snippet(&mut model, &samples[start..]));
+    Ok(crate::vocabulary::correct(
+        &parts.join(" "),
+        &AppSettings::load().speech_to_text.vocabulary_words,
+    ))
+}
+
 fn transcribe_parakeet(model_dir: &PathBuf, audio_path: &PathBuf) -> Result<String, String> {
     let start = std::time::Instant::now();
     let mut model = ParakeetModel::load(model_dir, &Quantization::Int8)

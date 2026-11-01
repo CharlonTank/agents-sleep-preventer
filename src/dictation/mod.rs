@@ -17,6 +17,7 @@ use audio::{
 };
 use globe_key::{GlobeKeyEvent, GlobeKeyManager};
 pub use onboarding::{ensure_selected_model_downloaded, run_onboarding_if_needed};
+pub(crate) use transcription::{parakeet_model_dir, transcribe_recording};
 use crate::settings::ModelEngine;
 use overlay::{OverlayMode, RecordingOverlay};
 use result_popup::ResultPopup;

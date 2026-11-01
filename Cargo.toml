@@ -30,6 +30,10 @@ core-foundation = "0.10.1"
 mach2 = "0.6.0"
 global-hotkey = "0.7"
 libc = "0.2"
+ureq = "3"                 # Telegram Bot API
+regex = "1"
+unicode-normalization = "0.1"
+toml = "0.8"
 
 # Dictation feature
 cpal = "0.15"       # Audio recording

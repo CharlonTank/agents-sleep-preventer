@@ -10,6 +10,7 @@ mod objc_utils;
 mod popover;
 mod runtime_dir;
 mod settings;
+mod telegram;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -220,6 +221,11 @@ enum Commands {
     Settings,
     /// Debug: list process names
     Debug,
+    /// Talk with your coding agent sessions from Telegram, through your own bot
+    Telegram {
+        #[command(subcommand)]
+        command: telegram::TelegramCommand,
+    },
 }
 
 fn main() -> Result<()> {
@@ -253,6 +259,7 @@ fn main() -> Result<()> {
         } => cmd_uninstall(keep_model, keep_hooks, keep_data)?,
         Commands::Settings => cmd_settings()?,
         Commands::Debug => cmd_debug()?,
+        Commands::Telegram { command } => std::process::exit(telegram::run(command)),
     }
 
     Ok(())
