@@ -4839,6 +4839,7 @@ fn cmd_agent() -> Result<()> {
     unsafe {
         let _: objc_utils::Id = msg_send![class!(NSApplication), sharedApplication];
     }
+    forward_quit_to_menu_bar_app();
     // The Swift menu bar app moves itself to /Applications before spawning
     // the agent; asking here too only exited the agent and left the
     // translocated app running.
@@ -4934,6 +4935,69 @@ fn cmd_agent() -> Result<()> {
                 ));
             }
         }
+    }
+}
+
+/// The agent lives in the app bundle, so LaunchServices lists it as a second
+/// "Agents Sleep Preventer" and `quit app "AgentsSleepPreventer"` (AppleScript,
+/// launchers, logout) reaches it. It pumps events itself instead of running
+/// NSApplication, which is what installs AppKit's quit handler, so the quit
+/// was refused (-1708) and the app kept running. Hand it to the menu bar app
+/// that started this agent: quitting it stops the agent too.
+fn forward_quit_to_menu_bar_app() {
+    extern "C" fn handle_quit(
+        _: &objc::runtime::Object,
+        _: objc::runtime::Sel,
+        _: objc_utils::Id,
+        _: objc_utils::Id,
+    ) {
+        logging::log("[agent] Quit requested");
+        if !terminate_menu_bar_app() {
+            std::process::exit(0);
+        }
+    }
+    const CORE_EVENT_CLASS: u32 = u32::from_be_bytes(*b"aevt");
+    const QUIT_APPLICATION: u32 = u32::from_be_bytes(*b"quit");
+
+    let Some(mut decl) = objc::declare::ClassDecl::new("ASPQuitHandler", class!(NSObject)) else {
+        return;
+    };
+    unsafe {
+        decl.add_method(
+            sel!(handleQuit:withReplyEvent:),
+            handle_quit
+                as extern "C" fn(&objc::runtime::Object, objc::runtime::Sel, objc_utils::Id, objc_utils::Id),
+        );
+        let handler: objc_utils::Id = msg_send![decl.register(), new];
+        let manager: objc_utils::Id =
+            msg_send![class!(NSAppleEventManager), sharedAppleEventManager];
+        let _: () = msg_send![manager,
+            setEventHandler: handler
+            andSelector: sel!(handleQuit:withReplyEvent:)
+            forEventClass: CORE_EVENT_CLASS
+            andEventID: QUIT_APPLICATION];
+    }
+}
+
+/// Asks the parent process to quit when it is this bundle's menu bar app;
+/// false when the agent runs on its own.
+fn terminate_menu_bar_app() -> bool {
+    unsafe {
+        let parent: objc_utils::Id = msg_send![class!(NSRunningApplication),
+            runningApplicationWithProcessIdentifier: libc::getppid()];
+        if parent.is_null() {
+            return false;
+        }
+        let parent_bundle: objc_utils::Id = msg_send![parent, bundleIdentifier];
+        let bundle: objc_utils::Id = msg_send![class!(NSBundle), mainBundle];
+        let own_bundle: objc_utils::Id = msg_send![bundle, bundleIdentifier];
+        let same_bundle = objc_utils::nsstring_to_string(parent_bundle)
+            .is_some_and(|id| Some(id) == objc_utils::nsstring_to_string(own_bundle));
+        if !same_bundle {
+            return false;
+        }
+        let sent: objc::runtime::BOOL = msg_send![parent, terminate];
+        sent == objc::runtime::YES
     }
 }
 

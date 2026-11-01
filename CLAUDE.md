@@ -150,3 +150,4 @@ The app requests only TWO permissions: Microphone and Accessibility.
 
 - `--` in AppleScript starts a comment. Use short flags like `-y` instead of `--yes` when running commands via AppleScript.
 - Use `osascript -e "..."` via `Command::new()` instead of `NSAppleScript` - it's more reliable.
+- `asp agent` lives in the app bundle, so LaunchServices registers it as a second "Agents Sleep Preventer" (`lsappinfo list` shows two UIElement apps with the bundle id): `quit app "AgentsSleepPreventer"`, launchers' Quit and `NSRunningApplication.terminate()` by bundle id reach it. It pumps events itself (`pump_run_loop_once`, no `[NSApp run]`, so AppKit never installs its quit handler) and refused the quit (-1708). `forward_quit_to_menu_bar_app` installs a quit Apple Event handler that asks the parent menu bar app to terminate (its `applicationWillTerminate` stops the agent), or exits when the agent runs on its own.
