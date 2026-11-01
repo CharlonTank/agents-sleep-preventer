@@ -203,5 +203,11 @@ pub fn run(data_dir: &Path, service: &str) -> Result<()> {
         );
     }
     println!("{welcome}");
+    for (file, written) in super::install_skill(&first_name, &username) {
+        if written {
+            let shown = file.display();
+            println!("{}", tr!(fr, "Skill /telegram installé : {shown}", "/telegram skill installed: {shown}"));
+        }
+    }
     Ok(())
 }

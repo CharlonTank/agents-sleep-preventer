@@ -83,6 +83,8 @@ pub enum TelegramCommand {
     },
     /// Check the bot, listeners and groups
     Doctor,
+    /// Install the /telegram skill in every Claude Code profile
+    Skill,
 }
 
 #[derive(Subcommand)]
@@ -127,6 +129,27 @@ struct TelegramSettings {
 }
 
 const DEFAULT_KEYCHAIN_SERVICE: &str = "agents-sleep-preventer-telegram";
+const SKILL: &str = include_str!("SKILL.md");
+const SKILL_MARKER: &str = "Installed by Agents Sleep Preventer";
+
+/// Installs the /telegram skill in every Claude Code profile. A telegram
+/// skill the user wrote themselves is left alone. Returns (file, written).
+pub fn install_skill(owner: &str, bot: &str) -> Vec<(PathBuf, bool)> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    let text = SKILL.replace("{{OWNER}}", owner).replace("{{BOT}}", bot);
+    let mut done = Vec::new();
+    for profile in crate::claude_config_dirs(&home) {
+        let file = profile.join("skills").join("telegram").join("SKILL.md");
+        let theirs = std::fs::read_to_string(&file).is_ok_and(|current| !current.contains(SKILL_MARKER));
+        let written = !theirs
+            && std::fs::create_dir_all(file.parent().unwrap_or(&profile)).is_ok()
+            && std::fs::write(&file, &text).is_ok();
+        done.push((file, written));
+    }
+    done
+}
 
 fn app_support() -> PathBuf {
     dirs::data_local_dir()
@@ -381,6 +404,19 @@ fn execute(command: TelegramCommand) -> Result<i32> {
             let name = session_name(session.as_deref())?;
             bot.stop(&name, announce_group)?;
             println!("{}", say!(bot, "Session « {name} » arrêtée (arrêter aussi sa tâche d’écoute).", "Session \"{name}\" stopped (stop its listening task too)."));
+            Ok(0)
+        }
+        TelegramCommand::Skill => {
+            let settings = bot.config()?;
+            let username = settings.text("username").unwrap_or("").to_string();
+            for (file, written) in install_skill(&owner, &username) {
+                let shown = file.display();
+                if written {
+                    println!("{}", say!(bot, "Skill installé : {shown}", "Skill installed: {shown}"));
+                } else {
+                    println!("{}", say!(bot, "Laissé tel quel (skill à toi) : {shown}", "Left as is (your own skill): {shown}"));
+                }
+            }
             Ok(0)
         }
         TelegramCommand::Group { command } => group(&bot, command),
