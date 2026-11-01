@@ -1,0 +1,24 @@
+name: Install script
+
+# The one-line Linux install from the website, against the latest release.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install from the website
+        run: curl -fsSL https://asp.charlon.dev/install.sh | sh
+      - name: Use it
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          asp --version
+          asp monitor status
+          asp monitor watch --max 1 || test $? -eq 3
+          asp telegram sessions 2>&1 | grep -q "setup" || asp telegram sessions
