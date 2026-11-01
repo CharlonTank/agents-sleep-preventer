@@ -9,6 +9,7 @@ mod notifications;
 mod objc_utils;
 mod popover;
 mod runtime_dir;
+mod monitor;
 mod settings;
 mod telegram;
 
@@ -221,10 +222,27 @@ enum Commands {
     Settings,
     /// Debug: list process names
     Debug,
+    /// Watch RAM and disk, and name the Claude Code sessions behind a drift
+    Monitor {
+        #[command(subcommand)]
+        command: MonitorCommand,
+    },
     /// Talk with your coding agent sessions from Telegram, through your own bot
     Telegram {
         #[command(subcommand)]
         command: telegram::TelegramCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum MonitorCommand {
+    /// The system, then the RAM of each session's process tree
+    Status,
+    /// Read every 15 s; print the alerts and exit 0 as soon as there are
+    /// some (exit 3 after --max seconds without any)
+    Watch {
+        #[arg(long)]
+        max: Option<u64>,
     },
 }
 
@@ -259,6 +277,10 @@ fn main() -> Result<()> {
         } => cmd_uninstall(keep_model, keep_hooks, keep_data)?,
         Commands::Settings => cmd_settings()?,
         Commands::Debug => cmd_debug()?,
+        Commands::Monitor { command } => match command {
+            MonitorCommand::Status => println!("{}", monitor::status()),
+            MonitorCommand::Watch { max } => std::process::exit(monitor::watch(max)),
+        },
         Commands::Telegram { command } => std::process::exit(telegram::run(command)),
     }
 
@@ -4881,6 +4903,7 @@ fn cmd_agent() -> Result<()> {
 
     let mut settings_modified = settings_modified_time();
     let home = resolve_user_home().ok();
+    monitor::spawn();
     let mut tick_counter = 0u64;
 
     loop {

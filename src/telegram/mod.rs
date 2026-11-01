@@ -11,7 +11,9 @@ mod text;
 mod tests;
 
 use anyhow::{bail, Context, Result};
-use bot::{say, Bot, Busy};
+pub(crate) use bot::Bot;
+use bot::{say, Busy};
+pub(crate) use setup::system_prefers_french;
 use clap::Subcommand;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -309,6 +311,21 @@ fn session_name(given: Option<&str>) -> Result<String> {
         bail!("Unreadable session name: {name:?} (give it with --session)");
     }
     Ok(normal)
+}
+
+/// The configured bot, once `asp telegram setup` is done.
+pub(crate) fn configured_bot() -> Option<Bot> {
+    open_bot().ok().filter(|bot| bot.config().is_ok())
+}
+
+/// The language the owner reads: the bot's when it is set up, else the Mac's.
+pub(crate) fn owner_prefers_french() -> bool {
+    settings()
+        .ok()
+        .map(|settings| Store::new(data_dir(&settings)))
+        .and_then(|store| store.read_object(&store.path(&["bot.json"])))
+        .and_then(|bot| bot.text("language").map(|language| language == "fr"))
+        .unwrap_or_else(system_prefers_french)
 }
 
 /// Runs a telegram command; returns the process exit code.

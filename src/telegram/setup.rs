@@ -14,7 +14,8 @@ use std::time::Duration;
 /// How long to wait for the first message.
 const FIRST_MESSAGE_WAIT: f64 = 600.0;
 
-fn french() -> bool {
+/// The Mac's first preferred language is French.
+pub(crate) fn system_prefers_french() -> bool {
     let languages = Command::new("/usr/bin/defaults")
         .args(["read", "-g", "AppleLanguages"])
         .output()
@@ -129,7 +130,7 @@ fn first_message(tg: &HttpTelegram, mut offset: i64) -> Result<Option<(i64, Obje
 }
 
 pub fn run(data_dir: &Path, service: &str) -> Result<()> {
-    let fr = french();
+    let fr = system_prefers_french();
     println!("{}", tr!(
         fr,
         "Connecter ton bot Telegram, en trois étapes.\n\n1. Dans Telegram, ouvre @BotFather (https://t.me/BotFather), envoie /newbot et suis ses deux questions (un nom, puis un identifiant qui finit par « bot »).\n2. Il te donne un jeton (123456789:AA…). Colle-le ici, il ne s’affiche pas :",

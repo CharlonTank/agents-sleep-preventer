@@ -2031,6 +2031,20 @@ impl Bot {
         }));
     }
 
+    /// A message from this machine (not from Telegram) into a session's
+    /// inbox, shown by its listener under `speaker`.
+    pub fn drop_in_inbox(&self, name: &str, speaker: &str, text: &str) -> Result<()> {
+        let at = now();
+        let entry = json!({
+            "at": at, "from": "asp", "speaker": speaker, "message_id": null, "update_id": null,
+            "thread_id": null, "text": text, "session": name, "how": "moniteur", "routed_at": at,
+        });
+        let file = format!("asp-{}.json", (at * 1000.0) as u64);
+        self.store.write(&self.store.path(&["inbox", name, &file]), &entry)?;
+        self.store.journal(&entry);
+        Ok(())
+    }
+
     pub fn take(&self, name: &str) -> Vec<Object> {
         let mut files = self.store.json_files(&self.store.path(&["inbox", name]));
         files.sort_by_key(|file| {
