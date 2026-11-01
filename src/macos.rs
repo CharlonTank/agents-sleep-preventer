@@ -4911,6 +4911,16 @@ fn cmd_agent() -> Result<()> {
             }
         }
 
+        // At startup: an `asp` on the PATH left as a copy by an older
+        // install becomes a link that follows the app's updates.
+        if tick_counter == 1 && Path::new("/usr/local/bin/asp").exists() {
+            match sync_installed_cli() {
+                Ok(true) => logging::log("[cli] /usr/local/bin/asp now links to the app"),
+                Ok(false) => {}
+                Err(e) => logging::log(&format!("[cli] Could not link /usr/local/bin/asp: {e}")),
+            }
+        }
+
         // At startup, then every 60s: hook up Claude Code profiles
         // (CLAUDE_CONFIG_DIR) created or first used since the install.
         if tick_counter % 1200 == 1 {
@@ -5045,8 +5055,15 @@ fn ask_yes_no(prompt: &str) -> bool {
     answer.is_empty() || answer == "y" || answer == "yes"
 }
 
+/// Puts `asp` on the PATH as links to the app's binary, so the command
+/// follows every Sparkle update (copies stayed at the version of the last
+/// `asp install`: 5.2.1 under a 5.4.2 app).
 fn sync_installed_cli() -> Result<bool> {
-    let current_exe = std::env::current_exe().context("Could not find current executable")?;
+    let binary = if Path::new(APP_BINARY_PATH).exists() {
+        PathBuf::from(APP_BINARY_PATH)
+    } else {
+        std::env::current_exe().context("Could not find current executable")?
+    };
     fs::create_dir_all("/usr/local/bin")?;
 
     let mut updated = false;
@@ -5054,23 +5071,13 @@ fn sync_installed_cli() -> Result<bool> {
         Path::new("/usr/local/bin/asp"),
         Path::new("/usr/local/bin/agents-sleep-preventer"),
     ] {
-        if current_exe == target {
+        if binary == target || fs::read_link(target).ok().as_deref() == Some(binary.as_path()) {
             continue;
         }
-
-        fs::copy(&current_exe, target).with_context(|| {
-            format!(
-                "Failed to copy {} to {}",
-                current_exe.display(),
-                target.display()
-            )
+        let _ = fs::remove_file(target);
+        std::os::unix::fs::symlink(&binary, target).with_context(|| {
+            format!("Failed to link {} to {}", target.display(), binary.display())
         })?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(target, fs::Permissions::from_mode(0o755))?;
-        }
         updated = true;
     }
 
