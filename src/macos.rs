@@ -262,6 +262,14 @@ enum MonitorCommand {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if !matches!(cli.command, None | Some(Commands::Agent) | Some(Commands::Menubar)) {
+        // A command piped into `head` ends quietly, like any Unix tool,
+        // instead of panicking on the closed pipe. The long-lived app
+        // processes keep ignoring it.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
 
     match cli.command.unwrap_or(Commands::Menubar) {
         Commands::Start { pid } => cmd_start(pid)?,
