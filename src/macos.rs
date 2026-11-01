@@ -12,6 +12,7 @@ mod runtime_dir;
 mod monitor;
 mod settings;
 mod telegram;
+mod workshop;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -222,6 +223,19 @@ enum Commands {
     Settings,
     /// Debug: list process names
     Debug,
+    /// Open your named Claude Code sessions in iTerm ([workshop] in config.toml)
+    Workshop {
+        /// Claude Code profile ([workshop.profiles]); default: the last used
+        profile: Option<String>,
+        /// Even if Claude already runs in those folders
+        #[arg(long)]
+        force: bool,
+        /// Only the tab holding this session, in a new tab
+        #[arg(long)]
+        only: Option<String>,
+    },
+    #[command(hide = true)]
+    WorkshopPilot { plan: String },
     /// Watch RAM and disk, and name the Claude Code sessions behind a drift
     Monitor {
         #[command(subcommand)]
@@ -277,6 +291,8 @@ fn main() -> Result<()> {
         } => cmd_uninstall(keep_model, keep_hooks, keep_data)?,
         Commands::Settings => cmd_settings()?,
         Commands::Debug => cmd_debug()?,
+        Commands::Workshop { profile, force, only } => workshop::open(profile.as_deref(), force, only.as_deref())?,
+        Commands::WorkshopPilot { plan } => workshop::pilot(serde_json::from_str(&plan)?),
         Commands::Monitor { command } => match command {
             MonitorCommand::Status => println!("{}", monitor::status()),
             MonitorCommand::Watch { max } => std::process::exit(monitor::watch(max)),

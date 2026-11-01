@@ -159,8 +159,11 @@ fn app_support() -> PathBuf {
         .join("AgentsSleepPreventer")
 }
 
+/// config.toml, or the file `ASP_CONFIG` names.
 pub fn config_file() -> PathBuf {
-    app_support().join("config.toml")
+    std::env::var_os("ASP_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| app_support().join("config.toml"))
 }
 
 fn expand(path: &str) -> PathBuf {
