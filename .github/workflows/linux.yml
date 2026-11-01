@@ -1,0 +1,37 @@
+name: Linux
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --locked
+      - name: Build
+        run: cargo build --release --locked
+      - name: Smoke test
+        run: |
+          ./target/release/asp --version
+          ./target/release/asp monitor status
+          ./target/release/asp telegram --help
+          ./target/release/asp workshop --help
+      - name: Package
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          mkdir -p dist
+          tar -C target/release -czf "dist/AgentsSleepPreventer-${version}-linux-x86_64.tar.gz" asp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AgentsSleepPreventer-linux-x86_64
+          path: dist/*.tar.gz
+          if-no-files-found: error

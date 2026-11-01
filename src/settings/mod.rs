@@ -202,12 +202,7 @@ pub enum ModelEngine {
 }
 
 /// Files making up the Parakeet ONNX model directory.
-pub const PARAKEET_FILES: [&str; 4] = [
-    "encoder-model.int8.onnx",
-    "decoder_joint-model.int8.onnx",
-    "nemo128.onnx",
-    "vocab.txt",
-];
+pub use crate::voice::PARAKEET_FILES;
 
 /// A downloadable transcription model the user can choose from.
 #[derive(Debug, Clone, Copy)]

@@ -4,17 +4,19 @@
 
 use super::api::{HttpTelegram, Params, Telegram};
 use super::store::{now, Fields, Object, Store};
+use super::TelegramSettings;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+#[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 /// How long to wait for the first message.
 const FIRST_MESSAGE_WAIT: f64 = 600.0;
 
-/// The Mac's first preferred language is French.
+/// The machine's first preferred language is French.
+#[cfg(target_os = "macos")]
 pub(crate) fn system_prefers_french() -> bool {
     let languages = Command::new("/usr/bin/defaults")
         .args(["read", "-g", "AppleLanguages"])
@@ -28,6 +30,14 @@ pub(crate) fn system_prefers_french() -> bool {
         .or_else(|| std::env::var("LANG").ok())
         .unwrap_or_default();
     first.to_lowercase().starts_with("fr")
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn system_prefers_french() -> bool {
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
+        .is_some_and(|value| value.to_lowercase().starts_with("fr"))
 }
 
 macro_rules! tr {
@@ -78,7 +88,9 @@ fn plausible_token(token: &str) -> bool {
 
 /// Saves the token in the Keychain through `security -i`, so it never
 /// shows in the process list.
-fn save_token(service: &str, token: &str) -> Result<()> {
+#[cfg(target_os = "macos")]
+fn save_token(settings: &TelegramSettings, token: &str) -> Result<()> {
+    let service = super::keychain_service(settings);
     let mut child = Command::new("/usr/bin/security")
         .arg("-i")
         .stdin(Stdio::piped())
@@ -94,6 +106,22 @@ fn save_token(service: &str, token: &str) -> Result<()> {
     if !output.status.success() || refused.contains("rror") {
         bail!("security: {}", refused.trim());
     }
+    Ok(())
+}
+
+/// Saves the token in `<data_dir>/token`, readable by this user only.
+#[cfg(target_os = "linux")]
+fn save_token(settings: &TelegramSettings, token: &str) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = super::data_dir(settings);
+    std::fs::create_dir_all(&dir)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(dir.join("token"))?;
+    writeln!(file, "{token}")?;
     Ok(())
 }
 
@@ -129,7 +157,8 @@ fn first_message(tg: &HttpTelegram, mut offset: i64) -> Result<Option<(i64, Obje
     Ok(None)
 }
 
-pub fn run(data_dir: &Path, service: &str) -> Result<()> {
+pub fn run(settings: &TelegramSettings) -> Result<()> {
+    let data_dir = super::data_dir(settings);
     let fr = system_prefers_french();
     println!("{}", tr!(
         fr,
@@ -145,7 +174,7 @@ pub fn run(data_dir: &Path, service: &str) -> Result<()> {
         .call("getMe", &Params::new(), Duration::from_secs(30), None)
         .context("getMe")?;
     let username = me.get("username").and_then(Value::as_str).unwrap_or("").to_string();
-    save_token(service, &token)?;
+    save_token(settings, &token)?;
     // Updates sent before now are skipped: the first message must be new.
     let pending = tg.call("getUpdates", &Params::new().set("offset", -1).set("timeout", 0), Duration::from_secs(30), None)?;
     let offset = pending
@@ -156,8 +185,8 @@ pub fn run(data_dir: &Path, service: &str) -> Result<()> {
         .map_or(0, |id| id + 1);
     println!("{}", tr!(
         fr,
-        "3. Jeton enregistré dans le Trousseau. Écris maintenant n’importe quel message à @{username} dans Telegram (https://t.me/{username})…",
-        "3. Token saved in the Keychain. Now send any message to @{username} in Telegram (https://t.me/{username})…"
+        "3. Jeton enregistré. Écris maintenant n’importe quel message à @{username} dans Telegram (https://t.me/{username})…",
+        "3. Token saved. Now send any message to @{username} in Telegram (https://t.me/{username})…"
     ));
     let Some((update_id, message)) = first_message(&tg, offset)? else {
         bail!(tr!(fr, "Aucun message reçu en 10 minutes : relance asp telegram setup.", "No message within 10 minutes: run asp telegram setup again."));
@@ -175,7 +204,7 @@ pub fn run(data_dir: &Path, service: &str) -> Result<()> {
     if answer.starts_with('n') {
         bail!(tr!(fr, "Annulé : relance asp telegram setup et écris au bot depuis ton compte.", "Cancelled: run asp telegram setup again and write to the bot from your account."));
     }
-    let store = Store::new(data_dir.to_path_buf());
+    let store = Store::new(data_dir);
     let file = store.path(&["bot.json"]);
     let mut settings = store.read_object(&file).unwrap_or_default();
     settings.extend(match json!({
@@ -204,6 +233,14 @@ pub fn run(data_dir: &Path, service: &str) -> Result<()> {
         );
     }
     println!("{welcome}");
+    #[cfg(target_os = "linux")]
+    if crate::voice::parakeet_model_dir().is_none() {
+        print!("{}", tr!(fr, "Transcrire les vocaux sur cette machine (téléchargement de 640 Mo) ? [O/n] ", "Transcribe voice notes on this machine (640 MB download)? [Y/n] "));
+        io::stdout().flush()?;
+        if !read_line()?.to_lowercase().starts_with('n') {
+            super::voice_model()?;
+        }
+    }
     for (file, written) in super::install_skill(&first_name, &username) {
         if written {
             let shown = file.display();

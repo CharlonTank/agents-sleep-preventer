@@ -161,20 +161,6 @@ fn short_name(command: &str) -> String {
         .unwrap_or_else(|| command.to_string())
 }
 
-/// A process's real memory, as Activity Monitor shows it. `ps`'s RSS leaves
-/// out compressed memory (2.2 GB of RSS seen for 9 GB real, enough to hide
-/// a leak); phys_footprint counts it, and not shared memory.
-fn footprint(pid: u32) -> Option<u64> {
-    let mut info: libc::rusage_info_v0 = unsafe { std::mem::zeroed() };
-    let read = unsafe {
-        libc::proc_pid_rusage(
-            pid as libc::c_int,
-            libc::RUSAGE_INFO_V0,
-            &mut info as *mut libc::rusage_info_v0 as *mut libc::rusage_info_t,
-        )
-    };
-    (read == 0).then_some(info.ri_phys_footprint)
-}
 
 /// A process's start as Claude Code writes `procStart`: UTC, English, like
 /// `ps -o lstart` ("Sun Nov  1 05:08:55 2026"), whitespace collapsed.
@@ -194,6 +180,13 @@ fn start_text(seconds: u64) -> String {
         tm.tm_sec,
         tm.tm_year + 1900
     )
+}
+
+/// "Sun Nov  1 05:08:55 2026": the format compared; another one (a
+/// platform where Claude Code writes it differently) isn't checked.
+fn lstart_like(text: &str) -> bool {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    words.len() == 5 && words[3].matches(':').count() == 2 && words[4].len() == 4 && words[4].chars().all(|c| c.is_ascii_digit())
 }
 
 fn collapse(text: &str) -> String {
@@ -240,7 +233,7 @@ pub fn read_sessions(folders: &[PathBuf], alive: &HashSet<u32>, starts: &HashMap
             };
             let pid = pid as u32;
             if let (Some(started), Some(written)) = (starts.get(&pid), data.get("procStart").and_then(Value::as_str)) {
-                if collapse(written) != *started {
+                if lstart_like(written) && collapse(written) != *started {
                     continue;
                 }
             }
@@ -344,30 +337,6 @@ fn add(tree: Option<&mut Tree>, pid: u32, proc: &Proc, orphan: bool) {
     }
 }
 
-fn sysctl_u64(name: &str) -> Option<u64> {
-    let name = std::ffi::CString::new(name).ok()?;
-    let mut value: u64 = 0;
-    let mut size = std::mem::size_of::<u64>();
-    let read = unsafe {
-        libc::sysctlbyname(name.as_ptr(), &mut value as *mut u64 as *mut libc::c_void, &mut size, std::ptr::null_mut(), 0)
-    };
-    (read == 0).then_some(if size == 4 { value & 0xFFFF_FFFF } else { value })
-}
-
-fn swap_used() -> u64 {
-    let name = c"vm.swapusage";
-    let mut usage: libc::xsw_usage = unsafe { std::mem::zeroed() };
-    let mut size = std::mem::size_of::<libc::xsw_usage>();
-    let read = unsafe {
-        libc::sysctlbyname(name.as_ptr(), &mut usage as *mut libc::xsw_usage as *mut libc::c_void, &mut size, std::ptr::null_mut(), 0)
-    };
-    if read == 0 {
-        usage.xsu_used
-    } else {
-        0
-    }
-}
-
 fn free_space(path: &str) -> u64 {
     let Ok(path) = std::ffi::CString::new(path) else {
         return 0;
@@ -392,9 +361,9 @@ pub fn read_system() -> Snapshot {
     let mut procs = HashMap::new();
     let mut starts = HashMap::new();
     for info in crate::load_process_table() {
-        let ram = footprint(info.pid).unwrap_or(0);
-        if let Some(bsd) = crate::bsd_info(info.pid) {
-            starts.insert(info.pid, start_text(bsd.pbi_start_tvsec));
+        let ram = system::footprint(info.pid).unwrap_or(0);
+        if let Some(started) = system::started(info.pid) {
+            starts.insert(info.pid, start_text(started));
         }
         procs.insert(info.pid, Proc { ppid: info.ppid, ram, command: info.arg0 });
     }
@@ -412,12 +381,138 @@ pub fn read_system() -> Snapshot {
         trees,
         top_system: top,
         outside: others.iter().map(|p| p.ram).sum(),
-        pressure: sysctl_u64("kern.memorystatus_vm_pressure_level").unwrap_or(1) as i64,
-        swap: swap_used(),
-        memtotal: sysctl_u64("hw.memsize").unwrap_or(0),
+        pressure: system::pressure(),
+        swap: system::swap_used(),
+        memtotal: system::memory_total(),
         free: free_space(&home_text),
         sessions,
         home: home_text,
+    }
+}
+
+/// What each platform tells about processes and memory.
+#[cfg(target_os = "macos")]
+mod system {
+    fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
+        let mut value: u64 = 0;
+        let mut size = std::mem::size_of::<u64>();
+        let read = unsafe {
+            libc::sysctlbyname(name.as_ptr(), &mut value as *mut u64 as *mut libc::c_void, &mut size, std::ptr::null_mut(), 0)
+        };
+        (read == 0).then_some(if size == 4 { value & 0xFFFF_FFFF } else { value })
+    }
+
+    /// A process's real memory, as Activity Monitor shows it. `ps`'s RSS
+    /// leaves out compressed memory (2.2 GB of RSS seen for 9 GB real,
+    /// enough to hide a leak); phys_footprint counts it, and not shared memory.
+    pub fn footprint(pid: u32) -> Option<u64> {
+        let mut info: libc::rusage_info_v0 = unsafe { std::mem::zeroed() };
+        let read = unsafe {
+            libc::proc_pid_rusage(
+                pid as libc::c_int,
+                libc::RUSAGE_INFO_V0,
+                &mut info as *mut libc::rusage_info_v0 as *mut libc::rusage_info_t,
+            )
+        };
+        (read == 0).then_some(info.ri_phys_footprint)
+    }
+
+    /// Start time, seconds since the epoch.
+    pub fn started(pid: u32) -> Option<u64> {
+        crate::bsd_info(pid).map(|info| info.pbi_start_tvsec)
+    }
+
+    /// kern.memorystatus_vm_pressure_level: 1 normal, 2 warning, 4 critical.
+    pub fn pressure() -> i64 {
+        sysctl_u64(c"kern.memorystatus_vm_pressure_level").unwrap_or(1) as i64
+    }
+
+    pub fn swap_used() -> u64 {
+        let mut usage: libc::xsw_usage = unsafe { std::mem::zeroed() };
+        let mut size = std::mem::size_of::<libc::xsw_usage>();
+        let read = unsafe {
+            libc::sysctlbyname(c"vm.swapusage".as_ptr(), &mut usage as *mut libc::xsw_usage as *mut libc::c_void, &mut size, std::ptr::null_mut(), 0)
+        };
+        if read == 0 {
+            usage.xsu_used
+        } else {
+            0
+        }
+    }
+
+    pub fn memory_total() -> u64 {
+        sysctl_u64(c"hw.memsize").unwrap_or(0)
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod system {
+    fn meminfo(key: &str) -> u64 {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix(key)?.strip_prefix(':').map(str::to_string))
+            })
+            .and_then(|value| value.split_whitespace().next()?.parse::<u64>().ok())
+            .map_or(0, |kilobytes| kilobytes * 1024)
+    }
+
+    /// Proportional memory (shared pages split among their users) plus
+    /// swapped-out pages: what the process really costs.
+    pub fn footprint(pid: u32) -> Option<u64> {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
+        let field = |key: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(key))
+                .and_then(|rest| rest.split_whitespace().next()?.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        Some((field("Pss:") + field("SwapPss:")) * 1024)
+    }
+
+    /// Start time, seconds since the epoch: field 22 of /proc/<pid>/stat
+    /// (clock ticks after boot) plus the boot time.
+    pub fn started(pid: u32) -> Option<u64> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after_name = &stat[stat.rfind(')')? + 1..];
+        let ticks: u64 = after_name.split_whitespace().nth(19)?.parse().ok()?;
+        let boot: u64 = std::fs::read_to_string("/proc/stat")
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix("btime ")?.trim().parse().ok())?;
+        let per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+        Some(boot + ticks / per_second)
+    }
+
+    /// Pressure stall information: memory stalls over the last 10 s, as
+    /// macOS's levels (1 normal, 2 warning, 4 critical).
+    pub fn pressure() -> i64 {
+        let Ok(text) = std::fs::read_to_string("/proc/pressure/memory") else {
+            return 1;
+        };
+        let average = |kind: &str| {
+            text.lines()
+                .find(|line| line.starts_with(kind))
+                .and_then(|line| line.split_whitespace().find_map(|w| w.strip_prefix("avg10=")))
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or(0.0)
+        };
+        if average("full") >= 5.0 {
+            4
+        } else if average("some") >= 10.0 {
+            2
+        } else {
+            1
+        }
+    }
+
+    pub fn swap_used() -> u64 {
+        meminfo("SwapTotal").saturating_sub(meminfo("SwapFree"))
+    }
+
+    pub fn memory_total() -> u64 {
+        meminfo("MemTotal")
     }
 }
 
@@ -907,16 +1002,25 @@ fn session_message(alert: &Alert, owner: &str, fr: bool) -> String {
         "{label} ({level}): {summary}\nBiggest processes: {procs}\n{advice} Then tell {owner} in one line what you did, or why you keep everything.\n(A measurement by ASP on this machine, not a message from {owner}.)")
 }
 
-/// Hands the alerts out: a notification, the culprit sessions' Telegram
-/// inboxes, and the owner when nobody can be told or it is critical.
-fn deliver(alerts: &[Alert], fr: bool) {
-    let Some(first) = alerts.first() else {
-        return;
-    };
+/// One notification for a batch: the first alert, and how many more.
+#[cfg(target_os = "macos")]
+fn notify(alerts: &[Alert], fr: bool) {
+    let first = &alerts[0];
     let label = kind_label(&first.kind, fr);
     let title = tr!(fr, "ASP : {label}", "ASP: {label}");
     let more = if alerts.len() > 1 { format!(" (+{})", alerts.len() - 1) } else { String::new() };
     crate::notifications::spool(&title, &format!("{}{more}", first.resume), first.pid);
+}
+
+/// Hands the alerts out: a notification, the culprit sessions' Telegram
+/// inboxes, and the owner when nobody can be told or it is critical.
+fn deliver(alerts: &[Alert], fr: bool) {
+    if alerts.is_empty() {
+        return;
+    }
+    // A server has no notification center: Telegram carries the alerts there.
+    #[cfg(target_os = "macos")]
+    notify(alerts, fr);
     let Some(bot) = crate::telegram::configured_bot() else {
         return;
     };
@@ -969,6 +1073,29 @@ pub fn spawn() {
             std::thread::sleep(Duration::from_secs(STEP));
         }
     });
+}
+
+#[derive(clap::Subcommand)]
+pub enum MonitorCommand {
+    /// The system, then the RAM of each session's process tree
+    Status,
+    /// Read every 15 s; print the alerts and exit 0 as soon as there are
+    /// some (exit 3 after --max seconds without any)
+    Watch {
+        #[arg(long)]
+        max: Option<u64>,
+    },
+}
+
+/// Runs a monitor command; returns the process exit code.
+pub fn run(command: MonitorCommand) -> i32 {
+    match command {
+        MonitorCommand::Status => {
+            println!("{}", status());
+            0
+        }
+        MonitorCommand::Watch { max } => watch(max),
+    }
 }
 
 /// `asp monitor watch`: exits 0 as soon as there are alerts (printed), 3

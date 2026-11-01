@@ -1427,10 +1427,17 @@ impl Bot {
         let notice = || Notice { thread, ..Notice::default() };
         match first_word(text).as_str() {
             "/start" => {
+                #[cfg(target_os = "macos")]
                 let hello = say!(
                     self,
                     "Bien reçu. Je relaie tes messages aux sessions Claude Code de ton Mac.",
                     "Got it. I pass your messages on to the Claude Code sessions on your Mac."
+                );
+                #[cfg(not(target_os = "macos"))]
+                let hello = say!(
+                    self,
+                    "Bien reçu. Je relaie tes messages aux sessions Claude Code de cette machine.",
+                    "Got it. I pass your messages on to the Claude Code sessions on this machine."
                 );
                 self.notify(&format!("{hello}\n\n{}", self.guide()), notice())?;
             }

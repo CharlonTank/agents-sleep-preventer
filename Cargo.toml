@@ -20,9 +20,20 @@ dirs = "5"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+hound = "3.5"
+
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
 tao = "0.30"
 tray-icon = "0.21"
-hound = "3.5"
+
+# Server mode: Telegram, RAM and disk watch, workshop in tmux.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+ureq = "3"
+regex = "1"
+unicode-normalization = "0.1"
+toml = "0.8"
+transcribe-rs = { version = "0.3.11", default-features = false, features = ["onnx"] } # voice notes
 
 [target.'cfg(target_os = "macos")'.dependencies]
 io-kit-sys = "0.5.0"

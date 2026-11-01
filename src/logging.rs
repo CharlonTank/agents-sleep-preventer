@@ -7,6 +7,7 @@ use std::time::SystemTime;
 static LOG_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Initialize logging to ~/Library/Logs/AgentsSleepPreventer/asp.log
+/// (Linux: ~/.local/state/AgentsSleepPreventer/asp.log)
 pub fn init() {
     init_with_startup_message(true);
 }
@@ -17,9 +18,13 @@ pub fn init_quiet() {
 }
 
 fn init_with_startup_message(write_startup: bool) {
-    let log_dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("Library/Logs/AgentsSleepPreventer");
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    #[cfg(target_os = "macos")]
+    let log_dir = home.join("Library/Logs/AgentsSleepPreventer");
+    #[cfg(not(target_os = "macos"))]
+    let log_dir = dirs::state_dir()
+        .unwrap_or_else(|| home.join(".local/state"))
+        .join("AgentsSleepPreventer");
 
     if fs::create_dir_all(&log_dir).is_ok() {
         let log_path = log_dir.join("asp.log");

@@ -115,20 +115,73 @@ impl Bot {
             .ok()
             .and_then(|settings| settings.text("parakeet_model").map(PathBuf::from))
             .filter(|dir| dir.is_dir())
-            .or_else(crate::dictation::parakeet_model_dir)
-            .ok_or_else(|| {
-                Unheard::Failed(say!(
-                    self,
-                    "modèle Parakeet absent : choisis-le dans les réglages de dictée d’ASP",
-                    "Parakeet model missing: pick it in ASP's dictation settings"
-                ))
-            })?;
-        crate::dictation::transcribe_recording(&model, &samples).map_err(Unheard::Failed)
+            .or_else(installed_model)
+            .ok_or_else(|| Unheard::Failed(missing_model(self.french())))?;
+        transcribe(&model, &samples).map_err(Unheard::Failed)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn installed_model() -> Option<PathBuf> {
+    crate::dictation::parakeet_model_dir()
+}
+
+#[cfg(target_os = "linux")]
+fn installed_model() -> Option<PathBuf> {
+    crate::voice::parakeet_model_dir()
+}
+
+#[cfg(target_os = "macos")]
+fn missing_model(fr: bool) -> String {
+    if fr {
+        "modèle Parakeet absent : choisis-le dans les réglages de dictée d’ASP".to_string()
+    } else {
+        "Parakeet model missing: pick it in ASP's dictation settings".to_string()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn missing_model(fr: bool) -> String {
+    if fr {
+        "modèle Parakeet absent : asp telegram voice le télécharge".to_string()
+    } else {
+        "Parakeet model missing: asp telegram voice downloads it".to_string()
+    }
+}
+
+/// The transcript, spelled with the dictation vocabulary on macOS.
+#[cfg(target_os = "macos")]
+fn transcribe(model: &Path, samples: &[f32]) -> Result<String, String> {
+    crate::dictation::transcribe_recording(model, samples)
+}
+
+#[cfg(target_os = "linux")]
+fn transcribe(model: &Path, samples: &[f32]) -> Result<String, String> {
+    crate::voice::transcribe_recording(model, samples)
+}
+
+/// 16 kHz mono samples, decoded by ffmpeg (`apt install ffmpeg`).
+#[cfg(target_os = "linux")]
+fn decode(file: &Path) -> Result<Vec<f32>, String> {
+    let output = std::process::Command::new("ffmpeg")
+        .args(["-nostdin", "-loglevel", "error", "-i"])
+        .arg(file)
+        .args(["-ac", "1", "-ar", "16000", "-f", "s16le", "-"])
+        .output()
+        .map_err(|e| format!("ffmpeg ({e}): sudo apt install ffmpeg"))?;
+    if !output.status.success() {
+        return Err(format!("ffmpeg: {}", String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    Ok(output
+        .stdout
+        .chunks_exact(2)
+        .map(|pair| f32::from(i16::from_le_bytes([pair[0], pair[1]])) / 32768.0)
+        .collect())
 }
 
 /// 16 kHz mono samples of any audio file Telegram sends (Ogg Opus voice
 /// notes, MP3, video notes), decoded and resampled by Core Audio.
+#[cfg(target_os = "macos")]
 fn decode(file: &Path) -> Result<Vec<f32>, String> {
     use core_foundation::base::TCFType;
     use core_foundation::url::CFURL;
@@ -223,7 +276,7 @@ fn decode(file: &Path) -> Result<Vec<f32>, String> {
     result.map(|()| samples)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::decode;
 

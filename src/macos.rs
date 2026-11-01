@@ -1,6 +1,8 @@
 use crate::hook_config::*;
 
 mod authorization;
+mod claude_profiles;
+use claude_profiles::claude_config_dirs;
 mod auto_resume;
 mod dictation;
 mod logging;
@@ -239,24 +241,12 @@ enum Commands {
     /// Watch RAM and disk, and name the Claude Code sessions behind a drift
     Monitor {
         #[command(subcommand)]
-        command: MonitorCommand,
+        command: monitor::MonitorCommand,
     },
     /// Talk with your coding agent sessions from Telegram, through your own bot
     Telegram {
         #[command(subcommand)]
         command: telegram::TelegramCommand,
-    },
-}
-
-#[derive(Subcommand)]
-enum MonitorCommand {
-    /// The system, then the RAM of each session's process tree
-    Status,
-    /// Read every 15 s; print the alerts and exit 0 as soon as there are
-    /// some (exit 3 after --max seconds without any)
-    Watch {
-        #[arg(long)]
-        max: Option<u64>,
     },
 }
 
@@ -301,10 +291,7 @@ fn main() -> Result<()> {
         Commands::Debug => cmd_debug()?,
         Commands::Workshop { profile, force, only } => workshop::open(profile.as_deref(), force, only.as_deref())?,
         Commands::WorkshopPilot { plan } => workshop::pilot(serde_json::from_str(&plan)?),
-        Commands::Monitor { command } => match command {
-            MonitorCommand::Status => println!("{}", monitor::status()),
-            MonitorCommand::Watch { max } => std::process::exit(monitor::watch(max)),
-        },
+        Commands::Monitor { command } => std::process::exit(monitor::run(command)),
         Commands::Telegram { command } => std::process::exit(telegram::run(command)),
     }
 
@@ -2900,23 +2887,6 @@ fn install_claude_hooks(settings_file: &Path, hooks_dir: &Path) -> Result<()> {
     println!("  Updated {}", settings_file.display());
 
     Ok(())
-}
-
-/// Claude Code profiles: ~/.claude plus every other `~/.claude-*` config
-/// dir (CLAUDE_CONFIG_DIR) that has been used, i.e. has a projects/ dir.
-fn claude_config_dirs(home: &Path) -> Vec<PathBuf> {
-    let mut dirs = vec![home.join(".claude")];
-    if let Ok(entries) = fs::read_dir(home) {
-        let mut profiles: Vec<PathBuf> = entries
-            .flatten()
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".claude-"))
-            .map(|entry| entry.path())
-            .filter(|path| path.join("projects").is_dir())
-            .collect();
-        profiles.sort();
-        dirs.extend(profiles);
-    }
-    dirs
 }
 
 /// Up to date: the latest events ASP hooks (SubagentStop, then StopFailure

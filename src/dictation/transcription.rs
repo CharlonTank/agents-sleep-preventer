@@ -10,6 +10,7 @@ use transcribe_rs::onnx::parakeet::{ParakeetModel, ParakeetParams};
 use transcribe_rs::onnx::Quantization;
 
 use crate::logging;
+use crate::voice::{quietest_cut, transcribe_snippet, COMMIT_SEARCH_SECS, COMMIT_TARGET_SECS};
 use crate::native_dialogs;
 use crate::settings::{AppSettings, ModelChoice, ModelEngine};
 
@@ -241,57 +242,6 @@ impl WhisperTranscriber {
     }
 }
 
-/// Commit the transcript in chunks while recording so the hotkey release
-/// only has to transcribe the last few seconds, never the whole recording.
-const COMMIT_TARGET_SECS: usize = 15;
-/// Search for the quietest cut point this far back from the commit target,
-/// so chunks split on a natural pause instead of mid-word.
-const COMMIT_SEARCH_SECS: usize = 5;
-/// Silence padding around each transcribed snippet to soften edge effects.
-const SNIPPET_PAD_SECS: f32 = 0.2;
-
-/// Quietest 30ms-frame boundary in `raw[from..to]` (channel-aligned).
-fn quietest_cut(raw: &[f32], channels: u16, sample_rate: u32, from: usize, to: usize) -> usize {
-    let channels = channels.max(1) as usize;
-    let frame = ((sample_rate as usize * 30 / 1000) * channels).max(channels);
-    let from = from - (from % channels);
-    let to = to.min(raw.len());
-
-    let mut best = to - (to % channels);
-    let mut best_rms = f32::MAX;
-    let mut offset = from;
-    while offset + frame <= to {
-        let rms = raw[offset..offset + frame]
-            .iter()
-            .map(|s| s * s)
-            .sum::<f32>()
-            / frame as f32;
-        if rms < best_rms {
-            best_rms = rms;
-            best = offset + frame;
-        }
-        offset += frame;
-    }
-    best
-}
-
-/// Transcribe a 16k-mono snippet padded with a little silence; None when
-/// empty or failed.
-fn transcribe_snippet(model: &mut ParakeetModel, samples: &[f32]) -> Option<String> {
-    if samples.is_empty() {
-        return None;
-    }
-    let pad = (SNIPPET_PAD_SECS * 16_000.0) as usize;
-    let mut padded = vec![0.0f32; pad];
-    padded.extend_from_slice(samples);
-    padded.resize(padded.len() + pad, 0.0);
-    model
-        .transcribe_with(&padded, &ParakeetParams::default())
-        .ok()
-        .map(|result| result.text.trim().to_string())
-        .filter(|text| !text.is_empty())
-}
-
 /// Spawn the Parakeet streaming thread: loads the model once, then keeps a
 /// running transcript while recording — audio older than ~15s is committed
 /// in chunks cut at natural pauses, and only the uncommitted tail is
@@ -417,24 +367,12 @@ pub(crate) fn parakeet_model_dir() -> Option<PathBuf> {
         .map(|dir| dir.join(parakeet.filename))
 }
 
-/// Transcribes a whole 16 kHz mono recording (a voice message), cut at
-/// natural pauses about every 15 s like live dictation, so long notes stay
-/// accurate. The model loads once for all the cuts.
+/// A whole recording (a voice message) transcribed, then spelled with the
+/// user's vocabulary.
 pub(crate) fn transcribe_recording(model_dir: &std::path::Path, samples: &[f32]) -> Result<String, String> {
-    let mut model = ParakeetModel::load(model_dir, &Quantization::Int8)
-        .map_err(|e| format!("Failed to load Parakeet model: {}", e))?;
-    let target = COMMIT_TARGET_SECS * 16_000;
-    let search = COMMIT_SEARCH_SECS * 16_000;
-    let mut parts = Vec::new();
-    let mut start = 0;
-    while samples.len() - start > target + search {
-        let cut = quietest_cut(samples, 1, 16_000, start + target - search, start + target);
-        parts.extend(transcribe_snippet(&mut model, &samples[start..cut]));
-        start = cut;
-    }
-    parts.extend(transcribe_snippet(&mut model, &samples[start..]));
+    let text = crate::voice::transcribe_recording(model_dir, samples)?;
     Ok(crate::vocabulary::correct(
-        &parts.join(" "),
+        &text,
         &AppSettings::load().speech_to_text.vocabulary_words,
     ))
 }

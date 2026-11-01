@@ -87,6 +87,8 @@ pub enum TelegramCommand {
     Doctor,
     /// Install the /telegram skill in every Claude Code profile
     Skill,
+    /// The voice-note model: where it is, or (Linux) download it
+    Voice,
 }
 
 #[derive(Subcommand)]
@@ -125,11 +127,13 @@ struct Settings {
 }
 
 #[derive(Deserialize, Default)]
-struct TelegramSettings {
+pub(crate) struct TelegramSettings {
     data_dir: Option<String>,
+    #[cfg(target_os = "macos")]
     keychain_service: Option<String>,
 }
 
+#[cfg(target_os = "macos")]
 const DEFAULT_KEYCHAIN_SERVICE: &str = "agents-sleep-preventer-telegram";
 const SKILL: &str = include_str!("SKILL.md");
 const SKILL_MARKER: &str = "Installed by Agents Sleep Preventer";
@@ -191,6 +195,7 @@ fn data_dir(settings: &TelegramSettings) -> PathBuf {
         .unwrap_or_else(|| app_support().join("telegram"))
 }
 
+#[cfg(target_os = "macos")]
 fn keychain_service(settings: &TelegramSettings) -> String {
     settings
         .keychain_service
@@ -198,14 +203,28 @@ fn keychain_service(settings: &TelegramSettings) -> String {
         .unwrap_or_else(|| DEFAULT_KEYCHAIN_SERVICE.to_string())
 }
 
-fn token(service: &str) -> Result<String> {
+/// The bot's token: in the Keychain on macOS, in `<data_dir>/token`
+/// (mode 0600) on Linux.
+#[cfg(target_os = "macos")]
+fn token(settings: &TelegramSettings) -> Result<String> {
+    let service = keychain_service(settings);
     let output = Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-s", service, "-w"])
+        .args(["find-generic-password", "-s", &service, "-w"])
         .output()
         .context("security")?;
     let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() || token.is_empty() {
         bail!("No bot token in the Keychain (service {service}): run `asp telegram setup`");
+    }
+    Ok(token)
+}
+
+#[cfg(target_os = "linux")]
+fn token(settings: &TelegramSettings) -> Result<String> {
+    let file = data_dir(settings).join("token");
+    let token = std::fs::read_to_string(&file).unwrap_or_default().trim().to_string();
+    if token.is_empty() {
+        bail!("No bot token in {}: run `asp telegram setup`", file.display());
     }
     Ok(token)
 }
@@ -279,7 +298,7 @@ fn elapsed_seconds(text: &str) -> Option<f64> {
 fn open_bot() -> Result<Bot> {
     let settings = settings()?;
     let store = Store::new(data_dir(&settings));
-    let tg = api::HttpTelegram::new(token(&keychain_service(&settings))?);
+    let tg = api::HttpTelegram::new(token(&settings)?);
     let code = std::env::current_exe().unwrap_or_default();
     Ok(Bot::new(
         store,
@@ -316,6 +335,29 @@ fn session_name(given: Option<&str>) -> Result<String> {
     Ok(normal)
 }
 
+/// Voice notes use the Parakeet model of ASP's dictation.
+#[cfg(target_os = "macos")]
+fn voice_model() -> Result<()> {
+    match crate::dictation::parakeet_model_dir() {
+        Some(dir) => println!("Voice notes are transcribed with {}", dir.display()),
+        None => println!("Pick Parakeet in ASP's dictation settings (Settings → Dictation): voice notes use it too."),
+    }
+    Ok(())
+}
+
+/// Downloads the Parakeet model (about 640 MB) when missing.
+#[cfg(target_os = "linux")]
+pub(crate) fn voice_model() -> Result<()> {
+    if let Some(dir) = crate::voice::parakeet_model_dir() {
+        println!("Voice notes are transcribed with {}", dir.display());
+        return Ok(());
+    }
+    println!("Downloading the Parakeet model (about 640 MB)…");
+    let dir = crate::voice::download_parakeet()?;
+    println!("Voice notes are transcribed with {} (ffmpeg decodes them: sudo apt install ffmpeg)", dir.display());
+    Ok(())
+}
+
 /// The configured bot, once `asp telegram setup` is done.
 pub(crate) fn configured_bot() -> Option<Bot> {
     open_bot().ok().filter(|bot| bot.config().is_ok())
@@ -349,7 +391,7 @@ pub fn run(command: TelegramCommand) -> i32 {
 fn execute(command: TelegramCommand) -> Result<i32> {
     if let TelegramCommand::Setup = command {
         let settings = settings()?;
-        return setup::run(&data_dir(&settings), &keychain_service(&settings)).map(|()| 0);
+        return setup::run(&settings).map(|()| 0);
     }
     let bot = open_bot()?;
     let owner = bot.owner();
@@ -424,6 +466,10 @@ fn execute(command: TelegramCommand) -> Result<i32> {
             let name = session_name(session.as_deref())?;
             bot.stop(&name, announce_group)?;
             println!("{}", say!(bot, "Session « {name} » arrêtée (arrêter aussi sa tâche d’écoute).", "Session \"{name}\" stopped (stop its listening task too)."));
+            Ok(0)
+        }
+        TelegramCommand::Voice => {
+            voice_model()?;
             Ok(0)
         }
         TelegramCommand::Skill => {
