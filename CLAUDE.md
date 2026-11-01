@@ -165,6 +165,11 @@ The app requests only TWO permissions: Microphone and Accessibility.
   - Sessions are resumed by id (a duplicate name opens a picker), using `custom-title.json` or the last custom-title line.
   - The detached `workshop-pilot` walks down to "Yes, I trust this folder" before Enter. It types each text without a newline, then Enter on its own: iTerm `write text … without newline` then character 13, or tmux `send-keys -l -- text` then `send-keys Enter`.
   - `[workshop] terminal` picks the terminal. The default is tmux inside tmux, over SSH or without iTerm (servers), iTerm otherwise. Outside tmux, a detached `tmux_session` ("asp") is created; attach it with `tmux attach -t asp`. Both backends were tested end to end with two scratch sessions.
+- **Linux (server mode)**: `src/linux.rs` is the crate root on Linux (`include!` like macos.rs).
+  - Commands: telegram, monitor, workshop (tmux), `serve` (the watch, in the foreground) and `service install|uninstall` (systemd user unit `asp.service`, with linger).
+  - Shared pieces: processes from /proc behind the same `ProcessInfo` / `load_process_table` / `get_process_cwd` names; `monitor::system` per platform (Pss+SwapPss, PSI pressure, /proc/meminfo); `voice.rs` (chunked Parakeet, also used by dictation); `claude_profiles.rs`.
+  - Linux specifics: the bot token is `<data_dir>/token` (0600), voice notes are decoded by ffmpeg, `asp telegram voice` downloads the model, and there are no notifications.
+  - CI: the Linux workflow tests the build and uploads `AgentsSleepPreventer-X-linux-x86_64.tar.gz`. Releases require it in `dist/`, like the Windows zip. The website serves `install.sh`.
 - **The `asp` CLI on the PATH** (`/usr/local/bin/asp`) is a symlink to the app's binary (`sync_installed_cli`; the agent fixes old copies at startup).
 - **A fresh target dir** (worktree) fails to build `coreaudio-sys` with the MacOSX27 SDK ("KernelKit requires -fdefine_target_os_macros"). Build with `COREAUDIO_SDK_PATH=/Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk`.
 

@@ -63,6 +63,17 @@ Install this tool. Your computer stays awake while your agent works; normal slee
 
 ## Installation
 
+### Linux server (Telegram, RAM and disk watch, workshop)
+
+For a machine that never turns off, without a desktop:
+
+```bash
+curl -fsSL https://asp.charlon.dev/install.sh | sh
+asp telegram setup
+```
+
+It installs `asp` in `~/.local/bin`, plus a systemd user service (`asp serve`) that watches RAM and disk and alerts you on Telegram. Your Claude Code sessions run in tmux: `asp workshop` opens them (`[workshop]` in `~/.local/share/AgentsSleepPreventer/config.toml`), and `/telegram` in each lets you drive them from your phone. Voice notes need ffmpeg (`sudo apt install ffmpeg`); setup offers the transcription model. Linux has no menu bar, dictation or sleep prevention.
+
 ### Windows 10 / 11
 
 [Download the Windows ZIP](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-5.5.0-windows-x86_64.zip), extract it, and run `asp.exe` for the system tray app. To install native Claude Code/Codex hooks and start at login, run this in PowerShell from the extracted folder:

@@ -1448,6 +1448,7 @@ fn ensure_github_release(version: &str, release_notes_path: &Path, target: &str)
 
 fn upload_release_assets(version: &str, appcast_path: &Path) -> Result<()> {
     let windows_zip = format!("dist/AgentsSleepPreventer-{version}-windows-x86_64.zip");
+    let linux_tar = format!("dist/AgentsSleepPreventer-{version}-linux-x86_64.tar.gz");
     let tag = format!("v{}", version);
     let dmg_name = format!("AgentsSleepPreventer-{}.dmg", version);
     run(
@@ -1461,6 +1462,7 @@ fn upload_release_assets(version: &str, appcast_path: &Path) -> Result<()> {
             &dmg_name,
             appcast_path.to_str().context("Invalid appcast path")?,
             &windows_zip,
+            &linux_tar,
             "--clobber",
         ],
     )
@@ -1488,7 +1490,8 @@ fn verify_uploaded_release(version: &str) -> Result<()> {
         .context("GitHub release response did not include assets")?;
 
     let windows_name = format!("AgentsSleepPreventer-{version}-windows-x86_64.zip");
-    for required_asset in [&dmg_name, SPARKLE_APPCAST_ASSET_NAME, &windows_name] {
+    let linux_name = format!("AgentsSleepPreventer-{version}-linux-x86_64.tar.gz");
+    for required_asset in [&dmg_name, SPARKLE_APPCAST_ASSET_NAME, &windows_name, &linux_name] {
         let found = assets.iter().any(|asset| {
             asset
                 .get("name")
@@ -1562,6 +1565,10 @@ fn publish_release(version: &str, artifacts: &AppcastArtifacts, target: &str) ->
     let windows_zip = format!("dist/AgentsSleepPreventer-{version}-windows-x86_64.zip");
     if !Path::new(&windows_zip).is_file() {
         bail!("Missing tested Windows package: {windows_zip}");
+    }
+    let linux_tar = format!("dist/AgentsSleepPreventer-{version}-linux-x86_64.tar.gz");
+    if !Path::new(&linux_tar).is_file() {
+        bail!("Missing tested Linux package (Linux CI artifact): {linux_tar}");
     }
     ensure_github_release(version, &artifacts.release_notes_path, target)?;
     upload_release_assets(version, &artifacts.appcast_path)?;
