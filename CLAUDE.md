@@ -163,7 +163,8 @@ The app requests only TWO permissions: Microphone and Accessibility.
   - Alert JSON keys (`gravite`, `valeur`, `processus`…) are the Python tool's.
 - **`asp workshop`** (`src/workshop.rs`) is a port of claude-atelier's atelier.
   - Sessions are resumed by id (a duplicate name opens a picker), using `custom-title.json` or the last custom-title line.
-  - The detached `workshop-pilot` walks down to "Yes, I trust this folder" before Enter, and types texts with `write text … without newline`, then character 13.
+  - The detached `workshop-pilot` walks down to "Yes, I trust this folder" before Enter. It types each text without a newline, then Enter on its own: iTerm `write text … without newline` then character 13, or tmux `send-keys -l -- text` then `send-keys Enter`.
+  - `[workshop] terminal` picks the terminal. The default is tmux inside tmux, over SSH or without iTerm (servers), iTerm otherwise. Outside tmux, a detached `tmux_session` ("asp") is created; attach it with `tmux attach -t asp`. Both backends were tested end to end with two scratch sessions.
 - **The `asp` CLI on the PATH** (`/usr/local/bin/asp`) is a symlink to the app's binary (`sync_installed_cli`; the agent fixes old copies at startup).
 - **A fresh target dir** (worktree) fails to build `coreaudio-sys` with the MacOSX27 SDK ("KernelKit requires -fdefine_target_os_macros"). Build with `COREAUDIO_SDK_PATH=/Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk`.
 

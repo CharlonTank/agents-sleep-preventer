@@ -50,6 +50,11 @@ pub struct Settings {
     /// Claude Code profiles (CLAUDE_CONFIG_DIR) by short name; empty: the
     /// default profile only.
     pub profiles: BTreeMap<String, String>,
+    /// "iterm" or "tmux"; default: tmux inside tmux or over SSH, else iTerm
+    /// when installed.
+    pub terminal: Option<Terminal>,
+    /// The tmux session the workshop opens in, outside tmux.
+    pub tmux_session: String,
     pub tab: Vec<Tab>,
 }
 
@@ -62,6 +67,8 @@ impl Default for Settings {
             claude_args: Vec::new(),
             resume_full: false,
             profiles: BTreeMap::new(),
+            terminal: None,
+            tmux_session: "asp".to_string(),
             tab: Vec::new(),
         }
     }
@@ -349,12 +356,101 @@ on run argv
 end run
 "#;
 
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum Terminal {
+    Iterm,
+    Tmux,
+}
+
+#[derive(Clone, Copy)]
+enum Key {
+    Enter,
+    Down,
+}
+
+fn tmux_binary() -> &'static str {
+    ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+        .unwrap_or("tmux")
+}
+
+fn tmux(args: &[&str]) -> Result<String> {
+    let output = Command::new(tmux_binary()).args(args).output().context("tmux")?;
+    if !output.status.success() {
+        bail!("tmux {}: {}", args.first().unwrap_or(&""), String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim_end_matches('\n').to_string())
+}
+
+impl Terminal {
+    /// tmux inside tmux or over SSH (a server), else iTerm when installed.
+    fn detect() -> Self {
+        let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+        if set("TMUX") {
+            Terminal::Tmux
+        } else if set("ITERM_SESSION_ID") {
+            Terminal::Iterm
+        } else if set("SSH_CONNECTION") || !Path::new("/Applications/iTerm.app").exists() {
+            Terminal::Tmux
+        } else {
+            Terminal::Iterm
+        }
+    }
+
+    /// The pane's screen; None when it is gone.
+    fn screen(self, uid: &str) -> Option<String> {
+        match self {
+            Terminal::Iterm => osascript(&format!("{FIND}{CONTENTS}"), &[uid])
+                .ok()
+                .filter(|screen| screen != "__GONE__"),
+            Terminal::Tmux => tmux(&["capture-pane", "-p", "-t", uid]).ok(),
+        }
+    }
+
+    /// Types `text` (none: only the key), then the key on its own: written
+    /// together, Claude Code takes the newline as part of the text.
+    fn press(self, uid: &str, text: &str, key: Key) {
+        match self {
+            Terminal::Iterm => {
+                let key = match key {
+                    Key::Enter => "enter",
+                    Key::Down => "down",
+                };
+                let _ = osascript(&format!("{FIND}{TYPE}"), &[uid, text, key]);
+            }
+            Terminal::Tmux => {
+                if !text.is_empty() {
+                    let _ = tmux(&["send-keys", "-t", uid, "-l", "--", text]);
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                let key = match key {
+                    Key::Enter => "Enter",
+                    Key::Down => "Down",
+                };
+                let _ = tmux(&["send-keys", "-t", uid, key]);
+            }
+        }
+    }
+
+    fn notify(self, summary: &str) {
+        if self == Terminal::Iterm {
+            let _ = osascript(
+                "on run argv\ndisplay notification (item 1 of argv) with title \"Workshop\"\nend run",
+                &[summary],
+            );
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Piloted {
     pub uid: String,
     pub name: String,
     pub texts: Vec<String>,
     pub resume_full: bool,
+    pub terminal: Terminal,
 }
 
 fn log(message: &str) {
@@ -374,18 +470,14 @@ pub fn pilot(plan: Vec<Piloted>) {
     let mut ready_since: BTreeMap<String, Instant> = BTreeMap::new();
     let mut downs: BTreeMap<String, u32> = BTreeMap::new();
     let mut report = Vec::new();
-    let find_and = |script: &str| format!("{FIND}{script}");
     while !waiting.is_empty() && started.elapsed() < PILOT_TIMEOUT {
         let mut done = Vec::new();
         for pane in &waiting {
-            let Ok(screen) = osascript(&find_and(CONTENTS), &[&pane.uid]) else {
-                continue;
-            };
-            if screen == "__GONE__" {
+            let Some(screen) = pane.terminal.screen(&pane.uid) else {
                 report.push(format!("{}: tab closed", pane.name));
                 done.push(pane.uid.clone());
                 continue;
-            }
+            };
             let lines: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
             let bottom = lines[lines.len().saturating_sub(SCREEN_TAIL)..].join("\n");
             if bottom.contains("Enter to confirm") {
@@ -400,13 +492,13 @@ pub fn pilot(plan: Vec<Piloted>) {
                         .lines()
                         .any(|line| line.trim_start().strip_prefix('❯').is_some_and(|rest| rest.trim_start().starts_with(choice)));
                     if highlighted {
-                        let _ = osascript(&find_and(TYPE), &[&pane.uid, "", "enter"]);
+                        pane.terminal.press(&pane.uid, "", Key::Enter);
                         log(&format!("{}: question \"{sign}\" → {choice}", pane.name));
                         if choice.starts_with("Resume") {
                             report.push(format!("{}: {choice}", pane.name));
                         }
                     } else if downs.get(&pane.uid).copied().unwrap_or(0) < 6 {
-                        let _ = osascript(&find_and(TYPE), &[&pane.uid, "", "down"]);
+                        pane.terminal.press(&pane.uid, "", Key::Down);
                         *downs.entry(pane.uid.clone()).or_default() += 1;
                     }
                 }
@@ -421,7 +513,7 @@ pub fn pilot(plan: Vec<Piloted>) {
                 continue; // let the resumed session finish drawing
             }
             for text in &pane.texts {
-                let _ = osascript(&find_and(TYPE), &[&pane.uid, text, "enter"]);
+                pane.terminal.press(&pane.uid, text, Key::Enter);
                 std::thread::sleep(Duration::from_secs(2));
             }
             log(&format!("{}: typed {:?}", pane.name, pane.texts));
@@ -438,11 +530,58 @@ pub fn pilot(plan: Vec<Piloted>) {
     } else {
         report.join("; ")
     };
-    let _ = osascript(
-        "on run argv\ndisplay notification (item 1 of argv) with title \"Workshop\"\nend run",
-        &[&summary],
-    );
+    if let Some(pane) = plan.first() {
+        pane.terminal.notify(&summary);
+    }
     log(&format!("pilot: done — {summary}"));
+}
+
+/// iTerm tabs of side-by-side panes; returns the panes' unique ids.
+fn iterm_layout(layout: &[Vec<(PathBuf, String)>], here: bool, current: &str) -> Result<Vec<String>> {
+    let tabs: Vec<String> = layout
+        .iter()
+        .map(|panes| panes.iter().map(|(_, line)| line.as_str()).collect::<Vec<_>>().join("|||"))
+        .collect();
+    let mut args: Vec<&str> = vec![if here { "current" } else { "new" }, current];
+    args.extend(tabs.iter().map(String::as_str));
+    Ok(osascript(&format!("{FIND}{LAYOUT}"), &args)?
+        .lines()
+        .map(str::to_string)
+        .collect())
+}
+
+/// tmux windows of side-by-side panes, in the current tmux session or in
+/// `session` (created when missing); returns the pane ids.
+fn tmux_layout(layout: &[Vec<(PathBuf, String)>], here: bool, current: Option<&str>, session: &str) -> Result<Vec<String>> {
+    let target = match current {
+        Some(pane) => tmux(&["display-message", "-p", "-t", pane, "#{session_name}"])?,
+        None => session.to_string(),
+    };
+    let mut fresh = current.is_none() && tmux(&["has-session", "-t", &format!("={target}")]).is_err();
+    let mut ids = Vec::new();
+    for (i, panes) in layout.iter().enumerate() {
+        let mut previous: Option<String> = None;
+        for (j, (cwd, line)) in panes.iter().enumerate() {
+            let cwd = cwd.display().to_string();
+            let id = if i == 0 && j == 0 && here {
+                current.unwrap_or_default().to_string()
+            } else if let Some(previous) = &previous {
+                tmux(&["split-window", "-h", "-t", previous, "-c", &cwd, "-P", "-F", "#{pane_id}"])?
+            } else if fresh {
+                fresh = false;
+                tmux(&["new-session", "-d", "-s", &target, "-c", &cwd, "-x", "200", "-y", "50", "-P", "-F", "#{pane_id}"])?
+            } else {
+                tmux(&["new-window", "-t", &format!("{target}:"), "-c", &cwd, "-P", "-F", "#{pane_id}"])?
+            };
+            if !line.is_empty() {
+                tmux(&["send-keys", "-t", &id, "-l", "--", line])?;
+                tmux(&["send-keys", "-t", &id, "Enter"])?;
+            }
+            previous = Some(id.clone());
+            ids.push(id);
+        }
+    }
+    Ok(ids)
 }
 
 /// `asp workshop [PROFILE] [--force] [--only SESSION]`.
@@ -473,18 +612,23 @@ pub fn open(profile: Option<&str>, force: bool, only: Option<&str>) -> Result<()
             );
         }
     }
-    let current = std::env::var("ITERM_SESSION_ID")
-        .ok()
-        .and_then(|id| id.split_once(':').map(|(_, uid)| uid.to_string()))
-        .unwrap_or_default();
-    // --only opens its tab next to this one: the current tab is never turned into it.
-    let mode = if only.is_some() || current.is_empty() { "new" } else { "current" };
+    let terminal = settings.terminal.unwrap_or_else(Terminal::detect);
+    // The pane this command runs in becomes the first Claude, except with
+    // --only, which opens its tab next to this one.
+    let current = match terminal {
+        Terminal::Iterm => std::env::var("ITERM_SESSION_ID")
+            .ok()
+            .and_then(|id| id.split_once(':').map(|(_, uid)| uid.to_string())),
+        Terminal::Tmux => std::env::var("TMUX_PANE").ok().filter(|_| std::env::var_os("TMUX").is_some()),
+    }
+    .filter(|uid| !uid.is_empty());
+    let here = only.is_none() && current.is_some();
     println!("Workshop with profile {profile_name} ({})", profile.display());
-    let mut layout = Vec::new();
+    let mut layout: Vec<Vec<(PathBuf, String)>> = Vec::new();
     let mut plan = Vec::new();
     let mut first: Option<(PathBuf, Vec<String>)> = None;
     for (i, tab) in tabs.iter().enumerate() {
-        let mut commands = Vec::new();
+        let mut panes = Vec::new();
         for (j, pane) in tab.panes.iter().enumerate() {
             let cwd = folder_of(pane);
             let id = find_session(&profile, &cwd, &pane.session);
@@ -492,27 +636,29 @@ pub fn open(profile: Option<&str>, force: bool, only: Option<&str>) -> Result<()
                 if id.is_some() { settings.texts.clone() } else { settings.type_new.clone() }
             });
             println!("  {:16} {}{}", pane.session, pane.dir, if id.is_some() { "" } else { "   (new session)" });
-            plan.push(Piloted { uid: String::new(), name: pane.session.clone(), texts, resume_full: settings.resume_full });
+            plan.push(Piloted { uid: String::new(), name: pane.session.clone(), texts, resume_full: settings.resume_full, terminal });
             let argv = claude_argv(&settings, &pane.session, id.as_deref());
-            if i == 0 && j == 0 && mode == "current" {
-                first = Some((cwd, argv));
-                commands.push(String::new());
+            if i == 0 && j == 0 && here {
+                first = Some((cwd.clone(), argv));
+                panes.push((cwd, String::new()));
             } else {
                 let command = argv.iter().map(|w| quote(w)).collect::<Vec<_>>().join(" ");
-                commands.push(format!(
+                let line = format!(
                     "cd {} && env CLAUDE_CONFIG_DIR={} {command}",
                     quote(&cwd.display().to_string()),
                     quote(&profile.display().to_string())
-                ));
+                );
+                panes.push((cwd, line));
             }
         }
-        layout.push(commands.join("|||"));
+        layout.push(panes);
     }
-    let mut args: Vec<&str> = vec![mode, &current];
-    args.extend(layout.iter().map(String::as_str));
-    let ids = osascript(&format!("{FIND}{LAYOUT}"), &args)?;
-    for (pane, uid) in plan.iter_mut().zip(ids.lines()) {
-        pane.uid = uid.to_string();
+    let ids = match terminal {
+        Terminal::Iterm => iterm_layout(&layout, here, current.as_deref().unwrap_or(""))?,
+        Terminal::Tmux => tmux_layout(&layout, here, current.as_deref(), &settings.tmux_session)?,
+    };
+    for (pane, uid) in plan.iter_mut().zip(ids) {
+        pane.uid = uid;
     }
     let exe = std::env::current_exe().context("current executable")?;
     {
@@ -525,6 +671,9 @@ pub fn open(profile: Option<&str>, force: bool, only: Option<&str>) -> Result<()
             .process_group(0)
             .spawn()
             .context("pilot")?;
+    }
+    if terminal == Terminal::Tmux && current.is_none() {
+        println!("Opened in tmux session \"{}\": tmux attach -t {}", settings.tmux_session, settings.tmux_session);
     }
     if let Some((cwd, argv)) = first {
         // This tab becomes the workshop's first Claude.

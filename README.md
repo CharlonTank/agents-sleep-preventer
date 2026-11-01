@@ -181,6 +181,7 @@ disk_free_gb = 30         # alert under this much free disk (critical: disk_free
 
 [workshop]
 projects_dir = "~/projects"
+terminal = "tmux"         # or "iterm"; default: tmux over SSH or inside tmux, else iTerm
 
 [[workshop.tab]]          # one tab; two panes side by side
 panes = [{ dir = "my-app", session = "dev" }, { dir = "my-app", session = "review" }]
