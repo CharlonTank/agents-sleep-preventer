@@ -51,9 +51,9 @@ Install this tool. Your computer stays awake while your agent works; normal slee
 - A macOS menu bar app or Windows tray app, with automatic and manual sleep controls
 - Auto-resume on macOS: when a network drop cuts Claude Code or Codex off, it types "continue" into the agent's terminal once the connection is back
 - Safety nets on macOS: a nightly sleep time, and sleep at low battery (10% by default), even with agents still working
-- Telegram on macOS: talk to every Claude Code session from your phone through your own bot (`asp telegram setup`, then `/telegram` in a session), voice notes transcribed locally
-- RAM and disk watch on macOS: names the session behind a memory or disk drift, by notification and on Telegram
-- Workshop on macOS: `asp workshop` opens your named Claude Code sessions in iTerm in one go
+- Telegram on macOS and Linux: talk to every Claude Code session from your phone through your own bot (`asp telegram setup`, then `/telegram` in a session), voice notes transcribed locally
+- RAM and disk watch on macOS and Linux: names the session behind a memory or disk drift, by notification and on Telegram
+- Workshop on macOS and Linux: `asp workshop` opens your named Claude Code sessions in iTerm or tmux in one go
 
 - Local voice dictation with a customizable hotkey: hold Fn+Shift on macOS, toggle Ctrl+Alt+Space on Windows
 - Two dictation engines: Whisper (best accuracy, custom vocabulary) or Parakeet v3 (near-instant transcription)
@@ -67,14 +67,26 @@ Install this tool. Your computer stays awake while your agent works; normal slee
 
 ### Linux server (Telegram, RAM and disk watch, workshop)
 
-For a machine that never turns off, without a desktop:
+For a machine that never turns off, without a desktop. Download the archive from GitHub, check it, then install it (no root needed):
 
 ```bash
-curl -fsSL https://asp.charlon.dev/install.sh | sh
-asp telegram setup
+curl -fLO https://github.com/CharlonTank/agents-sleep-preventer/releases/download/v5.7.0/AgentsSleepPreventer-5.7.0-linux-x86_64.tar.gz
+sha256sum AgentsSleepPreventer-5.7.0-linux-x86_64.tar.gz   # same as on the release page and on asp.charlon.dev?
+tar -xzf AgentsSleepPreventer-5.7.0-linux-x86_64.tar.gz asp
+install -Dm755 asp ~/.local/bin/asp
+~/.local/bin/asp service install
+~/.local/bin/asp telegram setup
 ```
 
-It installs `asp` in `~/.local/bin`, plus a systemd user service (`asp serve`) that watches RAM and disk and alerts you on Telegram. Your Claude Code sessions run in tmux: `asp workshop` opens them (`[workshop]` in `~/.local/share/AgentsSleepPreventer/config.toml`), and `/telegram` in each lets you drive them from your phone. Voice notes need ffmpeg (`sudo apt install ffmpeg`); setup offers the transcription model. Linux has no menu bar, dictation or sleep prevention.
+Or the same steps as a script, [install.sh](https://asp.charlon.dev/install.sh), which checks the SHA-256 for you and stops if it doesn't match. Read it before you run it:
+
+```bash
+curl -fsSL https://asp.charlon.dev/install.sh -o install.sh
+less install.sh
+sh install.sh
+```
+
+Either way you get `asp` in `~/.local/bin`, plus a systemd user service (`asp serve`) that watches RAM and disk and alerts you on Telegram. Your Claude Code sessions run in tmux: `asp workshop` opens them (`[workshop]` in `~/.local/share/AgentsSleepPreventer/config.toml`), and `/telegram` in each lets you drive them from your phone. Voice notes need ffmpeg (`sudo apt install ffmpeg`); setup offers the transcription model. Linux has no menu bar, dictation or sleep prevention. To remove it: `asp service uninstall`, then delete `~/.local/bin/asp`.
 
 ### Windows 10 / 11
 
@@ -113,6 +125,27 @@ cd agents-sleep-preventer
 cargo build --release
 ./target/release/asp install
 ```
+
+---
+
+## Trust and Privacy
+
+Before you install something that keeps your computer awake and talks to your agents, here is exactly what it does:
+
+- **Open source, MIT.** All the code is here. The Windows and Linux downloads are built by [GitHub Actions](https://github.com/CharlonTank/agents-sleep-preventer/actions), in public, from this code. Each release lists the SHA-256 of every file, and [asp.charlon.dev](https://asp.charlon.dev/#install) publishes them too.
+- **Signed and notarized.** The Mac app is signed with an Apple Developer ID and notarized by Apple. Updates go through Sparkle, signed with an EdDSA key: the app refuses an update that isn't signed.
+- **No account, no tracking.** No sign-up, no analytics, no server of ours. The app only goes online to:
+  - check for updates on GitHub;
+  - download a dictation model from Hugging Face when you ask;
+  - see whether the network is back after a drop, for auto-resume (one request to the agent's API, with no credentials and no data);
+  - reach Telegram, if you connect your own bot.
+- **Local voice.** Dictation and Telegram voice notes are transcribed on your computer. Telegram messages go straight between your computer and your own bot. Its token stays in the macOS Keychain, or on Linux in a file only you can read.
+- **What setup changes on a Mac:**
+  - hooks in Claude Code and Codex (your own hooks are kept);
+  - a LaunchAgent;
+  - one sudo rule, `/etc/sudoers.d/agents-pmset`, limited to `pmset -a disablesleep 0|1`, `pmset -a sleep 5` and `pmset sleepnow`. Nothing else gets admin rights.
+
+  `asp uninstall` removes all of it.
 
 ---
 

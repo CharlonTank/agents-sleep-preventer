@@ -1,6 +1,7 @@
 name: Install script
 
-# The one-line Linux install from the website, against the latest release.
+# The Linux install script from the website, against the latest release, run
+# the way the site tells people to: download it, then run it.
 on:
   workflow_dispatch:
   schedule:
@@ -14,7 +15,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Install from the website
-        run: curl -fsSL https://asp.charlon.dev/install.sh | sh
+        run: |
+          curl -fsSL https://asp.charlon.dev/install.sh -o install.sh
+          sh install.sh | tee install.log
+          grep -q "SHA-256 checked" install.log
       - name: Use it
         run: |
           export PATH="$HOME/.local/bin:$PATH"
