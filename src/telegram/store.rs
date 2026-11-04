@@ -201,6 +201,22 @@ impl Fields for Object {
 }
 
 #[cfg(test)]
+impl Store {
+    /// The lock is free, or becomes so within a second: a test running in
+    /// parallel may spawn a process right as it is released, and the child
+    /// shares the lock until it execs, a few milliseconds.
+    pub(crate) fn released(&self, name: &str) -> bool {
+        (0..100).any(|_| {
+            let free = !self.held(name);
+            if !free {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            free
+        })
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -213,16 +229,7 @@ mod tests {
         assert!(store.lock("poll", false).is_none());
         assert!(store.held("poll"));
         drop(first);
-        // A test running in parallel may fork right then: its child shares
-        // the lock until it execs, a few milliseconds.
-        let released = (0..100).any(|_| {
-            let free = !store.held("poll");
-            if !free {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            free
-        });
-        assert!(released);
+        assert!(store.released("poll"));
     }
 
     #[test]

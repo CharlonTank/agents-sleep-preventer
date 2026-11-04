@@ -29,6 +29,17 @@ struct AgentInstance {
     /// Auto-resume status after a network drop cut the agent's turn off.
     var resumeNote: String? = nil
     var tasks: [AgentTask] = []
+    /// Claude Code: the session's name (/rename) and its profile.
+    var name: String? = nil
+    var profile: String? = nil
+}
+
+/// A Claude Code profile (CLAUDE_CONFIG_DIR) and the account it uses.
+struct ProfileInfo {
+    let name: String
+    let dir: String
+    let account: String?
+    let sessions: Int
 }
 
 struct AgentGroup {
@@ -37,6 +48,23 @@ struct AgentGroup {
     let branch: String
     let state: AgentState
     let instances: [AgentInstance]
+
+    /// Named sessions get a row each, so all instances share it.
+    var name: String? {
+        instances[0].name
+    }
+
+    var profile: String? {
+        instances[0].profile
+    }
+
+    /// The project, then the session's name when it says something more.
+    var title: String {
+        guard let name, !name.isEmpty, name.lowercased() != project.lowercased() else {
+            return project
+        }
+        return "\(project) · \(name)"
+    }
 
     var primaryPid: Int {
         instances[0].pid
@@ -86,6 +114,8 @@ struct InstanceList {
     /// On battery at or below that charge right now: agents no longer keep
     /// the Mac awake.
     var lowBattery: Bool = false
+    /// Claude Code profiles and their accounts.
+    var profiles: [ProfileInfo] = []
 
     static let empty = InstanceList(
         agents: [], activeCount: 0, hooksInstalled: true, sleepDisabled: false,
@@ -97,7 +127,7 @@ struct InstanceList {
             sleepDisabled: sleepDisabled, manualEnabled: manualEnabled,
             force: value, thermalWarning: thermalWarning, sleepBy: sleepBy,
             autoResume: autoResume, bedtime: bedtime, lowBatterySleep: lowBatterySleep,
-            lowBattery: lowBattery)
+            lowBattery: lowBattery, profiles: profiles)
     }
 
     func agents(in state: AgentState) -> [AgentInstance] {
@@ -109,11 +139,12 @@ struct InstanceList {
         var grouped: [String: [AgentInstance]] = [:]
 
         for agent in agents(in: state).sorted(by: {
-            let left = ($0.project.lowercased(), $0.kind.lowercased(), $0.branch.lowercased(), $0.pid)
-            let right = ($1.project.lowercased(), $1.kind.lowercased(), $1.branch.lowercased(), $1.pid)
+            let left = ($0.project.lowercased(), $0.kind.lowercased(), ($0.name ?? "").lowercased(), $0.pid)
+            let right = ($1.project.lowercased(), $1.kind.lowercased(), ($1.name ?? "").lowercased(), $1.pid)
             return left < right
         }) {
-            let key = "\(agent.kind)\u{1f}\(agent.project)\u{1f}\(agent.branch)"
+            // A named session is told apart from the project's others.
+            let key = "\(agent.kind)\u{1f}\(agent.project)\u{1f}\(agent.branch)\u{1f}\(agent.name ?? "")\u{1f}\(agent.name == nil ? "" : String(agent.pid))"
             if grouped[key] == nil {
                 order.append(key)
             }
@@ -253,6 +284,8 @@ private final class AgentPopoverViewController: NSViewController {
 
     private var currentList = InstanceList.empty
     private var showAllIdle = false
+    /// Several Claude Code profiles: each row says which one it runs under.
+    private var showsProfiles = false
     private var updateAvailable = false
 
     func setUpdateAvailable(_ available: Bool) {
@@ -309,12 +342,14 @@ private final class AgentPopoverViewController: NSViewController {
         root.addArrangedSubview(footer)
         footer.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
 
+        // The header's third line: the Claude account in use.
+        let accountLine = accountText(for: list.profiles) == nil ? 0 : 16
         NSLayoutConstraint.activate([
             root.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             root.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             root.topAnchor.constraint(equalTo: view.topAnchor),
             root.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            header.heightAnchor.constraint(equalToConstant: 76),
+            header.heightAnchor.constraint(equalToConstant: 76 + CGFloat(accountLine)),
             forceAwakeRow.heightAnchor.constraint(equalToConstant: list.force == .whenDone ? 76 : 46),
             footer.heightAnchor.constraint(equalToConstant: 50),
             scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 120),
@@ -325,7 +360,8 @@ private final class AgentPopoverViewController: NSViewController {
             + list.groups(in: .idle).prefix(showAllIdle ? 8 : 3)
         let rowsHeight = visibleGroups.reduce(0) { $0 + 54 + detailLines(for: $1).count * 15 }
         let limitLine = list.force == .whenDone ? 30 : 0
-        let height = min(716, max(376, 226 + limitLine + rowsHeight))
+        let accountsHeight = showsAccountsSection(list) ? 34 + list.profiles.count * 20 : 0
+        let height = min(716, max(376, 226 + accountLine + limitLine + rowsHeight + accountsHeight))
         // The 4-segment control's width follows the system's font metrics;
         // with a fixed 390pt it overflowed and the popover clipped its right
         // edge (issue #10). Widen to whatever the control and its margins need.
@@ -337,7 +373,15 @@ private final class AgentPopoverViewController: NSViewController {
         let container = NSView()
         let title = label("Agents", size: 17, weight: .semibold, color: .labelColor)
         let summary = label(summaryText(for: list), size: 12, color: .secondaryLabelColor)
-        let textStack = NSStackView(views: [title, summary])
+        var lines: [NSView] = [title, summary]
+        if let account = accountText(for: list.profiles) {
+            let field = label(account.text, size: 11, color: .tertiaryLabelColor)
+            field.lineBreakMode = .byTruncatingMiddle
+            field.toolTip = account.toolTip
+            field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            lines.append(field)
+        }
+        let textStack = NSStackView(views: lines)
         textStack.orientation = .vertical
         textStack.alignment = .leading
         textStack.spacing = 3
@@ -351,10 +395,27 @@ private final class AgentPopoverViewController: NSViewController {
         NSLayoutConstraint.activate([
             textStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 18),
             textStack.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            textStack.topAnchor.constraint(greaterThanOrEqualTo: container.topAnchor, constant: 12),
+            status.leadingAnchor.constraint(greaterThanOrEqualTo: textStack.trailingAnchor, constant: 12),
             status.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -18),
             status.centerYAnchor.constraint(equalTo: container.centerYAnchor),
         ])
         return container
+    }
+
+    /// The Claude account in use, under the summary: the one every profile
+    /// shares, or how many there are (each profile's is listed below).
+    private func accountText(for profiles: [ProfileInfo]) -> (text: String, toolTip: String)? {
+        let accounts = Set(profiles.compactMap(\.account))
+        guard !accounts.isEmpty else { return nil }
+        let detail = profiles
+            .map { "\($0.name) (\($0.dir)): \($0.account ?? "no account")" }
+            .joined(separator: "\n")
+        if accounts.count == 1, let account = accounts.first {
+            let scope = profiles.count > 1 ? "  ·  all \(profiles.count) profiles" : ""
+            return ("Claude: \(account)\(scope)", detail)
+        }
+        return ("\(accounts.count) Claude accounts  ·  \(profiles.count) profiles", detail)
     }
 
     private func makeAgentList(for list: InstanceList) -> NSScrollView {
@@ -383,6 +444,7 @@ private final class AgentPopoverViewController: NSViewController {
             stack.bottomAnchor.constraint(equalTo: document.bottomAnchor),
         ])
 
+        showsProfiles = list.profiles.count > 1
         let attention = list.groups(in: .attention)
         let working = list.groups(in: .working)
         let idle = list.groups(in: .idle)
@@ -426,7 +488,7 @@ private final class AgentPopoverViewController: NSViewController {
 
             if idle.count > 3 {
                 let hiddenCount = idle.count - 3
-                let title = showAllIdle ? "Show less" : "Show \(hiddenCount) more idle projects"
+                let title = showAllIdle ? "Show less" : "Show \(hiddenCount) more idle"
                 let showMore = NSButton(title: title, target: self, action: #selector(toggleIdle))
                 showMore.isBordered = false
                 showMore.font = NSFont.systemFont(ofSize: 11, weight: .medium)
@@ -435,7 +497,45 @@ private final class AgentPopoverViewController: NSViewController {
             }
         }
 
+        if showsAccountsSection(list) {
+            let accounts = makeAccountsSection(list.profiles)
+            stack.addArrangedSubview(accounts)
+            accounts.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true
+        }
+
         return scrollView
+    }
+
+    private func showsAccountsSection(_ list: InstanceList) -> Bool {
+        Set(list.profiles.map { $0.account ?? "" }).count > 1
+    }
+
+    /// Which Claude account each profile uses, when they don't all share one.
+    private func makeAccountsSection(_ profiles: [ProfileInfo]) -> NSView {
+        let section = NSStackView()
+        section.orientation = .vertical
+        section.alignment = .leading
+        section.spacing = 4
+        section.addArrangedSubview(
+            label("CLAUDE ACCOUNTS", size: 10, weight: .semibold, color: .tertiaryLabelColor))
+
+        func sessions(_ count: Int) -> String {
+            count == 0 ? "no session" : count == 1 ? "1 session" : "\(count) sessions"
+        }
+        let lines = profiles.map { profile in
+            (
+                text: "\(profile.name)  ·  \(profile.account ?? "not logged in with an account")  ·  \(sessions(profile.sessions))",
+                toolTip: profile.dir
+            )
+        }
+        for line in lines {
+            let field = label(line.text, size: 11, color: .secondaryLabelColor)
+            field.lineBreakMode = .byTruncatingMiddle
+            field.toolTip = line.toolTip
+            field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            section.addArrangedSubview(field)
+        }
+        return section
     }
 
     private func makeSection(
@@ -463,7 +563,7 @@ private final class AgentPopoverViewController: NSViewController {
     private func makeAgentRow(_ group: AgentGroup) -> AgentRowView {
         let row = AgentRowView()
         row.toolTip = group.instances.first?.cwd
-        row.setAccessibilityLabel("\(group.project), \(group.kind), \(statusText(for: group))")
+        row.setAccessibilityLabel("\(group.title), \(group.kind), \(statusText(for: group))")
         row.onClick = { [weak self] in self?.onFocus?(group.primaryPid) }
 
         let color = stateColor(group.state)
@@ -477,7 +577,7 @@ private final class AgentPopoverViewController: NSViewController {
         initials.translatesAutoresizingMaskIntoConstraints = false
         badge.addSubview(initials)
 
-        let project = label(group.project, size: 13, weight: .semibold, color: .labelColor)
+        let project = label(group.title, size: 13, weight: .semibold, color: .labelColor)
         project.lineBreakMode = .byTruncatingMiddle
         let metadata = label(metadataText(for: group), size: 11, color: .secondaryLabelColor)
         metadata.lineBreakMode = .byTruncatingTail
@@ -839,6 +939,9 @@ private final class AgentPopoverViewController: NSViewController {
         var parts = [group.kind]
         if !group.branch.isEmpty {
             parts.append(group.branch)
+        }
+        if showsProfiles, let profile = group.profile {
+            parts.append(profile)
         }
         if group.instances.count > 1 {
             parts.append("\(group.instances.count) sessions")
@@ -1486,13 +1589,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let bedtime = json["bedtime"] as? String
         let lowBatterySleep = (json["low_battery_sleep"] as? NSNumber)?.intValue
         let lowBattery = (json["low_battery"] as? NSNumber)?.boolValue ?? false
+        let profiles = (json["profiles"] as? [[String: Any]] ?? []).compactMap { item -> ProfileInfo? in
+            guard let name = item["name"] as? String else { return nil }
+            return ProfileInfo(
+                name: name,
+                dir: item["dir"] as? String ?? "",
+                account: item["account"] as? String,
+                sessions: (item["sessions"] as? NSNumber)?.intValue ?? 0
+            )
+        }
 
         return InstanceList(
             agents: agents, activeCount: activeCount, hooksInstalled: hooksInstalled,
             sleepDisabled: sleepDisabled, manualEnabled: manualEnabled,
             force: force, thermalWarning: thermalWarning, sleepBy: sleepBy,
             autoResume: autoResume, bedtime: bedtime, lowBatterySleep: lowBatterySleep,
-            lowBattery: lowBattery)
+            lowBattery: lowBattery, profiles: profiles)
     }
 
     private func parseAgents(from json: [String: Any]) -> [AgentInstance] {
@@ -1528,7 +1640,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     ageSecs: (item["age_secs"] as? NSNumber)?.intValue,
                     attentionReason: item["attention_reason"] as? String,
                     resumeNote: item["resume_note"] as? String,
-                    tasks: tasks
+                    tasks: tasks,
+                    name: item["name"] as? String,
+                    profile: item["profile"] as? String
                 )
             }
         }
@@ -1757,7 +1871,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     waiting.attentionReason = "Claude needs your permission to use Bash"
                     return waiting
                 }(),
-                agent(16599, "Claude Code", "cleemo-lamdera", .attention),
+                {
+                    var seo = agent(16599, "Claude Code", "cleemo-lamdera", .attention)
+                    seo.name = "seo"
+                    seo.profile = "work"
+                    return seo
+                }(),
+                {
+                    var dev = agent(16600, "Claude Code", "cleemo-lamdera", .working, age: 300)
+                    dev.name = "dev"
+                    dev.profile = "work"
+                    return dev
+                }(),
                 agent(14433, "Claude Code", "webhealth", .attention),
                 agent(18206, "Claude Code", "capitole-immo-vision", .attention),
                 agent(19729, "Claude Code", "thai-chess", .attention),
@@ -1781,7 +1906,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             sleepDisabled: true,
             manualEnabled: true,
             force: .auto,
-            thermalWarning: false
+            thermalWarning: false,
+            profiles: [
+                ProfileInfo(name: "default", dir: "~/.claude", account: "me@example.com", sessions: 8),
+                ProfileInfo(name: "work", dir: "~/.claude-work", account: "me@company.example", sessions: 2),
+            ]
         )
     }
 

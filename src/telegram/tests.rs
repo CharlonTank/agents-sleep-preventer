@@ -592,8 +592,8 @@ fn one_listener_reads_for_all_and_returns_its_own() {
     assert_eq!(h.offset(), "9");
     let reactions = h.calls("setMessageReaction");
     assert_eq!(reactions.iter().map(|p| p.get("message_id").unwrap()).collect::<Vec<_>>(), ["61"]);
-    assert!(!h.bot.listening("acme-backend"));
-    assert!(!h.bot.store.held("poll"));
+    assert!(h.bot.store.released("session.acme-backend"));
+    assert!(h.bot.store.released("poll"));
 }
 
 #[test]

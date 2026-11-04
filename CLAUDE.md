@@ -134,6 +134,15 @@ Hooks spool JSON to `runtime_dir::notifications_dir()`; the running app (menubar
 - Needs attention: Claude Code `Notification` hook → `~/.claude/hooks/agent-attention.sh` → `asp attention` (reads hook JSON on stdin, extracts `.message`). The attention marker file stores that message; `asp list` returns it as `attention_reason` and the menu shows it under the project.
 - "Needs you" reconciliation reads Claude Code's own `<profile>/sessions/<pid>.json` status in every profile dir (`claude_config_dirs`), not only `~/.claude`: a session on `~/.claude-evo` otherwise stayed "Needs you" for up to 6h.
 - `asp list` also returns each agent's running Bash tasks (`tasks`: outermost `shell-snapshots` wrapper + the command from its `eval '…'`). The menu lists them with a Stop button → `asp stop-tasks <agent pid>…`, which SIGTERMs each task's whole process tree (only Bash tasks of live agents, never the caller's own chain).
+- Session names, profiles and accounts. `asp list` gives each Claude Code session:
+  - its `name`, from Claude Code's `<profile>/sessions/<pid>.json` (`/rename`, else the one Claude Code made up);
+  - its `profile`, from `CLAUDE_CONFIG_DIR` in the process's environment (read from `KERN_PROCARGS2`, after argv; macOS hides it for Apple's own binaries, not for Claude Code). Several profiles may share one `sessions/` dir, so the file's location doesn't tell.
+
+  `profiles` lists each profile with its account: `oauthAccount.emailAddress` of `<profile>/.claude.json`, and for `~/.claude` the fresher of that and `~/.claude.json`.
+
+  The menu gives a named session its own row ("project · name"), adds the profile to the row when there are several, puts the account in the header, and adds a "Claude accounts" block when profiles use different accounts. `asp sessions` prints the same view, grouped by project.
+
+  Accounts used by no profile, quotas and switching accounts stay out of ASP (no quota tracking).
 - `claude --chrome-native-host` is Chrome's extension bridge, not a session: `classify_agent_process` ignores it. The login shell that writes Claude Code's shell snapshot (`SNAPSHOT_FILE=…`) before a session's first Bash call is not a task.
 - Toggle in Settings tab 1 (`notifications.enabled`, default true).
 

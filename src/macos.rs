@@ -150,6 +150,8 @@ enum Commands {
     Status,
     /// List active/inactive instances as JSON
     List,
+    /// Your sessions by project, with their names, profiles and accounts
+    Sessions,
     /// Focus an agent instance by PID
     Focus { pid: u32 },
     /// Stop the Bash tasks (background or running) started by these agents
@@ -267,6 +269,7 @@ fn main() -> Result<()> {
         Commands::Refresh { pid } => cmd_refresh(pid)?,
         Commands::Status => cmd_status()?,
         Commands::List => cmd_list()?,
+        Commands::Sessions => cmd_sessions(),
         Commands::Focus { pid } => cmd_focus(pid)?,
         Commands::StopTasks { pids } => cmd_stop_tasks(&pids)?,
         Commands::Cleanup => cmd_cleanup()?,
@@ -345,6 +348,11 @@ struct AgentListItem {
     branch: String,
     cwd: String,
     state: AgentState,
+    /// Claude Code: the session's name (/rename) and its profile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     age_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -526,6 +534,20 @@ fn argument_space() -> usize {
 }
 
 fn read_argv(pid: u32, buffer: &mut [u8]) -> Option<Vec<String>> {
+    let size = read_procargs(pid, buffer)?;
+    parse_procargs(&buffer[..size])
+}
+
+/// One variable of a process's environment (only the user's own processes
+/// are readable), e.g. the CLAUDE_CONFIG_DIR a session was started with.
+fn read_environment_variable(pid: u32, name: &str) -> Option<String> {
+    let mut buffer = vec![0u8; argument_space()];
+    let size = read_procargs(pid, &mut buffer)?;
+    parse_procargs_variable(&buffer[..size], name)
+}
+
+/// `KERN_PROCARGS2` into the buffer; its size.
+fn read_procargs(pid: u32, buffer: &mut [u8]) -> Option<usize> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
     let mut size = buffer.len();
     let status = unsafe {
@@ -538,27 +560,39 @@ fn read_argv(pid: u32, buffer: &mut [u8]) -> Option<Vec<String>> {
             0,
         )
     };
-    if status != 0 {
-        return None;
-    }
-    parse_procargs(&buffer[..size])
+    (status == 0).then_some(size)
 }
 
 /// `KERN_PROCARGS2`: argc, the executable path, NUL padding, then the
-/// NUL-terminated arguments (the environment follows).
-fn parse_procargs(buffer: &[u8]) -> Option<Vec<String>> {
+/// NUL-terminated arguments, then the environment. Gives argc and the
+/// strings from the first argument on.
+fn procargs_strings(buffer: &[u8]) -> Option<(usize, std::slice::Split<'_, u8, impl FnMut(&u8) -> bool>)> {
     let argc = i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?);
     let rest = &buffer[4..];
     let path_end = rest.iter().position(|&b| b == 0)?;
     let rest = &rest[path_end..];
     let args_start = rest.iter().position(|&b| b != 0)?;
+    Some((argc.max(0) as usize, rest[args_start..].split(|&b| b == 0)))
+}
+
+fn parse_procargs(buffer: &[u8]) -> Option<Vec<String>> {
+    let (argc, strings) = procargs_strings(buffer)?;
     Some(
-        rest[args_start..]
-            .split(|&b| b == 0)
-            .take(argc.max(0) as usize)
+        strings
+            .take(argc)
             .map(|arg| String::from_utf8_lossy(arg).into_owned())
             .collect(),
     )
+}
+
+fn parse_procargs_variable(buffer: &[u8], name: &str) -> Option<String> {
+    let (argc, strings) = procargs_strings(buffer)?;
+    let prefix = format!("{name}=");
+    strings
+        .skip(argc)
+        .take_while(|entry| !entry.is_empty())
+        .find_map(|entry| entry.strip_prefix(prefix.as_bytes()))
+        .map(|value| String::from_utf8_lossy(value).into_owned())
 }
 
 /// %CPU like `ps` shows it: the sum of the threads' recent CPU usage, read
@@ -989,13 +1023,54 @@ fn parse_claude_attention_status(content: &str) -> Option<ClaudeAttentionStatus>
 /// A reused PID can leave a stale file in another profile, so the most
 /// recently written one wins.
 fn claude_attention_status(home: &Path, pid: u32) -> Option<ClaudeAttentionStatus> {
+    claude_session_file(home, pid).and_then(|content| parse_claude_attention_status(&content))
+}
+
+/// Claude Code's own record of a session (`<profile>/sessions/<pid>.json`).
+fn claude_session_file(home: &Path, pid: u32) -> Option<String> {
     claude_config_dirs(home)
         .into_iter()
         .map(|dir| dir.join("sessions").join(format!("{pid}.json")))
         .filter_map(|path| Some((fs::metadata(&path).ok()?.modified().ok()?, path)))
         .max_by_key(|(modified, _)| *modified)
         .and_then(|(_, path)| fs::read_to_string(path).ok())
-        .and_then(|content| parse_claude_attention_status(&content))
+}
+
+/// The session's name: the one given with /rename, else the one Claude
+/// Code made up (from the folder or the conversation).
+fn claude_session_name(home: &Path, pid: u32) -> Option<String> {
+    let content = claude_session_file(home, pid)?;
+    let record: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let name = record.get("name")?.as_str()?.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// A Claude Code profile (CLAUDE_CONFIG_DIR), its account and its sessions.
+#[derive(Debug, Clone, Serialize)]
+struct ProfileSummary {
+    name: String,
+    dir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account: Option<String>,
+    sessions: usize,
+}
+
+fn profile_summaries(home: &Path, agents: &[AgentListItem]) -> Vec<ProfileSummary> {
+    claude_config_dirs(home)
+        .into_iter()
+        .map(|dir| {
+            let name = claude_profiles::profile_label(home, &dir);
+            ProfileSummary {
+                sessions: agents.iter().filter(|agent| agent.profile.as_deref() == Some(name.as_str())).count(),
+                account: claude_profiles::profile_account(home, &dir),
+                dir: dir
+                    .strip_prefix(home)
+                    .map(|rest| format!("~/{}", rest.display()))
+                    .unwrap_or_else(|_| dir.display().to_string()),
+                name,
+            }
+        })
+        .collect()
 }
 
 fn should_keep_attention_marker(
@@ -2202,6 +2277,7 @@ fn build_agent_list_items(
     cwds: &HashMap<u32, String>,
 ) -> Vec<AgentListItem> {
     let resume_notes = auto_resume::menu_notes();
+    let home = dirs::home_dir().unwrap_or_default();
     let process_by_pid = processes
         .iter()
         .map(|process| (process.pid, process))
@@ -2232,17 +2308,20 @@ fn build_agent_list_items(
             }
 
             let state = agent_state(attention.contains_key(&pid), working.contains_key(&pid));
+            let kind = process.and_then(|process| classify_agent_process(process));
+            let claude = kind == Some(AgentKind::Claude);
             AgentListItem {
                 pid,
-                kind: process
-                    .and_then(|process| classify_agent_process(process))
-                    .map(agent_kind_name)
-                    .unwrap_or("Agent")
-                    .to_string(),
+                kind: kind.map(agent_kind_name).unwrap_or("Agent").to_string(),
                 project: project_info.project,
                 branch: project_info.branch,
                 cwd,
                 state,
+                name: claude.then(|| claude_session_name(&home, pid)).flatten(),
+                profile: claude.then(|| {
+                    let config_dir = read_environment_variable(pid, "CLAUDE_CONFIG_DIR");
+                    claude_profiles::profile_label(&home, &claude_profiles::profile_dir(&home, config_dir.as_deref()))
+                }),
                 age_secs: (state == AgentState::Working)
                     .then(|| working.get(&pid).copied())
                     .flatten(),
@@ -2264,6 +2343,93 @@ fn build_agent_list_items(
             .then_with(|| left.pid.cmp(&right.pid))
     });
     agents
+}
+
+/// `asp sessions`: the menu's view as text, grouped by project.
+fn cmd_sessions() {
+    let processes = load_process_table();
+    let agent_processes = select_agent_processes(&processes);
+    let working = working_pid_ages();
+    let attention = attention_reasons(&processes);
+    let mut all_pids = agent_processes
+        .iter()
+        .map(|process| process.pid)
+        .collect::<BTreeSet<_>>();
+    all_pids.extend(working.keys().copied());
+    all_pids.extend(attention.keys().copied());
+    let cwd_by_pid = get_process_cwds(&all_pids.into_iter().collect::<Vec<_>>());
+    let agents = build_agent_list_items(&processes, &agent_processes, &working, &attention, &cwd_by_pid);
+    let profiles = profile_summaries(&dirs::home_dir().unwrap_or_default(), &agents);
+    print!("{}", format_sessions(&agents, &profiles));
+}
+
+fn format_sessions(agents: &[AgentListItem], profiles: &[ProfileSummary]) -> String {
+    let mut out = String::new();
+    if profiles.iter().any(|profile| profile.account.is_some() || profile.sessions > 0) {
+        out.push_str("Claude profiles\n");
+        let width = profiles.iter().map(|profile| profile.name.chars().count()).max().unwrap_or(0);
+        for profile in profiles {
+            let sessions = match profile.sessions {
+                0 => "no session".to_string(),
+                1 => "1 session".to_string(),
+                count => format!("{count} sessions"),
+            };
+            let account = profile.account.as_deref().unwrap_or("not logged in with an account");
+            out.push_str(&format!("  {:width$}  {account}  ·  {sessions}  ·  {}\n", profile.name, profile.dir));
+        }
+        out.push('\n');
+    }
+    if agents.is_empty() {
+        out.push_str("No agent sessions running.\n");
+        return out;
+    }
+    let mut sorted = agents.iter().collect::<Vec<_>>();
+    sorted.sort_by(|left, right| {
+        (left.project.to_lowercase(), left.state.priority(), left.name.as_deref().unwrap_or(""), left.pid).cmp(&(
+            right.project.to_lowercase(),
+            right.state.priority(),
+            right.name.as_deref().unwrap_or(""),
+            right.pid,
+        ))
+    });
+    let label = |agent: &AgentListItem| agent.name.clone().unwrap_or_else(|| agent.kind.clone());
+    let width = sorted.iter().map(|agent| label(agent).chars().count()).max().unwrap_or(0);
+    let several_profiles = profiles.len() > 1;
+    let profile_width = sorted
+        .iter()
+        .filter_map(|agent| agent.profile.as_ref())
+        .map(|profile| profile.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut project = None;
+    for agent in sorted {
+        if project != Some(&agent.project) {
+            let title = if agent.project.is_empty() { "Unknown project" } else { agent.project.as_str() };
+            out.push_str(&format!("{title}\n"));
+            project = Some(&agent.project);
+        }
+        let state = match agent.state {
+            AgentState::Attention => "needs you".to_string(),
+            AgentState::Working => match agent.age_secs {
+                Some(secs) if secs >= 3600 => format!("working {}h", secs / 3600),
+                Some(secs) if secs >= 60 => format!("working {}m", secs / 60),
+                _ => "working".to_string(),
+            },
+            AgentState::Idle => "idle".to_string(),
+        };
+        let mut details = vec![format!("{state:10}")];
+        if several_profiles {
+            if let Some(profile) = &agent.profile {
+                details.push(format!("{profile:profile_width$}"));
+            }
+        }
+        if !agent.branch.is_empty() {
+            details.push(agent.branch.clone());
+        }
+        details.push(format!("pid {}", agent.pid));
+        out.push_str(&format!("  {:width$}  {}\n", label(agent), details.join("  ·  ")));
+    }
+    out
 }
 
 fn cmd_list() -> Result<()> {
@@ -2335,8 +2501,10 @@ fn cmd_list() -> Result<()> {
     let sleep_disabled = is_sleep_disabled();
     let app_settings = settings::AppSettings::load();
     let prevention = &app_settings.sleep_prevention;
+    let profiles = profile_summaries(&dirs::home_dir().unwrap_or_default(), &agents);
     let payload = json!({
         "agents": agents,
+        "profiles": profiles,
         "active": active,
         "inactive": inactive,
         "sleep_disabled": sleep_disabled,
@@ -3821,6 +3989,64 @@ hooks = false
             ])
         );
         assert_eq!(parse_procargs(&[1, 0]), None);
+        // The environment follows the arguments; an argument that looks like
+        // a variable is not one.
+        let mut buffer = 2i32.to_ne_bytes().to_vec();
+        buffer.extend_from_slice(b"/usr/local/bin/claude\0\0\0");
+        buffer.extend_from_slice(b"claude\0CLAUDE_CONFIG_DIR=/argument\0");
+        buffer.extend_from_slice(b"HOME=/Users/x\0CLAUDE_CONFIG_DIR=/Users/x/.claude-work\0\0\0");
+        assert_eq!(
+            parse_procargs_variable(&buffer, "CLAUDE_CONFIG_DIR").as_deref(),
+            Some("/Users/x/.claude-work")
+        );
+        assert_eq!(parse_procargs_variable(&buffer, "SHELL"), None);
+    }
+
+    /// The environment the process started with (macOS hides it for Apple's
+    /// own binaries, like /bin/sleep, but not for others like this test or
+    /// Claude Code). No test changes PATH.
+    #[test]
+    fn this_process_environment_reads_back() {
+        assert_eq!(
+            read_environment_variable(std::process::id(), "PATH"),
+            std::env::var("PATH").ok()
+        );
+    }
+
+    #[test]
+    fn sessions_are_listed_by_project_with_their_names() {
+        let agent = |pid: u32, project: &str, name: Option<&str>, profile: &str, state: AgentState| AgentListItem {
+            pid,
+            kind: "Claude Code".to_string(),
+            project: project.to_string(),
+            branch: "main".to_string(),
+            cwd: String::new(),
+            state,
+            name: name.map(str::to_string),
+            profile: Some(profile.to_string()),
+            age_secs: None,
+            attention_reason: None,
+            resume_note: None,
+            tasks: Vec::new(),
+        };
+        let agents = vec![
+            agent(3, "nova-studio", Some("seo"), "work", AgentState::Idle),
+            agent(1, "acme-backend", Some("dev"), "default", AgentState::Working),
+            agent(2, "nova-studio", Some("dev"), "work", AgentState::Attention),
+        ];
+        let profiles = vec![
+            ProfileSummary { name: "default".into(), dir: "~/.claude".into(), account: Some("me@example.com".into()), sessions: 1 },
+            ProfileSummary { name: "work".into(), dir: "~/.claude-work".into(), account: None, sessions: 2 },
+        ];
+        let text = format_sessions(&agents, &profiles);
+        assert!(text.contains("default  me@example.com  ·  1 session  ·  ~/.claude"), "{text}");
+        assert!(text.contains("work     not logged in with an account  ·  2 sessions"), "{text}");
+        let acme = text.find("acme-backend\n").unwrap();
+        let nova = text.find("nova-studio\n").unwrap();
+        let waiting = text.find("dev  needs you").unwrap();
+        let idle = text.find("seo  idle").unwrap();
+        assert!(acme < nova && nova < waiting && waiting < idle, "{text}");
+        assert!(text.contains("work     ·  main  ·  pid 2"), "{text}");
     }
 
     /// argv[0] stays whole even with spaces (ps cut it at 16 characters).

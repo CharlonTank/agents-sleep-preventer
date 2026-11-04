@@ -53,6 +53,7 @@ Install this tool. Your computer stays awake while your agent works; normal slee
 - Safety nets on macOS: a nightly sleep time, and sleep at low battery (10% by default), even with agents still working
 - Telegram on macOS and Linux: talk to every Claude Code session from your phone through your own bot (`asp telegram setup`, then `/telegram` in a session), voice notes transcribed locally
 - RAM and disk watch on macOS and Linux: names the session behind a memory or disk drift, by notification and on Telegram
+- Every session by name on macOS: the menu and `asp sessions` show each Claude Code session's name (`/rename`), its profile (`CLAUDE_CONFIG_DIR`) and the Claude account each profile uses
 - Workshop on macOS and Linux: `asp workshop` opens your named Claude Code sessions in iTerm or tmux in one go
 
 - Local voice dictation with a customizable hotkey: hold Fn+Shift on macOS, toggle Ctrl+Alt+Space on Windows
@@ -203,6 +204,7 @@ Two engines are available:
 
 ```bash
 asp status     # Check current state
+asp sessions   # Your sessions by project, with their names, profiles and accounts (macOS)
 asp settings   # Open sleep prevention and dictation settings
 asp cleanup    # Clean up after interrupts
 asp auto-resume on|off  # Type "continue" after a network drop (macOS)
