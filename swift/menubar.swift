@@ -373,15 +373,7 @@ private final class AgentPopoverViewController: NSViewController {
         let container = NSView()
         let title = label("Agents", size: 17, weight: .semibold, color: .labelColor)
         let summary = label(summaryText(for: list), size: 12, color: .secondaryLabelColor)
-        var lines: [NSView] = [title, summary]
-        if let account = accountText(for: list.profiles) {
-            let field = label(account.text, size: 11, color: .tertiaryLabelColor)
-            field.lineBreakMode = .byTruncatingMiddle
-            field.toolTip = account.toolTip
-            field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-            lines.append(field)
-        }
-        let textStack = NSStackView(views: lines)
+        let textStack = NSStackView(views: [title, summary])
         textStack.orientation = .vertical
         textStack.alignment = .leading
         textStack.spacing = 3
@@ -392,14 +384,30 @@ private final class AgentPopoverViewController: NSViewController {
 
         container.addSubview(textStack)
         container.addSubview(status)
-        NSLayoutConstraint.activate([
+        var constraints = [
             textStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 18),
-            textStack.centerYAnchor.constraint(equalTo: container.centerYAnchor),
-            textStack.topAnchor.constraint(greaterThanOrEqualTo: container.topAnchor, constant: 12),
             status.leadingAnchor.constraint(greaterThanOrEqualTo: textStack.trailingAnchor, constant: 12),
             status.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -18),
-            status.centerYAnchor.constraint(equalTo: container.centerYAnchor),
-        ])
+            status.centerYAnchor.constraint(equalTo: textStack.centerYAnchor),
+        ]
+        if let account = accountText(for: list.profiles) {
+            // Below the pill, so it can use the header's whole width.
+            let field = label(account.text, size: 11, color: .tertiaryLabelColor)
+            field.lineBreakMode = .byTruncatingMiddle
+            field.toolTip = account.toolTip
+            field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            field.translatesAutoresizingMaskIntoConstraints = false
+            container.addSubview(field)
+            constraints += [
+                textStack.topAnchor.constraint(equalTo: container.topAnchor, constant: 14),
+                field.topAnchor.constraint(equalTo: textStack.bottomAnchor, constant: 3),
+                field.leadingAnchor.constraint(equalTo: textStack.leadingAnchor),
+                field.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -18),
+            ]
+        } else {
+            constraints.append(textStack.centerYAnchor.constraint(equalTo: container.centerYAnchor))
+        }
+        NSLayoutConstraint.activate(constraints)
         return container
     }
 
