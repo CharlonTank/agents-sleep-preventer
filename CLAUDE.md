@@ -157,6 +157,7 @@ The app requests only TWO permissions: Microphone and Accessibility.
   - Settings: `[telegram] data_dir` / `keychain_service` point at an existing sync-telegram folder and its Keychain item. bot.json `name` and `language` (fr|en) set the owner's name and the messages' language.
   - Tests: `src/telegram/tests.rs` runs the routing, topics, groups and listener scenarios against a `Fake` Telegram.
   - Voice notes: Core Audio's `ExtAudioFile` decodes Ogg Opus natively. `dictation::transcribe_recording` cuts at pauses about every 15 s and loads the model once (6 min 20 transcribed in 17 s).
+  - The listener transcribes in a child process, the hidden `asp telegram hear FILE [--model DIR]` (exit 0 text, 3 silent with the peak dB, 4 no model, 2 failure). Parakeet peaks at about 1.5 GB, and a process that loaded it keeps that memory after dropping the model: the listener reading Telegram for every session stayed at 1.24 GB for days. Never transcribe in the listener's own process. On Linux the child is `/proc/self/exe`, which survives an update replacing the file.
   - `asp telegram skill` writes the generic `src/telegram/SKILL.md` into every Claude profile and never overwrites a user's own telegram skill.
 - **`asp monitor`** (`src/monitor.rs`) is a port of claude-atelier's moniteur.
   - Memory is `phys_footprint` (`proc_pid_rusage`), never RSS, which misses compressed memory.

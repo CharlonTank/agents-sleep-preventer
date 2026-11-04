@@ -11,6 +11,12 @@ use std::path::{Path, PathBuf};
 /// on silence Parakeet invents words ("Thank you."), so it isn't asked.
 const SILENT_DB: f32 = -60.0;
 
+/// Exit codes of `asp telegram hear`, read back by the listener.
+const HEARD: i32 = 0;
+const FAILED: i32 = 2;
+const SILENT: i32 = 3;
+const NO_MODEL: i32 = 4;
+
 enum Unheard {
     Silent(f32),
     Failed(String),
@@ -103,22 +109,78 @@ impl Bot {
         }
     }
 
+    /// In a child process (`asp telegram hear`): Parakeet takes about
+    /// 1.2 GB while it works, and a process that loaded it once keeps that
+    /// memory after dropping the model. The listener that reads Telegram for
+    /// every session runs for days, so it stays small and the child exits.
     fn hear(&self, file: &Path) -> Result<String, Unheard> {
-        let samples = decode(file).map_err(Unheard::Failed)?;
-        let peak = samples.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
-        let decibels = if peak > 0.0 { 20.0 * peak.log10() } else { -120.0 };
-        if decibels < SILENT_DB {
-            return Err(Unheard::Silent(decibels));
-        }
         let model = self
             .config()
             .ok()
             .and_then(|settings| settings.text("parakeet_model").map(PathBuf::from))
             .filter(|dir| dir.is_dir())
-            .or_else(installed_model)
-            .ok_or_else(|| Unheard::Failed(missing_model(self.french())))?;
-        transcribe(&model, &samples).map_err(Unheard::Failed)
+            .or_else(installed_model);
+        let mut child = std::process::Command::new(this_program());
+        child.args(["telegram", "hear"]).arg(file);
+        if let Some(model) = &model {
+            child.arg("--model").arg(model);
+        }
+        let output = child.output().map_err(|error| Unheard::Failed(error.to_string()))?;
+        let said = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        match output.status.code() {
+            Some(HEARD) => Ok(said),
+            Some(SILENT) => Err(Unheard::Silent(said.parse().unwrap_or(-120.0))),
+            Some(NO_MODEL) => Err(Unheard::Failed(missing_model(self.french()))),
+            _ => {
+                let reason = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                Err(Unheard::Failed(if reason.is_empty() { output.status.to_string() } else { reason }))
+            }
+        }
     }
+}
+
+/// `asp telegram hear`: decodes and transcribes one voice note, prints the
+/// transcript (or a silent note's peak in dB) and returns the exit code.
+pub(crate) fn hear_once(file: &Path, model: Option<&Path>) -> i32 {
+    let samples = match decode(file) {
+        Ok(samples) => samples,
+        Err(reason) => {
+            eprintln!("{reason}");
+            return FAILED;
+        }
+    };
+    let peak = samples.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
+    let decibels = if peak > 0.0 { 20.0 * peak.log10() } else { -120.0 };
+    if decibels < SILENT_DB {
+        println!("{decibels}");
+        return SILENT;
+    }
+    let Some(model) = model else {
+        return NO_MODEL;
+    };
+    match transcribe(model, &samples) {
+        Ok(text) => {
+            println!("{text}");
+            HEARD
+        }
+        Err(reason) => {
+            eprintln!("{reason}");
+            FAILED
+        }
+    }
+}
+
+/// This program, to run it again as a child. On Linux an update may have
+/// replaced the file since the listener started: /proc/self/exe still runs
+/// the same binary.
+#[cfg(target_os = "linux")]
+fn this_program() -> PathBuf {
+    PathBuf::from("/proc/self/exe")
+}
+
+#[cfg(target_os = "macos")]
+fn this_program() -> PathBuf {
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("asp"))
 }
 
 #[cfg(target_os = "macos")]

@@ -89,6 +89,13 @@ pub enum TelegramCommand {
     Skill,
     /// The voice-note model: where it is, or (Linux) download it
     Voice,
+    /// Transcribe one voice note and exit (the listener runs it as a child)
+    #[command(hide = true)]
+    Hear {
+        file: PathBuf,
+        #[arg(long)]
+        model: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -389,14 +396,18 @@ pub fn run(command: TelegramCommand) -> i32 {
 }
 
 fn execute(command: TelegramCommand) -> Result<i32> {
-    if let TelegramCommand::Setup = command {
-        let settings = settings()?;
-        return setup::run(&settings).map(|()| 0);
+    match &command {
+        TelegramCommand::Setup => {
+            let settings = settings()?;
+            return setup::run(&settings).map(|()| 0);
+        }
+        TelegramCommand::Hear { file, model } => return Ok(media::hear_once(file, model.as_deref())),
+        _ => {}
     }
     let bot = open_bot()?;
     let owner = bot.owner();
     match command {
-        TelegramCommand::Setup => unreachable!(),
+        TelegramCommand::Setup | TelegramCommand::Hear { .. } => unreachable!(),
         TelegramCommand::Start { session, alias, announce_group } => {
             let name = session_name(session.as_deref())?;
             bot.start(&name, &alias, announce_group)?;

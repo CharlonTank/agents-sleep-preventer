@@ -213,7 +213,16 @@ mod tests {
         assert!(store.lock("poll", false).is_none());
         assert!(store.held("poll"));
         drop(first);
-        assert!(!store.held("poll"));
+        // A test running in parallel may fork right then: its child shares
+        // the lock until it execs, a few milliseconds.
+        let released = (0..100).any(|_| {
+            let free = !store.held("poll");
+            if !free {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            free
+        });
+        assert!(released);
     }
 
     #[test]
