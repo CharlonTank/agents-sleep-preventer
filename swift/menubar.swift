@@ -577,10 +577,15 @@ private final class AgentPopoverViewController: NSViewController {
         initials.translatesAutoresizingMaskIntoConstraints = false
         badge.addSubview(initials)
 
+        // A session's name can be long ("my-app · Fix the login redirect"):
+        // the title shortens, never the popover's width.
         let project = label(group.title, size: 13, weight: .semibold, color: .labelColor)
-        project.lineBreakMode = .byTruncatingMiddle
+        project.lineBreakMode = .byTruncatingTail
+        project.toolTip = group.title
+        project.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let metadata = label(metadataText(for: group), size: 11, color: .secondaryLabelColor)
         metadata.lineBreakMode = .byTruncatingTail
+        metadata.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let details = detailLines(for: group).map { line -> NSTextField in
             let field = label(line.text, size: 11, color: line.color)
             field.lineBreakMode = .byTruncatingTail
