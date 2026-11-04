@@ -11,7 +11,7 @@
 
 <br>
 
-[![Download DMG](https://img.shields.io/badge/Download-DMG%20Installer-blue?style=for-the-badge&logo=apple)](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-5.7.0.dmg)
+[![Download DMG](https://img.shields.io/badge/Download-DMG%20Installer-blue?style=for-the-badge&logo=apple)](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-5.7.1.dmg)
 
 <br>
 
@@ -70,9 +70,9 @@ Install this tool. Your computer stays awake while your agent works; normal slee
 For a machine that never turns off, without a desktop. Download the archive from GitHub, check it, then install it (no root needed):
 
 ```bash
-curl -fLO https://github.com/CharlonTank/agents-sleep-preventer/releases/download/v5.7.0/AgentsSleepPreventer-5.7.0-linux-x86_64.tar.gz
-sha256sum AgentsSleepPreventer-5.7.0-linux-x86_64.tar.gz   # same as on the release page and on asp.charlon.dev?
-tar -xzf AgentsSleepPreventer-5.7.0-linux-x86_64.tar.gz asp
+curl -fLO https://github.com/CharlonTank/agents-sleep-preventer/releases/download/v5.7.1/AgentsSleepPreventer-5.7.1-linux-x86_64.tar.gz
+sha256sum AgentsSleepPreventer-5.7.1-linux-x86_64.tar.gz   # same as on the release page and on asp.charlon.dev?
+tar -xzf AgentsSleepPreventer-5.7.1-linux-x86_64.tar.gz asp
 install -Dm755 asp ~/.local/bin/asp
 ~/.local/bin/asp service install
 ~/.local/bin/asp telegram setup
@@ -90,7 +90,7 @@ Either way you get `asp` in `~/.local/bin`, plus a systemd user service (`asp se
 
 ### Windows 10 / 11
 
-[Download the Windows ZIP](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-5.7.0-windows-x86_64.zip), extract it, and run `asp.exe` for the system tray app. To install native Claude Code/Codex hooks and start at login, run this in PowerShell from the extracted folder:
+[Download the Windows ZIP](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-5.7.1-windows-x86_64.zip), extract it, and run `asp.exe` for the system tray app. To install native Claude Code/Codex hooks and start at login, run this in PowerShell from the extracted folder:
 
 ```powershell
 .\asp.exe install --yes
@@ -102,7 +102,7 @@ Requires macOS 14 Sonoma or later on Apple Silicon.
 
 ### 🍎 Download DMG (Easiest)
 
-1. [Download the latest DMG](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-5.7.0.dmg)
+1. [Download the latest DMG](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-5.7.1.dmg)
 2. Drag `AgentsSleepPreventer.app` to Applications
 3. Launch the app - it will auto-configure on first run
 4. Restart your coding agents
