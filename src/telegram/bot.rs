@@ -19,9 +19,9 @@
 //! sync-telegram writes, so both can share one data folder; its journals
 //! mark the owner's messages `from: "charles"`, read like `"owner"`.
 
-use super::api::{ApiError, Params, Telegram};
+use super::api::{ApiError, Params, Relay, Telegram};
 use super::store::{now, Fields, Lock, Object, Store};
-use super::text::{address, chunks, crc32, escape, normal, stamp, tag};
+use super::text::{address, chunks, crc32, day_and_time, display, escape, normal, stamp, tag};
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 use std::cell::OnceCell;
@@ -43,6 +43,10 @@ pub(crate) use say;
 
 /// Short long polls: the reading passes quickly from one listener to another.
 const POLL_WAIT: f64 = 25.0;
+/// Seconds between two empty reads of the relay.
+const RELAY_PAUSE: f64 = 3.0;
+/// The machine's topics and groups are told to the relay again every 10 min.
+const RELAY_SYNC: f64 = 600.0;
 /// A message without an address, under 3 min after the previous one, follows it.
 const FOLLOW_UP: f64 = 180.0;
 /// `--max 0`: listen until the next message.
@@ -100,6 +104,7 @@ pub type Listeners = Box<dyn Fn() -> Vec<(u32, String)>>;
 pub struct Bot {
     pub store: Store,
     tg: Box<dyn Telegram>,
+    relay: Box<dyn Relay>,
     /// Listeners still running a build older than the installed one.
     old_listeners: Listeners,
     identity: OnceCell<(bool, String)>,
@@ -170,10 +175,11 @@ fn first_word(text: &str) -> String {
 }
 
 impl Bot {
-    pub fn new(store: Store, tg: Box<dyn Telegram>, old_listeners: Listeners) -> Self {
+    pub fn new(store: Store, tg: Box<dyn Telegram>, relay: Box<dyn Relay>, old_listeners: Listeners) -> Self {
         Self {
             store,
             tg,
+            relay,
             old_listeners,
             identity: OnceCell::new(),
         }
@@ -243,6 +249,74 @@ impl Bot {
 
     fn api(&self, method: &str, params: Params) -> Result<Value, ApiError> {
         self.tg.call(method, &params, API_TIMEOUT, None)
+    }
+
+    // The relay: bot.json "relais" {url, machine, prefixe, principale}, when
+    // the bot's webhook goes to a relay shared by several machines (see
+    // `api::Relay`). Each machine reads its share there instead of calling
+    // `getUpdates`, and answers Telegram directly.
+
+    /// The relay's settings, when the bot reads through one.
+    fn relay_settings(&self) -> Option<Object> {
+        self.config()
+            .ok()?
+            .object("relais")
+            .filter(|relay| relay.text("url").is_some_and(|url| !url.is_empty()))
+            .cloned()
+    }
+
+    fn relay_call(&self, route: &str, body: Option<&Value>) -> Result<Value> {
+        let settings = self
+            .relay_settings()
+            .ok_or_else(|| anyhow!("bot.json: no relay (\"relais\": {{\"url\": …}})"))?;
+        self.relay.call(settings.text("url").unwrap_or(""), route, body)
+    }
+
+    /// This machine's prefix on the relay ("pc"); empty on the main machine
+    /// and without a relay.
+    fn prefix(&self) -> String {
+        self.relay_settings()
+            .and_then(|relay| relay.text("prefixe").map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    /// "🟪 acme-backend" (or "🟪 pc-acme-backend" on a machine with a prefix).
+    fn tag(&self, name: &str) -> String {
+        tag(name, &self.prefix())
+    }
+
+    /// Tells the relay the topics and project groups this machine holds, so
+    /// it files their messages for this machine. True when done.
+    pub fn relay_sync(&self) -> bool {
+        let Some(settings) = self.relay_settings() else {
+            return false;
+        };
+        let mut threads: Vec<i64> = self
+            .sessions()
+            .values()
+            .flat_map(|data| {
+                data.int("thread_id")
+                    .into_iter()
+                    .chain(data.list("threads").iter().filter_map(Value::as_i64))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        threads.sort_unstable();
+        threads.dedup();
+        let groups: Vec<i64> = self.groups().into_keys().collect();
+        let body = json!({
+            "fils": threads,
+            "groupes": groups,
+            "prefixe": settings.text("prefixe").unwrap_or(""),
+            "principale": settings.flag("principale"),
+        });
+        match self.relay_call("/fils", Some(&body)) {
+            Ok(_) => true,
+            Err(error) => {
+                eprintln!("asp telegram: relay not updated ({error:#})");
+                false
+            }
+        }
     }
 
     // Sessions: one per project (or per given name), a sessions/<name>.json each.
@@ -344,6 +418,7 @@ impl Bot {
         };
         self.store.write(&file, &Value::Object(data))?;
         drop(lock);
+        self.relay_sync(); // the relay files the groups' messages for this machine
         Ok(result)
     }
 
@@ -713,7 +788,7 @@ impl Bot {
                 "createForumTopic",
                 Params::new()
                     .set("chat_id", chat)
-                    .set("name", name)
+                    .set("name", display(name, &self.prefix()))
                     .set("icon_color", color),
             )
             .map_err(|e| e.to_string())
@@ -727,6 +802,7 @@ impl Bot {
         }?;
         self.update_session(name, obj(json!({"thread_id": thread}))).ok()?;
         drop(lock);
+        self.relay_sync();
         Some(thread)
     }
 
@@ -814,7 +890,7 @@ impl Bot {
                 let params = match thread {
                     Some(thread) => Params::new().set("text", &part).set("message_thread_id", thread),
                     None => Params::new()
-                        .set("text", format!("<b>{}</b>\n{}", escape(&tag(name)), escape(&part)))
+                        .set("text", format!("<b>{}</b>\n{}", escape(&self.tag(name)), escape(&part)))
                         .set("parse_mode", "HTML"),
                 };
                 let record = obj(json!({"from": "claude", "session": name, "thread_id": thread, "text": part}));
@@ -885,7 +961,7 @@ impl Bot {
                     params = params.set("message_thread_id", thread);
                     caption.to_string()
                 }
-                None => format!("{}\n{caption}", tag(name)).trim().to_string(),
+                None => format!("{}\n{caption}", self.tag(name)).trim().to_string(),
             };
             if !text.is_empty() {
                 params = params.set("caption", short(&text));
@@ -982,7 +1058,7 @@ impl Bot {
                 "• Each session has its own topic, under its name: write in the project's topic. In a new topic I ask once which project it is for, then it stays with it."
             ));
         }
-        let example = tag("my-project");
+        let example = self.tag("my-project");
         lines.push(say!(
             self,
             "• Hors fil, chaque message d’une session commence par son nom ({example}).",
@@ -1039,7 +1115,7 @@ impl Bot {
             } else {
                 String::new()
             };
-            lines.push(format!("{} — {state}{waiting}", tag(&name)));
+            lines.push(format!("{} — {state}{waiting}", self.tag(&name)));
         }
         lines.join("\n")
     }
@@ -1074,7 +1150,7 @@ impl Bot {
             .unwrap_or("")
             .to_string();
         if let Some((first, rest)) = quoted.split_once('\n') {
-            if !rest.is_empty() && self.sessions().keys().any(|name| tag(name) == first.trim()) {
+            if !rest.is_empty() && self.sessions().keys().any(|name| self.tag(name) == first.trim()) {
                 quoted = rest.to_string(); // the "🟦 name" header of messages outside topics
             }
         }
@@ -1175,21 +1251,40 @@ impl Bot {
         if let Some(owner) = thread.and_then(|thread| Self::thread_owner(thread, &known)) {
             return found(owner, "fil", text);
         }
-        if let Some(addressed) = address(text) {
-            let named = Self::resolve(&normal(&addressed.typed), &known, &live);
+        let mut text = text.to_string();
+        if let Some(addressed) = address(&text) {
             let rest = addressed.rest.trim().to_string();
-            if named.len() == 1 {
-                return found(named[0].clone(), "nom", &rest);
-            }
-            if !named.is_empty() {
-                return Route {
-                    session: None,
-                    how: "",
-                    text: rest,
-                    candidates: named,
-                };
+            // On the machine whose relay prefix is "pc": "pc-acme: …" names
+            // its session acme, "pc: …" only the machine.
+            let prefix = self.prefix();
+            let typed = normal(&addressed.typed);
+            let typed = if prefix.is_empty() {
+                Some(typed)
+            } else if typed == prefix {
+                None
+            } else {
+                let machine = format!("{prefix}-");
+                Some(typed.strip_prefix(&machine).map_or_else(|| typed.clone(), str::to_string))
+            };
+            match typed {
+                None => text = rest,
+                Some(typed) => {
+                    let named = Self::resolve(&typed, &known, &live);
+                    if named.len() == 1 {
+                        return found(named[0].clone(), "nom", &rest);
+                    }
+                    if !named.is_empty() {
+                        return Route {
+                            session: None,
+                            how: "",
+                            text: rest,
+                            candidates: named,
+                        };
+                    }
+                }
             }
         }
+        let text = text.as_str();
         if let Some(replied) = message.object("reply_to_message") {
             if let Some(session) = self
                 .find(replied.int("message_id"), None)
@@ -1251,6 +1346,7 @@ impl Bot {
         others.sort_unstable();
         others.dedup();
         self.update_session(name, obj(json!({"thread_id": thread, "threads": others})))?;
+        self.relay_sync();
         if owner.is_none() {
             if let Ok(chat) = self.chat_id() {
                 let _ = self.api(
@@ -1258,7 +1354,7 @@ impl Bot {
                     Params::new()
                         .set("chat_id", chat)
                         .set("message_thread_id", thread)
-                        .set("name", name),
+                        .set("name", display(name, &self.prefix())),
                 );
             }
         }
@@ -1323,7 +1419,7 @@ impl Bot {
         )?;
         let mut rows: Vec<Value> = names
             .iter()
-            .map(|name| json!([{"text": tag(name), "callback_data": format!("to:{update_id}:{name}")}]))
+            .map(|name| json!([{"text": self.tag(name), "callback_data": format!("to:{update_id}:{name}")}]))
             .collect();
         rows.push(json!([{
             "text": say!(self, "Laisser de côté", "Leave it"),
@@ -1357,7 +1453,7 @@ impl Bot {
                 if kind == "to" && self.sessions().contains_key(name) {
                     self.deliver(name, &entry, "bouton")?;
                     let _ = std::fs::remove_file(file);
-                    format!("→ {}", tag(name))
+                    format!("→ {}", self.tag(name))
                 } else {
                     let mut left = entry.clone();
                     left.insert("how".into(), json!("laissé"));
@@ -1867,16 +1963,26 @@ impl Bot {
             .ok()
             .and_then(|text| text.trim().parse().ok())
             .unwrap_or(0);
-        let updates = self.tg.call(
-            "getUpdates",
-            &Params::new()
-                .set("offset", offset)
-                .set("timeout", wait)
-                .set("allowed_updates", UPDATES),
-            Duration::from_secs(wait + 20),
-            None,
-        )?;
-        let updates = updates.as_array().cloned().unwrap_or_default();
+        let updates = if self.relay_settings().is_some() {
+            // The relay forgets this machine's updates up to `ack`.
+            let answer = self.relay_call("/releve", Some(&json!({"ack": (offset - 1).max(0)})))?;
+            let updates = answer.get("updates").and_then(Value::as_array).cloned().unwrap_or_default();
+            if updates.is_empty() {
+                std::thread::sleep(Duration::from_secs_f64(RELAY_PAUSE.min(wait.max(1) as f64)));
+            }
+            updates
+        } else {
+            let updates = self.tg.call(
+                "getUpdates",
+                &Params::new()
+                    .set("offset", offset)
+                    .set("timeout", wait)
+                    .set("allowed_updates", UPDATES),
+                Duration::from_secs(wait + 20),
+                None,
+            )?;
+            updates.as_array().cloned().unwrap_or_default()
+        };
         let done = if updates.is_empty() { HashSet::new() } else { self.handled_ids() };
         let mut ignored = 0;
         for update in updates {
@@ -1970,7 +2076,7 @@ impl Bot {
                 }
                 std::fs::create_dir_all(&marks)?;
                 std::fs::write(&mark, "")?;
-                let who = tag(&name);
+                let who = self.tag(&name);
                 let when = stamp(entry.float("at"), at);
                 if entry.int("chat_id").is_some_and(|chat| chat != 0) {
                     // A group message: the owner is told privately, without quoting it.
@@ -2178,6 +2284,50 @@ impl Bot {
         }
     }
 
+    /// `asp telegram relay` (a launchd or systemd service): reads the relay
+    /// for every session of this machine, whether or not one listens, and
+    /// tells the owner about messages left waiting. Runs until killed.
+    pub fn relay_for_machine(&self) -> Result<()> {
+        if self.relay_settings().is_none() {
+            bail!(say!(
+                self,
+                "Pas de relais dans bot.json : les sessions lisent Telegram elles-mêmes quand elles écoutent",
+                "No relay in bot.json: sessions read Telegram themselves while they listen"
+            ));
+        }
+        let Some(leader) = self.store.lock("poll", true) else {
+            bail!("{}: cannot be locked", self.store.path(&["locks", "poll.lock"]).display());
+        };
+        let result = self.relay_holding();
+        drop(leader);
+        result
+    }
+
+    fn relay_holding(&self) -> Result<()> {
+        self.relay_sync();
+        let (mut synced, mut pause) = (now(), 5.0f64);
+        loop {
+            match self.poll_once(POLL_WAIT as u64).and_then(|_| self.warn_stale(now())) {
+                Ok(()) => {
+                    if now() - synced > RELAY_SYNC {
+                        self.relay_sync();
+                        synced = now();
+                    }
+                    pause = 5.0;
+                }
+                Err(error) => {
+                    eprintln!("{} relay: {error:#}", day_and_time(now()));
+                    let wait = match api_error(&error) {
+                        Some(ApiError::Refused { retry_after: Some(seconds), .. }) => *seconds as f64,
+                        _ => pause,
+                    };
+                    std::thread::sleep(Duration::from_secs_f64(wait));
+                    pause = (pause * 2.0).min(60.0);
+                }
+            }
+        }
+    }
+
     pub fn start(&self, name: &str, aliases: &[String], announce_group: bool) -> Result<Object> {
         if self.listening(name) {
             return Err(self.busy(name).into());
@@ -2296,6 +2446,42 @@ impl Bot {
         Ok(())
     }
 
+    /// The relay's machines, when each last read it and what waits for it.
+    fn relay_state(&self, url: &str) -> String {
+        let state = match self.relay_call("/etat", None) {
+            Ok(state) => obj(state),
+            Err(error) => return say!(self, "Relais {url} injoignable ({error:#})", "Relay {url} unreachable ({error:#})"),
+        };
+        let at = state.float("maintenant");
+        let waiting: HashMap<String, i64> = state
+            .list("en_attente")
+            .iter()
+            .filter_map(|row| Some((row.get("machine")?.as_str()?.to_string(), row.get("n")?.as_i64()?)))
+            .collect();
+        let machines = state
+            .list("machines")
+            .iter()
+            .filter_map(|row| {
+                let name = row.get("name")?.as_str()?;
+                let ago = (at - row.get("vue")?.as_f64()?).max(0.0) as i64;
+                let queued = waiting.get(name).copied().unwrap_or(0);
+                let queued = if queued > 0 {
+                    say!(self, " ({queued} en attente)", " ({queued} waiting)")
+                } else {
+                    String::new()
+                };
+                Some(say!(self, "{name} relevé il y a {ago} s{queued}", "{name} read {ago} s ago{queued}"))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let main = state.text("principale").unwrap_or("?");
+        say!(
+            self,
+            "Relais {url} : machine principale {main} ; {machines}",
+            "Relay {url}: main machine {main}; {machines}"
+        )
+    }
+
     pub fn old_listeners(&self) -> Vec<(u32, String)> {
         (self.old_listeners)()
     }
@@ -2366,6 +2552,9 @@ impl Bot {
                 "Groupe « {title} » ({chat}) → {session} : bot {status}{warning}",
                 "Group \"{title}\" ({chat}) → {session}: bot {status}{warning}"
             ));
+        }
+        if let Some(relay) = self.relay_settings() {
+            lines.push(self.relay_state(relay.text("url").unwrap_or("")));
         }
         let old = self.old_listeners();
         if !old.is_empty() {

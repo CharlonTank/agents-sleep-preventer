@@ -1,7 +1,8 @@
-//! The Telegram Bot API, behind a trait so the bot logic runs against a
-//! fake in tests.
+//! The Telegram Bot API, and the relay some bots read through, behind
+//! traits so the bot logic runs against fakes in tests.
 
 use serde_json::Value;
+use std::cell::OnceCell;
 use std::fmt;
 use std::fs::File;
 use std::io;
@@ -246,5 +247,90 @@ impl Telegram for HttpTelegram {
         let mut reader = response.into_body().into_reader();
         io::copy(&mut reader, &mut file).map_err(|e| self.network(e))?;
         Ok(())
+    }
+}
+
+/// A relay that receives the bot's updates by webhook and keeps each
+/// machine's share (bot.json "relais"): one bot for several machines.
+/// Telegram refuses `getUpdates` while the webhook is set, so the listener
+/// reading for the machine takes them from the relay instead.
+///
+/// Routes: `POST /releve {ack}` acknowledges updates up to `ack` and
+/// returns `{updates}`; `POST /fils {fils, groupes, prefixe, principale}`
+/// declares the topics and groups this machine holds; `GET /etat` tells
+/// the machines and what waits for them.
+pub trait Relay {
+    /// GET `route` without `body`, POST it as JSON with one.
+    fn call(&self, url: &str, route: &str, body: Option<&Value>) -> anyhow::Result<Value>;
+}
+
+type TokenReader = Box<dyn Fn() -> anyhow::Result<String>>;
+
+/// The machine's token is read once, at the first call: commands that
+/// never reach the relay (`send`) don't need it.
+pub struct HttpRelay {
+    read_token: TokenReader,
+    token: OnceCell<String>,
+    agent: ureq::Agent,
+}
+
+impl HttpRelay {
+    pub fn new(read_token: TokenReader) -> Self {
+        let agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .new_agent();
+        Self { read_token, token: OnceCell::new(), agent }
+    }
+
+    fn token(&self) -> anyhow::Result<&str> {
+        if self.token.get().is_none() {
+            let token = (self.read_token)()?;
+            let _ = self.token.set(token);
+        }
+        Ok(self.token.get().map_or("", String::as_str))
+    }
+}
+
+impl Relay for HttpRelay {
+    fn call(&self, url: &str, route: &str, body: Option<&Value>) -> anyhow::Result<Value> {
+        let bearer = format!("Bearer {}", self.token()?);
+        let address = format!("{}{route}", url.trim_end_matches('/'));
+        let network = |error: &dyn fmt::Display| ApiError::Network(format!("relay {route}: {error}"));
+        let response = match body {
+            Some(body) => self
+                .agent
+                .post(&address)
+                .config()
+                .timeout_global(Some(Duration::from_secs(30)))
+                .build()
+                .header("Authorization", &bearer)
+                .header("Content-Type", "application/json")
+                .send(body.to_string().as_bytes()),
+            None => self
+                .agent
+                .get(&address)
+                .config()
+                .timeout_global(Some(Duration::from_secs(30)))
+                .build()
+                .header("Authorization", &bearer)
+                .call(),
+        }
+        .map_err(|e| network(&e))?;
+        let status = response.status().as_u16();
+        let raw = response.into_body().read_to_string().map_err(|e| network(&e))?;
+        if !(200..300).contains(&status) {
+            let detail = raw.trim().chars().take(200).collect::<String>();
+            return Err(ApiError::Refused {
+                method: format!("relay {route}"),
+                code: i64::from(status),
+                description: format!("{detail} (HTTP {status})"),
+                retry_after: None,
+                migrate_to: None,
+            }
+            .into());
+        }
+        Ok(serde_json::from_str(if raw.trim().is_empty() { "{}" } else { &raw })
+            .map_err(|e| network(&e))?)
     }
 }

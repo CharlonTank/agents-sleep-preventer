@@ -1,7 +1,7 @@
 //! The bot against a fake Telegram: routing, topics, groups, listeners.
 //! Scenarios ported from sync-telegram's test suite, so both behave alike.
 
-use super::api::{ApiError, Params, Telegram};
+use super::api::{ApiError, Params, Relay, Telegram};
 use super::bot::Bot;
 use super::store::{now, Fields, Lock, Object, Store};
 use super::text::tag;
@@ -99,10 +99,41 @@ impl Telegram for Fake {
     }
 }
 
+/// The relay: updates waiting for this machine, and every call it got.
+#[derive(Default)]
+struct RelayState {
+    calls: Vec<(String, Option<Value>)>,
+    updates: Vec<Value>,
+}
+
+struct FakeRelay(Rc<RefCell<RelayState>>);
+
+impl Relay for FakeRelay {
+    fn call(&self, url: &str, route: &str, body: Option<&Value>) -> anyhow::Result<Value> {
+        assert_eq!(url, RELAY_URL);
+        let mut state = self.0.borrow_mut();
+        state.calls.push((route.to_string(), body.cloned()));
+        match route {
+            "/releve" => {
+                let ack = body.and_then(|b| b["ack"].as_i64()).unwrap_or(0);
+                state.updates.retain(|u| u["update_id"].as_i64().unwrap_or(0) > ack);
+                Ok(json!({"updates": state.updates.clone()}))
+            }
+            "/etat" => Ok(json!({"maintenant": 1000.0, "principale": "mac",
+                                 "machines": [{"name": "mac", "vue": 990.0}, {"name": "pc", "vue": 400.0}],
+                                 "en_attente": [{"machine": "pc", "n": 2}]})),
+            _ => Ok(json!({"ok": true})),
+        }
+    }
+}
+
+const RELAY_URL: &str = "https://relay.example";
+
 struct Harness {
     dir: tempfile::TempDir,
     bot: Bot,
     tg: Rc<RefCell<FakeState>>,
+    relay: Rc<RefCell<RelayState>>,
     locks: Vec<Lock>,
 }
 
@@ -125,8 +156,9 @@ fn harness() -> Harness {
         next_thread: 77,
         ..FakeState::default()
     }));
-    let bot = Bot::new(store, Box::new(Fake(tg.clone())), Box::new(Vec::new));
-    Harness { dir, bot, tg, locks: Vec::new() }
+    let relay = Rc::new(RefCell::new(RelayState::default()));
+    let bot = Bot::new(store, Box::new(Fake(tg.clone())), Box::new(FakeRelay(relay.clone())), Box::new(Vec::new));
+    Harness { dir, bot, tg, relay, locks: Vec::new() }
 }
 
 fn message(update_id: i64, message_id: i64, text: &str, extra: Value) -> Value {
@@ -231,6 +263,22 @@ impl Harness {
     fn offset(&self) -> String {
         std::fs::read_to_string(self.dir.path().join("offset")).unwrap()
     }
+
+    /// The bot reads through a relay, this machine under `prefix`.
+    fn relayed(&self, prefix: &str) {
+        let relay = json!({"url": RELAY_URL, "machine": "mac", "prefixe": prefix, "principale": prefix.is_empty()});
+        self.bot.update_config(obj(json!({"relais": relay}))).unwrap();
+    }
+
+    fn relay_calls(&self, route: &str) -> Vec<Value> {
+        self.relay
+            .borrow()
+            .calls
+            .iter()
+            .filter(|(r, _)| r == route)
+            .map(|(_, body)| body.clone().unwrap_or(Value::Null))
+            .collect()
+    }
 }
 
 // Routing.
@@ -282,7 +330,7 @@ fn a_reply_goes_to_its_session_with_the_quote() {
     h.live("acme-backend");
     h.live("nova-studio");
     let sent = h.bot.send("Fiche client prête, je l’envoie ?", "nova-studio", false).unwrap()[0];
-    let quoted = json!({"message_id": sent, "text": format!("{}\nFiche client prête, je l’envoie ?", tag("nova-studio"))});
+    let quoted = json!({"message_id": sent, "text": format!("{}\nFiche client prête, je l’envoie ?", tag("nova-studio", ""))});
     h.dispatch(message(1, 20, "oui", json!({"reply_to_message": quoted})));
     assert_eq!(h.inbox("nova-studio"), ["[en réponse à « Fiche client prête, je l’envoie ? »]\noui"]);
     assert!(h.inbox("acme-backend").is_empty());
@@ -303,7 +351,7 @@ fn without_an_address_and_two_sessions_the_bot_asks_once() {
     h.choose(2, "to:1:nova-studio");
     assert_eq!(h.inbox("nova-studio"), ["tu en es où ?"]);
     let edits = h.calls("editMessageText");
-    assert_eq!(edits.last().unwrap().get("text").unwrap(), format!("→ {}", tag("nova-studio")));
+    assert_eq!(edits.last().unwrap().get("text").unwrap(), format!("→ {}", tag("nova-studio", "")));
     h.choose(3, "to:1:nova-studio"); // a second tap: nothing more
     assert!(h.inbox("nova-studio").is_empty());
 }
@@ -346,7 +394,7 @@ fn outside_topics_a_message_carries_the_session_name() {
     h.bot.send("a < b & c", "nova-studio", false).unwrap();
     let last = h.last_sent();
     assert_eq!(last.get("parse_mode"), Some("HTML"));
-    assert_eq!(Harness::text_of(&last), format!("<b>{}</b>\na &lt; b &amp; c", tag("nova-studio")));
+    assert_eq!(Harness::text_of(&last), format!("<b>{}</b>\na &lt; b &amp; c", tag("nova-studio", "")));
     assert!(last.get("message_thread_id").is_none());
 }
 
@@ -472,7 +520,7 @@ fn bot_commands_deliver_nothing() {
     let mut h = harness();
     h.live("nova-studio");
     h.dispatch(message(1, 80, "/sessions", json!({})));
-    assert!(Harness::text_of(&h.last_sent()).contains(&format!("{} — à l’écoute", tag("nova-studio"))));
+    assert!(Harness::text_of(&h.last_sent()).contains(&format!("{} — à l’écoute", tag("nova-studio", ""))));
     h.dispatch(message(2, 81, "/aide@TestBot", json!({})));
     assert!(Harness::text_of(&h.last_sent()).contains("/sessions"));
     assert!(h.inbox("nova-studio").is_empty());
@@ -846,7 +894,7 @@ fn sending_from_a_bound_session_goes_to_the_group_without_header() {
     h.bot.send("Alice demande un achat", "alice-site", true).unwrap();
     let private = h.last_sent();
     assert_eq!(private.get("chat_id"), Some(OWNER.to_string().as_str()));
-    assert_eq!(Harness::text_of(&private), format!("<b>{}</b>\nAlice demande un achat", tag("alice-site")));
+    assert_eq!(Harness::text_of(&private), format!("<b>{}</b>\nAlice demande un achat", tag("alice-site", "")));
 }
 
 #[test]
@@ -864,7 +912,7 @@ fn a_file_goes_to_the_group_or_privately() {
     );
     assert_eq!(
         (sent[1].get("chat_id"), sent[1].get("caption").map(str::to_string)),
-        (Some(OWNER.to_string().as_str()), Some(format!("{}\npour toi", tag("alice-site"))))
+        (Some(OWNER.to_string().as_str()), Some(format!("{}\npour toi", tag("alice-site", ""))))
     );
 }
 
@@ -1019,4 +1067,103 @@ fn a_follow_up_counts_a_message_routed_by_sync_telegram() {
                                 "routed_at": now(), "message_id": 5, "update_id": 5, "text": "première consigne"}));
     h.dispatch(message(6, 6, "et la deuxième", json!({})));
     assert_eq!(h.inbox("nova-studio"), ["et la deuxième"]);
+}
+
+// The relay: one bot for several machines, Telegram's updates by webhook.
+
+#[test]
+fn with_a_relay_the_reading_goes_through_it_and_acknowledges() {
+    let mut h = harness();
+    h.relayed("");
+    h.live("nova-studio");
+    std::fs::write(h.dir.path().join("offset"), "41").unwrap();
+    h.relay.borrow_mut().updates = vec![message(41, 170, "nova: par le relais", json!({}))];
+    h.bot.poll_once(1).unwrap();
+    assert_eq!(h.inbox("nova-studio"), ["par le relais"]);
+    assert_eq!(h.offset(), "42");
+    h.bot.poll_once(1).unwrap();
+    let acks: Vec<i64> = h.relay_calls("/releve").iter().map(|b| b["ack"].as_i64().unwrap()).collect();
+    assert_eq!(acks, [40, 41]);
+    assert!(h.relay.borrow().updates.is_empty());
+    assert!(h.calls("getUpdates").is_empty());
+}
+
+#[test]
+fn with_a_relay_a_listener_takes_the_reading_without_get_updates() {
+    let h = harness();
+    h.relayed("");
+    h.bot
+        .update_session("acme-backend", obj(json!({"cwd": "/projets/acme-backend", "last_listen": now()})))
+        .unwrap();
+    h.relay.borrow_mut().updates = vec![message(1, 171, "backend: relayé", json!({}))];
+    let (received, _) = h.bot.listen("acme-backend", 10).unwrap();
+    assert_eq!(received.iter().map(|e| e.text("text").unwrap()).collect::<Vec<_>>(), ["relayé"]);
+    assert!(h.calls("getUpdates").is_empty());
+}
+
+#[test]
+fn the_relay_learns_each_new_topic_and_group() {
+    let mut h = harness();
+    h.relayed("");
+    h.topics();
+    h.live("nova-studio");
+    h.bot.send("Bonjour", "nova-studio", false).unwrap();
+    let told = h.relay_calls("/fils").pop().unwrap();
+    assert_eq!(told, json!({"fils": [77], "groupes": [], "prefixe": "", "principale": true}));
+    h.group();
+    let told = h.relay_calls("/fils").pop().unwrap();
+    assert_eq!((&told["fils"], &told["groupes"]), (&json!([77]), &json!([GROUP])));
+}
+
+#[test]
+fn without_a_relay_nothing_is_told_to_one() {
+    let mut h = harness();
+    h.topics();
+    h.live("nova-studio");
+    h.bot.send("Bonjour", "nova-studio", false).unwrap();
+    h.group();
+    assert!(!h.bot.relay_sync());
+    assert!(h.relay.borrow().calls.is_empty());
+}
+
+#[test]
+fn a_machine_prefix_names_its_sessions_and_topics() {
+    let mut h = harness();
+    h.relayed("pc");
+    h.live("nova-studio");
+    h.bot.send("Bonjour", "nova-studio", false).unwrap();
+    assert_eq!(Harness::text_of(&h.last_sent()), format!("<b>{}</b>\nBonjour", tag("nova-studio", "pc")));
+    assert!(tag("nova-studio", "pc").ends_with(" pc-nova-studio"));
+    h.dispatch(message(1, 180, "pc-nova: le build", json!({})));
+    assert_eq!(h.inbox("nova-studio"), ["le build"]);
+    // "pc: …" names the machine only: its only active session takes it.
+    h.dispatch(message(2, 181, "pc: tu es là ?", json!({})));
+    assert_eq!(h.inbox("nova-studio"), ["tu es là ?"]);
+    h.topics();
+    h.bot.send("Fil", "acme-backend", false).unwrap();
+    let created = h.calls("createForumTopic");
+    assert_eq!(created.iter().map(|p| p.get("name").unwrap()).collect::<Vec<_>>(), ["pc-acme-backend"]);
+}
+
+#[test]
+fn doctor_tells_the_relay_machines() {
+    let h = harness();
+    h.relayed("");
+    let lines = h.bot.doctor().unwrap();
+    assert!(lines.iter().any(|line| line
+        == "Relais https://relay.example : machine principale mac ; mac relevé il y a 10 s, pc relevé il y a 600 s (2 en attente)"));
+}
+
+#[test]
+fn the_machine_reader_needs_a_relay() {
+    let h = harness();
+    assert!(h.bot.relay_for_machine().is_err());
+    assert!(h.calls("getUpdates").is_empty());
+}
+
+#[test]
+fn a_listener_is_the_asp_process_not_the_shell_around_it() {
+    assert_eq!(super::program_name("/Applications/AgentsSleepPreventer.app/Contents/MacOS/asp telegram listen --session x"), "asp");
+    assert_eq!(super::program_name("asp telegram listen --session x --max 0"), "asp");
+    assert_eq!(super::program_name("/bin/zsh -c source s.sh && eval 'asp telegram listen --session x --max 0'"), "zsh");
 }

@@ -43,9 +43,19 @@ pub fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
+/// A session's name as Telegram shows it: after its machine's relay prefix
+/// ("pc-acme-backend") outside the main machine, whose prefix is empty.
+pub fn display(name: &str, prefix: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}-{name}")
+    }
+}
+
 /// "🟪 acme-backend": the header of a session's messages outside topics.
-pub fn tag(name: &str) -> String {
-    format!("{} {name}", EMOJIS[crc32(name.as_bytes()) as usize % EMOJIS.len()])
+pub fn tag(name: &str, prefix: &str) -> String {
+    format!("{} {}", EMOJIS[crc32(name.as_bytes()) as usize % EMOJIS.len()], display(name, prefix))
 }
 
 /// HTML-escapes `&`, `<` and `>` (Python's `html.escape(…, quote=False)`).

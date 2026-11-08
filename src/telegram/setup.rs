@@ -174,6 +174,18 @@ pub fn run(settings: &TelegramSettings) -> Result<()> {
         .call("getMe", &Params::new(), Duration::from_secs(30), None)
         .context("getMe")?;
     let username = me.get("username").and_then(Value::as_str).unwrap_or("").to_string();
+    // A webhook (another tool, a relay) makes Telegram refuse getUpdates.
+    // Removing it would cut whatever relies on it: say so and stop.
+    let hook = tg
+        .call("getWebhookInfo", &Params::new(), Duration::from_secs(30), None)
+        .context("getWebhookInfo")?;
+    if let Some(url) = hook.get("url").and_then(Value::as_str).filter(|url| !url.is_empty()) {
+        bail!(tr!(
+            fr,
+            "@{username} envoie ses messages à un webhook ({url}) : Telegram refuse alors la lecture dont ASP a besoin. ASP ne le retire pas, un autre service s’en sert. Prends un autre bot, ou retire ce webhook toi-même si plus rien ne s’en sert.",
+            "@{username} delivers its messages to a webhook ({url}): Telegram then refuses the reading ASP needs. ASP won't remove it, since another service relies on it. Use another bot, or remove that webhook yourself if nothing needs it anymore."
+        ));
+    }
     save_token(settings, &token)?;
     // Updates sent before now are skipped: the first message must be new.
     let pending = tg.call("getUpdates", &Params::new().set("offset", -1).set("timeout", 0), Duration::from_secs(30), None)?;

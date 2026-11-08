@@ -85,6 +85,13 @@ pub enum TelegramCommand {
     },
     /// Check the bot, listeners and groups
     Doctor,
+    /// Read the relay (bot.json "relais") for every session of this machine,
+    /// as a launchd or systemd service; --sync only tells it this machine's
+    /// topics and groups
+    Relay {
+        #[arg(long)]
+        sync: bool,
+    },
     /// Install the /telegram skill in every Claude Code profile
     Skill,
     /// The voice-note model: where it is, or (Linux) download it
@@ -138,10 +145,15 @@ pub(crate) struct TelegramSettings {
     data_dir: Option<String>,
     #[cfg(target_os = "macos")]
     keychain_service: Option<String>,
+    /// This machine's token on the bot's relay, when it has one.
+    #[cfg(target_os = "macos")]
+    relay_keychain_service: Option<String>,
 }
 
 #[cfg(target_os = "macos")]
 const DEFAULT_KEYCHAIN_SERVICE: &str = "agents-sleep-preventer-telegram";
+#[cfg(target_os = "macos")]
+const DEFAULT_RELAY_KEYCHAIN_SERVICE: &str = "agents-sleep-preventer-telegram-relay";
 const SKILL: &str = include_str!("SKILL.md");
 const SKILL_MARKER: &str = "Installed by Agent Session Pilot";
 
@@ -236,6 +248,47 @@ fn token(settings: &TelegramSettings) -> Result<String> {
     Ok(token)
 }
 
+/// Reads this machine's relay token (Keychain on macOS, `<data_dir>/relay-token`
+/// with mode 0600 on Linux) when the relay is first called.
+#[cfg(target_os = "macos")]
+fn relay_token_reader(settings: &TelegramSettings) -> Box<dyn Fn() -> Result<String>> {
+    let service = settings
+        .relay_keychain_service
+        .clone()
+        .unwrap_or_else(|| DEFAULT_RELAY_KEYCHAIN_SERVICE.to_string());
+    Box::new(move || {
+        let output = Command::new("/usr/bin/security")
+            .args(["find-generic-password", "-s", &service, "-w"])
+            .output()
+            .context("security")?;
+        let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !output.status.success() || token.is_empty() {
+            bail!("No relay token in the Keychain (service {service}; [telegram] relay_keychain_service in config.toml)");
+        }
+        Ok(token)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn relay_token_reader(settings: &TelegramSettings) -> Box<dyn Fn() -> Result<String>> {
+    use std::os::unix::fs::PermissionsExt;
+    let file = data_dir(settings).join("relay-token");
+    Box::new(move || {
+        let mode = std::fs::metadata(&file)
+            .with_context(|| format!("No relay token: {}", file.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            bail!("{} is readable by others: chmod 600 {}", file.display(), file.display());
+        }
+        let token = std::fs::read_to_string(&file)?.trim().to_string();
+        if token.is_empty() {
+            bail!("No relay token in {}", file.display());
+        }
+        Ok(token)
+    })
+}
+
 /// A running listener: its pid and session.
 type Listener = (u32, String);
 
@@ -278,7 +331,7 @@ fn running_listeners(code: &Path) -> (Vec<Listener>, Vec<Listener>) {
         };
         if command.contains("sync_telegram.cli bot listen") {
             python.push((pid, session_of(&command)));
-        } else if command.contains("telegram listen") && command.contains("asp") {
+        } else if program_name(&command) == "asp" && command.contains(" telegram listen") {
             if let Some(seconds) = elapsed_seconds(elapsed) {
                 if at - seconds < built {
                     old.push((pid, session_of(&command)));
@@ -287,6 +340,17 @@ fn running_listeners(code: &Path) -> (Vec<Listener>, Vec<Listener>) {
         }
     }
     (old, python)
+}
+
+/// The program a `ps` command line runs: "asp" for `/usr/local/bin/asp …`,
+/// "zsh" for the shell a background task wraps a listener in.
+fn program_name(command: &str) -> &str {
+    command
+        .split_whitespace()
+        .next()
+        .and_then(|program| Path::new(program).file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
 }
 
 /// "[[dd-]hh:]mm:ss" (ps etime) in seconds.
@@ -306,10 +370,12 @@ fn open_bot() -> Result<Bot> {
     let settings = settings()?;
     let store = Store::new(data_dir(&settings));
     let tg = api::HttpTelegram::new(token(&settings)?);
+    let relay = api::HttpRelay::new(relay_token_reader(&settings));
     let code = std::env::current_exe().unwrap_or_default();
     Ok(Bot::new(
         store,
         Box::new(tg),
+        Box::new(relay),
         Box::new(move || running_listeners(&code).0),
     ))
 }
@@ -504,6 +570,19 @@ fn execute(command: TelegramCommand) -> Result<i32> {
         TelegramCommand::Read { session, limit } => {
             let name = session.as_deref().map(|s| session_name(Some(s))).transpose()?;
             read(&bot, name.as_deref(), limit);
+            Ok(0)
+        }
+        TelegramCommand::Relay { sync: true } => {
+            let done = bot.relay_sync();
+            println!("{}", if done {
+                say!(bot, "Relais à jour.", "Relay up to date.")
+            } else {
+                say!(bot, "Relais non configuré ou injoignable.", "Relay not configured or unreachable.")
+            });
+            Ok(if done { 0 } else { 2 })
+        }
+        TelegramCommand::Relay { sync: false } => {
+            bot.relay_for_machine()?;
             Ok(0)
         }
         TelegramCommand::Doctor => {
