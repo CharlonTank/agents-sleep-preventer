@@ -27,6 +27,7 @@ struct FakeState {
     topics: bool,
     conflicts: u32,
     lost_thread: bool,
+    wrong_home: bool,
     refuse_download: Option<String>,
     migrated: HashMap<i64, i64>,
 }
@@ -81,6 +82,9 @@ impl Telegram for Fake {
             "getMe" => Ok(json!({"id": 1000000001i64, "username": "TestBot", "has_topics_enabled": state.topics})),
             "getChatMember" => Ok(json!({"status": "administrator"})),
             "createForumTopic" => {
+                if state.wrong_home {
+                    return Err(refused(method, 400, "Bad Request: BOT_TOPIC_WRONG_HOME", None));
+                }
                 state.next_thread += 1;
                 Ok(json!({"message_thread_id": state.next_thread - 1, "name": params.get("name")}))
             }
@@ -442,6 +446,56 @@ fn a_deleted_topic_is_created_again() {
     h.bot.send("Toujours là", "nova-studio", false).unwrap();
     assert_eq!(h.bot.sessions()["nova-studio"].int("thread_id"), Some(78));
     assert_eq!(h.last_sent().get("message_thread_id"), Some("78"));
+}
+
+#[test]
+fn when_telegram_refuses_new_topics_a_session_takes_over_a_stopped_ones() {
+    let mut h = harness();
+    h.topics();
+    h.tg.borrow_mut().wrong_home = true;
+    h.session("old-site", false, json!({"thread_id": 50, "stopped": true, "last_listen": now() - 3600.0}));
+    h.bot.send("Bonjour", "fable", false).unwrap();
+    assert_eq!(h.last_sent().get("message_thread_id"), Some("50"));
+    let sessions = h.bot.sessions();
+    assert_eq!(sessions["fable"].int("thread_id"), Some(50));
+    assert_eq!(sessions["old-site"].int("thread_id"), None);
+    let renamed = h.calls("editForumTopic").pop().unwrap();
+    assert_eq!((renamed.get("message_thread_id"), renamed.get("name")), (Some("50"), Some("fable")));
+    h.dispatch(message(1, 60, "salut", json!({"message_thread_id": 50, "is_topic_message": true})));
+    assert_eq!(h.inbox("fable"), ["salut"]);
+}
+
+#[test]
+fn never_the_topic_of_a_live_bound_or_waiting_session() {
+    let mut h = harness();
+    h.topics();
+    h.tg.borrow_mut().wrong_home = true;
+    h.session("live", true, json!({"thread_id": 51}));
+    h.session("recent", false, json!({"thread_id": 52, "last_listen": now() - 3600.0}));
+    h.session("waiting", false, json!({"thread_id": 53, "stopped": true}));
+    h.bot.store
+        .write(&h.bot.store.path(&["inbox", "waiting", "1.json"]), &json!({"update_id": 1, "text": "x"}))
+        .unwrap();
+    h.group();
+    h.session("alice-site", false, json!({"thread_id": 54, "stopped": true}));
+    h.bot.start("fable", &[], false).unwrap();
+    let hello = h.last_sent();
+    assert!(hello.get("message_thread_id").is_none());
+    assert!(Harness::text_of(&hello).contains("Telegram a refusé de me créer un fil"));
+    assert_eq!(h.bot.sessions()["fable"].int("thread_id"), None);
+    assert!(h.calls("editForumTopic").is_empty());
+}
+
+#[test]
+fn the_longest_gone_session_gives_up_its_topic_first() {
+    let mut h = harness();
+    h.topics();
+    h.tg.borrow_mut().wrong_home = true;
+    h.session("a", false, json!({"thread_id": 60, "stopped": true, "last_listen": now() - 100.0}));
+    h.session("b", false, json!({"thread_id": 61, "last_listen": now() - 30.0 * 86400.0}));
+    h.bot.send("Bonjour", "fable", false).unwrap();
+    assert_eq!(h.bot.sessions()["fable"].int("thread_id"), Some(61));
+    assert_eq!(h.bot.sessions()["a"].int("thread_id"), Some(60));
 }
 
 #[test]

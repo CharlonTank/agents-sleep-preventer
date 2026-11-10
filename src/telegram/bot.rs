@@ -783,26 +783,74 @@ impl Bot {
             return Some(thread);
         }
         let color = TOPIC_COLORS[crc32(name.as_bytes()) as usize % TOPIC_COLORS.len()];
-        let created = self.chat_id().map_err(|e| e.to_string()).and_then(|chat| {
-            self.api(
-                "createForumTopic",
-                Params::new()
-                    .set("chat_id", chat)
-                    .set("name", display(name, &self.prefix()))
-                    .set("icon_color", color),
-            )
-            .map_err(|e| e.to_string())
-        });
+        let chat = self.chat_id().ok()?;
+        let created = self.api(
+            "createForumTopic",
+            Params::new()
+                .set("chat_id", chat)
+                .set("name", display(name, &self.prefix()))
+                .set("icon_color", color),
+        );
         let thread = match created {
-            Ok(created) => created.get("message_thread_id").and_then(Value::as_i64),
-            Err(reason) => {
-                eprintln!("asp telegram: topic for {name} not created ({reason}); messages carry its name");
-                None
+            Ok(created) => {
+                let thread = created.get("message_thread_id").and_then(Value::as_i64)?;
+                self.update_session(name, obj(json!({"thread_id": thread}))).ok()?;
+                thread
             }
-        }?;
-        self.update_session(name, obj(json!({"thread_id": thread}))).ok()?;
+            Err(error) => {
+                let recycled = if error.mentions(&["wrong_home"]) { self.recycle_thread(name, chat) } else { None };
+                if recycled.is_none() {
+                    eprintln!("asp telegram: topic for {name} not created ({error}); messages carry its name");
+                }
+                recycled?
+            }
+        };
         drop(lock);
         self.relay_sync();
+        Some(thread)
+    }
+
+    /// Since 09/11/2026 Telegram refuses the bot new topics in the private
+    /// chat (BOT_TOPIC_WRONG_HOME, tdlib/telegram-bot-api#944) while existing
+    /// ones keep working. The session takes over the topic of a session that
+    /// was stopped or gone for a week, with no group and nothing waiting,
+    /// oldest first, and renames it. Called under the `fils` lock.
+    fn recycle_thread(&self, name: &str, chat: i64) -> Option<i64> {
+        let at = now();
+        let bound: Vec<String> = self
+            .groups()
+            .values()
+            .filter_map(|group| group.text("session").map(str::to_string))
+            .collect();
+        let last = |data: &Object| match data.float("last_listen") {
+            listened if listened > 0.0 => listened,
+            _ => data.float("created"),
+        };
+        let (_, other, thread) = self
+            .sessions()
+            .into_iter()
+            .filter(|(other, data)| {
+                other != name
+                    && !bound.contains(other)
+                    && !self.listening(other)
+                    && self.waiting(other) == 0
+                    && (data.flag("stopped") || at - last(data) > SHOWN)
+            })
+            .filter_map(|(other, data)| Some((last(&data), other, data.int("thread_id")?)))
+            .min_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)))?;
+        self.update_session(&other, obj(json!({"thread_id": null, "threads": [], "stopped": true})))
+            .ok()?;
+        self.update_session(name, obj(json!({"thread_id": thread}))).ok()?;
+        if let Err(error) = self.api(
+            "editForumTopic",
+            Params::new()
+                .set("chat_id", chat)
+                .set("message_thread_id", thread)
+                .set("name", display(name, &self.prefix())),
+        ) {
+            eprintln!("asp telegram: topic {thread} not renamed ({error})");
+        }
+        eprintln!("asp telegram: Telegram refuses new topics; {name} takes over {other}'s ({thread})");
         Some(thread)
     }
 
@@ -2401,11 +2449,20 @@ impl Bot {
                 .chain(data.list("aliases").iter().filter_map(|a| a.as_str().map(str::to_string)))
                 .min_by_key(|candidate| candidate.chars().count())
                 .unwrap_or_else(|| name.to_string());
-            say!(
+            let mut hello = say!(
                 self,
                 "Je t’écoute depuis {place}. Pour m’écrire : commence ton message par « {short}: », ou réponds à un de mes messages.",
                 "Listening from {place}. To write to me: start your message with \"{short}:\", or reply to one of my messages."
-            )
+            );
+            if self.topics_enabled().unwrap_or(false) {
+                hello.push('\n');
+                hello.push_str(&say!(
+                    self,
+                    "Telegram a refusé de me créer un fil, et aucun fil de session arrêtée n’était libre.",
+                    "Telegram refused to create my topic, and no stopped session's topic was free."
+                ));
+            }
+            hello
         };
         if let Some((_, group)) = &bound {
             let title = group.text("title").unwrap_or("");
