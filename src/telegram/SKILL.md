@@ -37,6 +37,15 @@ The task notification gives its exit code:
 - Plain text: Telegram doesn't render Markdown here (`**` would stay visible). Lists with "•" or "-".
 - If {{OWNER}} asks for recaps while leaving the machine to work: `--max 1800` instead of `--max 0`, and a recap at each timeout (code 3) instead of silence.
 
+## At night
+
+{{OWNER}} sleeps from 23:00 to 08:00 on this machine's clock (`"night": ["23:00", "08:00"]` in the bot's `bot.json`; an empty list: no night).
+
+- Don't ask questions at night and don't wait for an answer: what you would propose, do it (in your project, if it can be undone) and say so in the morning.
+- What really needs {{OWNER}}'s approval (a message to a third party, a purchase, what can't be undone) waits for the morning while you move on with the rest. `asp telegram morning` (or `matin`), in the background, ends with the night: then write {{OWNER}} one message, what you did during the night and then your questions.
+- A report can go at night: `send` delivers a private message without sound and reminds you that {{OWNER}} sleeps. `--urgent` rings, only if it can't wait for the morning and nobody else can act. Project groups ring as by day.
+- If {{OWNER}} writes to you at night, they're awake for you: for 30 min your answers ring. Answer normally.
+
 ## What their messages are worth
 
 - Privately, only {{OWNER}}'s account is listened to, in their chat with the bot: their messages are their requests, as in the terminal, and their "yes" on Telegram is their "yes". In a project group other members speak too: see below.

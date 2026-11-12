@@ -2,7 +2,7 @@
 //! Scenarios ported from sync-telegram's test suite, so both behave alike.
 
 use super::api::{ApiError, Params, Relay, Telegram};
-use super::bot::{Bot, Extras};
+use super::bot::{within, Bot, Extras, Notice};
 use super::store::{now, Fields, Lock, Object, Store};
 use super::text::tag;
 use serde_json::{json, Value};
@@ -151,7 +151,7 @@ fn harness() -> Harness {
     store
         .write(
             &store.path(&["bot.json"]),
-            &json!({"user_id": OWNER, "chat_id": OWNER, "name": "Sam", "language": "fr",
+            &json!({"user_id": OWNER, "chat_id": OWNER, "name": "Sam", "language": "fr", "night": [],
                     "username": "TestBot", "topics": {"enabled": false, "checked_at": now()}}),
         )
         .unwrap();
@@ -1374,7 +1374,7 @@ fn buttons_under_a_card_the_choice_goes_back_to_the_session() {
     h.live("alice-site");
     let text = "LUKA-3 · Couper la pub « Peau nette » ?";
     let labels = ["Oui".to_string(), "Non".to_string()];
-    let extras = Extras { topic: Some("Luka Beauté"), buttons: &labels };
+    let extras = Extras { topic: Some("Luka Beauté"), buttons: &labels, ..Extras::default() };
     let id = h.bot.send_with(text, "alice-site", false, extras).unwrap()[0];
     let sent = h.last_sent();
     assert_eq!(buttons(&sent), ["b:0", "b:1"]);
@@ -1465,4 +1465,163 @@ fn refused_buttons_send_nothing() {
     let sent = h.sent();
     assert!(sent[sent.len() - 2].get("reply_markup").is_none());
     assert_eq!(buttons(&sent[sent.len() - 1]), ["b:0", "b:1"]);
+}
+
+// The owner's night: what is written to them privately doesn't ring, and
+// send tells the session (ported from sync-telegram's NightTests).
+
+/// Today at this time of the machine's clock.
+fn today_at(hour: i32, minute: i32) -> f64 {
+    let at = now() as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&at, &mut tm) };
+    (tm.tm_hour, tm.tm_min, tm.tm_sec, tm.tm_isdst) = (hour, minute, 0, -1);
+    unsafe { libc::mktime(&mut tm) as f64 }
+}
+
+impl Harness {
+    fn night(&self) {
+        self.bot.update_config(obj(json!({"night": ["00:00", "24:00"]}))).unwrap();
+    }
+
+    fn silent(params: &Params) -> bool {
+        params.get("disable_notification") == Some("true")
+    }
+
+    fn last_entry(&self) -> Object {
+        self.bot.store.entries().pop().unwrap()
+    }
+}
+
+#[test]
+fn the_hours_of_the_night() {
+    let minutes = |clock: &str| {
+        let (hours, minutes) = clock.split_once(':').unwrap();
+        hours.parse::<u32>().unwrap() * 60 + minutes.parse::<u32>().unwrap()
+    };
+    let inside = |start, end, clocks: &[&str]| clocks.iter().map(|c| within(start, end, minutes(c))).collect::<Vec<_>>();
+    assert_eq!(
+        inside("23:00", "08:00", &["22:59", "23:00", "03:26", "07:59", "08:00", "15:00"]),
+        [false, true, true, true, false, false]
+    );
+    assert_eq!(inside("01:00", "06:30", &["00:59", "01:00", "06:29", "06:30"]), [false, true, true, false]);
+    let h = harness();
+    h.bot.update_config(obj(json!({"night": ["23:00", "08:00"]}))).unwrap();
+    assert_eq!(h.bot.night(today_at(3, 26)), Some(("23:00".to_string(), "08:00".to_string())));
+    assert_eq!(h.bot.night(today_at(15, 0)), None);
+    h.bot.update_config(obj(json!({"night": []}))).unwrap();
+    assert_eq!(h.bot.night(today_at(3, 0)), None);
+}
+
+#[test]
+fn without_a_setting_the_night_goes_from_23_to_8() {
+    let h = harness();
+    let file = h.bot.store.path(&["bot.json"]);
+    let mut settings = h.bot.config().unwrap();
+    settings.remove("night");
+    h.bot.store.write(&file, &Value::Object(settings)).unwrap();
+    assert_eq!(h.bot.night(today_at(4, 4)), Some(("23:00".to_string(), "08:00".to_string())));
+    assert_eq!(h.bot.night(today_at(12, 0)), None);
+}
+
+#[test]
+fn at_night_a_private_message_goes_without_sound_and_send_says_so() {
+    let mut h = harness();
+    h.night();
+    h.live("fable");
+    assert!(h.bot.asleep(Some("fable"), now()));
+    h.bot.send("Je fais la correction ?", "fable", false).unwrap();
+    assert!(Harness::silent(&h.last_sent()));
+    assert_eq!(h.last_entry().get("silent"), Some(&json!(true)));
+    let note = h.bot.night_note(now());
+    for said in ["Sam dort (nuit de 00:00 à 24:00)", "ne pose pas de question la nuit", "asp telegram matin"] {
+        assert!(note.contains(said), "{note}");
+    }
+}
+
+#[test]
+fn by_day_nothing_changes() {
+    let mut h = harness();
+    h.live("fable");
+    assert!(!h.bot.asleep(Some("fable"), now()));
+    h.bot.send("Fait.", "fable", false).unwrap();
+    assert!(h.last_sent().get("disable_notification").is_none());
+    assert!(h.last_entry().get("silent").is_none());
+}
+
+#[test]
+fn at_night_the_session_the_owner_talks_to_rings_the_others_dont() {
+    let mut h = harness();
+    h.night();
+    h.live("fable");
+    h.live("autre");
+    h.bot.store.journal(&json!({"at": now() - 60.0, "from": "charles", "session": "fable", "message_id": 30, "text": "tu es là ?"}));
+    h.bot.send("Oui.", "fable", false).unwrap();
+    assert!(!Harness::silent(&h.last_sent()));
+    assert!(h.bot.asleep(Some("autre"), now()));
+    h.bot.send("Un souci cette nuit.", "autre", false).unwrap();
+    assert!(Harness::silent(&h.last_sent()));
+}
+
+#[test]
+fn at_night_an_old_message_from_the_owner_doesnt_wake_them() {
+    let mut h = harness();
+    h.night();
+    h.live("fable");
+    h.bot.store.journal(&json!({"at": now() - 3600.0, "from": "owner", "session": "fable", "message_id": 30, "text": "bonne nuit"}));
+    h.bot.send("Fait.", "fable", false).unwrap();
+    assert!(Harness::silent(&h.last_sent()));
+}
+
+#[test]
+fn urgent_rings_at_night() {
+    let mut h = harness();
+    h.night();
+    h.live("fable");
+    let urgent = Extras { urgent: true, ..Extras::default() };
+    h.bot.send_with("La prod est tombée.", "fable", false, urgent).unwrap();
+    assert!(h.last_sent().get("disable_notification").is_none());
+    assert!(h.last_entry().get("silent").is_none());
+}
+
+#[test]
+fn at_night_a_file_goes_without_sound() {
+    let mut h = harness();
+    h.night();
+    h.live("fable");
+    let file = h.dir.path().join("rapport.pdf");
+    std::fs::write(&file, b"%PDF").unwrap();
+    h.bot.send_document(&file, "fable", "Le rapport", false, Extras::default()).unwrap();
+    assert!(Harness::silent(&h.calls("sendDocument").pop().unwrap()));
+    assert_eq!(h.last_entry().get("silent"), Some(&json!(true)));
+}
+
+#[test]
+fn at_night_the_project_group_rings_as_by_day() {
+    let mut h = harness();
+    h.night();
+    h.group();
+    h.live("alice-site");
+    h.bot.send("C’est en ligne.", "alice-site", false).unwrap();
+    let sent = h.last_sent();
+    assert_eq!(sent.get("chat_id"), Some(GROUP.to_string().as_str()));
+    assert!(sent.get("disable_notification").is_none());
+    h.bot.send("Alice demande un nom de domaine.", "alice-site", true).unwrap();
+    assert!(Harness::silent(&h.last_sent()));
+}
+
+#[test]
+fn at_night_the_bots_notices_and_the_ram_alerts_go_without_sound() {
+    let h = harness();
+    h.night();
+    h.bot.notify("⏳ fable n’écoute pas.", Notice::default()).unwrap();
+    assert!(Harness::silent(&h.last_sent()));
+    h.bot.send("• RAM — fable : 12 Go", "moniteur", true).unwrap(); // how the monitor tells the owner
+    assert!(Harness::silent(&h.last_sent()));
+}
+
+#[test]
+fn by_day_morning_returns_at_once() {
+    let h = harness();
+    assert!(h.bot.morning(Duration::from_secs(3600)) < 1.0);
 }

@@ -67,7 +67,15 @@ pub enum TelegramCommand {
         /// Buttons under the message, "Yes|No": a press comes back to the session as a message
         #[arg(long, alias = "boutons")]
         buttons: Option<String>,
+        /// Rings even during the owner's night: only if it can't wait for
+        /// the morning and nobody else can act
+        #[arg(long)]
+        urgent: bool,
     },
+    /// Wait for the end of the owner's night (in the background), to write
+    /// to them in the morning
+    #[command(alias = "matin")]
+    Morning,
     /// Stop listening for this session
     Stop {
         #[arg(long)]
@@ -519,7 +527,7 @@ fn execute(command: TelegramCommand) -> Result<i32> {
             }
             Ok(if received.is_empty() { 3 } else { 0 })
         }
-        TelegramCommand::Send { session, text: message, file, document, private, topic, buttons } => {
+        TelegramCommand::Send { session, text: message, file, document, private, topic, buttons, urgent } => {
             let name = session_name(session.as_deref())?;
             let message = match file {
                 Some(file) => Some(std::fs::read_to_string(&file).with_context(|| file.display().to_string())?),
@@ -534,13 +542,16 @@ fn execute(command: TelegramCommand) -> Result<i32> {
                 .filter(|label| !label.trim().is_empty())
                 .map(str::to_string)
                 .collect();
-            let extras = Extras { topic: topic.as_deref(), buttons: &buttons };
-            let place = match (bot.group_of(&name), &topic) {
-                (Some((_, group)), Some(topic)) if !private => {
+            let extras = Extras { topic: topic.as_deref(), buttons: &buttons, urgent };
+            let bound = if private { None } else { bot.group_of(&name) };
+            // The owner sleeps: no sound, and the session is told.
+            let sleeping = bound.is_none() && !urgent && bot.asleep(Some(&name), store::now());
+            let place = match (bound, &topic) {
+                (Some((_, group)), Some(topic)) => {
                     let title = group.text("title").unwrap_or("").to_string();
                     say!(bot, "dans le groupe « {title} », sujet « {topic} »", "in the group \"{title}\", topic \"{topic}\"")
                 }
-                (Some((_, group)), None) if !private => {
+                (Some((_, group)), None) => {
                     let title = group.text("title").unwrap_or("").to_string();
                     say!(bot, "dans le groupe « {title} »", "in the group \"{title}\"")
                 }
@@ -550,13 +561,35 @@ fn execute(command: TelegramCommand) -> Result<i32> {
                 bot.send_document(&document, &name, message.as_deref().unwrap_or(""), private, extras)?;
                 let shown = document.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 println!("{}", say!(bot, "Fichier envoyé {place} ({name}) : {shown}", "File sent {place} ({name}): {shown}"));
-                return Ok(0);
+            } else {
+                let Some(message) = message.filter(|m| !m.trim().is_empty()) else {
+                    bail!(say!(bot, "Rien à envoyer : --text ou --file", "Nothing to send: --text or --file"));
+                };
+                let count = bot.send_with(&message, &name, private, extras)?.len();
+                println!("{}", say!(bot, "Envoyé {place} ({name}) : {count} message(s).", "Sent {place} ({name}): {count} message(s)."));
             }
-            let Some(message) = message.filter(|m| !m.trim().is_empty()) else {
-                bail!(say!(bot, "Rien à envoyer : --text ou --file", "Nothing to send: --text or --file"));
+            if sleeping {
+                println!("{}", bot.night_note(store::now()));
+            }
+            Ok(0)
+        }
+        TelegramCommand::Morning => {
+            let waited = bot.morning(std::time::Duration::from_secs(30));
+            let at = store::now();
+            let time = text::stamp(at, at);
+            let state = if waited >= 1.0 {
+                say!(bot, "la nuit de {owner} est finie.", "{owner}'s night is over.")
+            } else {
+                say!(bot, "ce n’est pas la nuit de {owner}.", "it isn't {owner}'s night.")
             };
-            let count = bot.send_with(&message, &name, private, extras)?.len();
-            println!("{}", say!(bot, "Envoyé {place} ({name}) : {count} message(s).", "Sent {place} ({name}): {count} message(s)."));
+            println!(
+                "{}",
+                say!(
+                    bot,
+                    "Il est {time} : {state} Écris à {owner} un seul message : ce que tu as fait cette nuit, puis les questions qui attendaient.",
+                    "It is {time}: {state} Write {owner} a single message: what you did during the night, then the questions that were waiting."
+                )
+            );
             Ok(0)
         }
         TelegramCommand::Stop { session, announce_group } => {

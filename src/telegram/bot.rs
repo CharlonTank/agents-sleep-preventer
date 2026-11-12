@@ -21,7 +21,7 @@
 
 use super::api::{ApiError, Params, Relay, Telegram};
 use super::store::{now, Fields, Lock, Object, Store};
-use super::text::{address, chunks, crc32, day_and_time, display, escape, normal, stamp, tag};
+use super::text::{address, chunks, crc32, day_and_time, display, escape, local_time, normal, stamp, tag};
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 use std::cell::OnceCell;
@@ -169,6 +169,30 @@ fn topic_gone(error: &ApiError) -> bool {
 /// (`b:<rank>`; `b:x` once one was chosen), as in sync-telegram.
 const BUTTON: &str = "b:";
 
+/// The owner's night, on the machine's clock; "night" in bot.json (an empty
+/// list: no night).
+const NIGHT: (&str, &str) = ("23:00", "08:00");
+/// The owner wrote to the session less than 30 min ago: they are talking to
+/// it, its answer rings.
+const AWAKE: f64 = 1800.0;
+
+/// Minutes since midnight of "HH:MM".
+fn clock(text: &str) -> u32 {
+    let (hours, minutes) = text.split_once(':').unwrap_or((text, "0"));
+    hours.trim().parse::<u32>().unwrap_or(0) * 60 + minutes.trim().parse::<u32>().unwrap_or(0)
+}
+
+/// Whether the minute `current` of the day falls between `start` and `end`,
+/// across midnight when `end` comes first.
+pub(crate) fn within(start: &str, end: &str, current: u32) -> bool {
+    let (start, end) = (clock(start), clock(end));
+    if start < end {
+        start <= current && current < end
+    } else {
+        current >= start || current < end
+    }
+}
+
 /// What a session's message carries besides its text.
 #[derive(Default, Clone, Copy)]
 pub struct Extras<'a> {
@@ -177,6 +201,8 @@ pub struct Extras<'a> {
     pub topic: Option<&'a str>,
     /// Buttons under the (last) message; a press comes back to the session.
     pub buttons: &'a [String],
+    /// Rings even during the owner's night.
+    pub urgent: bool,
 }
 
 /// The topic a message was written in, if any.
@@ -1006,11 +1032,85 @@ impl Bot {
         Some(thread)
     }
 
+    // The owner's night: what is written to them privately goes without
+    // sound, `send` tells the session they won't answer before the morning,
+    // and `morning` waits for its end. Same setting and journal field as
+    // sync-telegram.
+
+    /// (start, end) of the owner's night if `at` falls in it.
+    pub fn night(&self, at: f64) -> Option<(String, String)> {
+        let settings = self.config().unwrap_or_default();
+        let (start, end) = match settings.get("night") {
+            None => (NIGHT.0.to_string(), NIGHT.1.to_string()),
+            Some(Value::Array(span)) => match span.as_slice() {
+                [Value::String(start), Value::String(end)] => (start.clone(), end.clone()),
+                _ => return None,
+            },
+            Some(_) => return None,
+        };
+        let moment = local_time(at);
+        within(&start, &end, moment.hour * 60 + moment.minute).then_some((start, end))
+    }
+
+    /// Whether the owner sleeps for this session: it is night, and they
+    /// haven't written to it for 30 min (talking to it, they're awake for it).
+    pub fn asleep(&self, name: Option<&str>, at: f64) -> bool {
+        if self.night(at).is_none() {
+            return false;
+        }
+        let Some(name) = name else {
+            return true;
+        };
+        !self
+            .store
+            .entries()
+            .iter()
+            .rev()
+            .take_while(|entry| at - entry.float("at") < AWAKE)
+            .any(|entry| from_owner(entry) && entry.text("session") == Some(name))
+    }
+
+    /// A private message to the owner while they sleep goes without sound
+    /// (unless `urgent`), marked `silent` in the journal.
+    fn hush(&self, params: Params, record: &mut Object, name: Option<&str>, urgent: bool) -> Params {
+        if urgent || !self.asleep(name, now()) {
+            return params;
+        }
+        record.insert("silent".into(), json!(true));
+        params.set("disable_notification", true)
+    }
+
+    /// What `send` tells the session that writes to the owner while they sleep.
+    pub fn night_note(&self, at: f64) -> String {
+        let (start, end) = self
+            .night(at)
+            .unwrap_or_else(|| (NIGHT.0.to_string(), NIGHT.1.to_string()));
+        let time = local_time(at);
+        let time = format!("{:02}:{:02}", time.hour, time.minute);
+        let owner = self.owner();
+        say!(
+            self,
+            "Il est {time} : {owner} dort (nuit de {start} à {end}). Message remis sans sonnerie, à lire au réveil.\nN’attends pas de réponse et ne pose pas de question la nuit : ce que tu proposerais, fais-le (dans ton projet, si ça se défait) et dis-le au matin. Ce qui demande vraiment l’accord de {owner} attend le matin pendant que tu avances sur le reste : « asp telegram matin », en tâche de fond, se termine à {end}. --urgent (qui sonne) : seulement si ça ne peut pas attendre le matin et que personne d’autre que {owner} ne peut agir.",
+            "It is {time}: {owner} is asleep (night from {start} to {end}). Message delivered without sound, to be read on waking.\nDon't wait for an answer and don't ask questions at night: what you would propose, do it (in your project, if it can be undone) and say so in the morning. What really needs {owner}'s approval waits for the morning while you move on with the rest: \"asp telegram morning\", in the background, ends at {end}. --urgent (which rings): only if it can't wait for the morning and nobody but {owner} can act."
+        )
+    }
+
+    /// Waits for the end of the owner's night; returns the seconds waited
+    /// (0: it is already day).
+    pub fn morning(&self, step: Duration) -> f64 {
+        let began = now();
+        while self.night(now()).is_some() {
+            std::thread::sleep(step);
+        }
+        now() - began
+    }
+
     // Sending.
 
     /// A message to the owner (or into the group `chat`), journaled with
-    /// `record` (who speaks, for which session).
-    fn post(&self, params: Params, record: Object, chat: Option<i64>) -> Result<i64> {
+    /// `record` (who speaks, for which session). To the owner while they
+    /// sleep: without sound, unless `urgent`.
+    fn post(&self, params: Params, record: Object, chat: Option<i64>, urgent: bool) -> Result<i64> {
         let params = Params::new()
             .json("link_preview_options", &json!({"is_disabled": true}))
             .merge(params);
@@ -1023,6 +1123,8 @@ impl Bot {
             }
             None => {
                 let chat = self.chat_id()?;
+                let name = record.text("session").map(str::to_string);
+                let params = self.hush(params, &mut record, name.as_deref(), urgent);
                 self.api("sendMessage", Params::new().set("chat_id", chat).merge(params))?
             }
         };
@@ -1150,7 +1252,8 @@ impl Bot {
     }
 
     /// `send`, in a named topic of the project group and/or with buttons
-    /// under the last message.
+    /// under the last message. To the owner while they sleep: without
+    /// sound, unless `extras.urgent`.
     pub fn send_with(&self, text: &str, name: &str, private: bool, extras: Extras) -> Result<Vec<i64>> {
         self.register_if_new(name)?;
         if !extras.buttons.is_empty() {
@@ -1175,7 +1278,7 @@ impl Bot {
                     obj(json!({"from": "claude", "session": name, "thread_id": thread, "text": part})),
                     Self::buttons_of(extras, index, parts.len()),
                 )?;
-                match self.post(params, record, None) {
+                match self.post(params, record, None, extras.urgent) {
                     Ok(id) => {
                         ids.push(id);
                         break;
@@ -1199,7 +1302,8 @@ impl Bot {
 
     /// A file from a session (PDF, image…), where its messages go (in the
     /// group's topic `extras.topic` when given); `caption` goes with it
-    /// (Telegram cuts it at 1024 characters).
+    /// (Telegram cuts it at 1024 characters). To the owner while they sleep:
+    /// without sound, unless `extras.urgent`.
     pub fn send_document(&self, file: &Path, name: &str, caption: &str, private: bool, extras: Extras) -> Result<i64> {
         if !file.is_file() {
             let shown = file.display();
@@ -1250,7 +1354,8 @@ impl Bot {
             if !text.is_empty() {
                 params = params.set("caption", short(&text));
             }
-            let (params, record) = self.with_buttons(params, record.clone(), extras.buttons)?;
+            let (params, mut record) = self.with_buttons(params, record.clone(), extras.buttons)?;
+            let params = self.hush(params, &mut record, Some(name), extras.urgent);
             match self.tg.call("sendDocument", &params, UPLOAD_TIMEOUT, Some(file)) {
                 Ok(message) => {
                     let id = message.get("message_id").and_then(Value::as_i64).unwrap_or(0);
@@ -1292,12 +1397,12 @@ impl Bot {
                 Some(thread) => params.set("message_thread_id", thread),
                 None => params,
             };
-            return self.post(params, record, Some(chat));
+            return self.post(params, record, Some(chat), false);
         }
         if let Some(thread) = notice.thread {
             let mut in_thread = record.clone();
             in_thread.insert("thread_id".into(), json!(thread));
-            match self.post(params.clone().set("message_thread_id", thread), in_thread, None) {
+            match self.post(params.clone().set("message_thread_id", thread), in_thread, None, false) {
                 Ok(id) => return Ok(id),
                 Err(error) => {
                     if !api_error(&error).is_some_and(|e| e.mentions(&["thread"])) {
@@ -1306,7 +1411,7 @@ impl Bot {
                 }
             }
         }
-        self.post(params, record, None)
+        self.post(params, record, None, false)
     }
 
     /// 👀 on the received message (the owner's, or a member's in their
