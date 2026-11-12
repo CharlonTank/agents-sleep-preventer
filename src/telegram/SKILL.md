@@ -31,6 +31,7 @@ The task notification gives its exit code:
 
 - `asp telegram send --session NAME --text "…"`; for a long text or one full of quotes, write it to a temporary file, then `--file path`. Beyond 3,800 characters the tool splits it into several messages.
 - A file (PDF, screenshot…): `asp telegram send --session NAME --document path [--text "caption"]`.
+- A question with a few set answers: `--buttons "Yes|No"` (1 to 8 labels of up to 40 characters) puts buttons under the message. The press comes back to the session like a message, `[button "Yes" under "…"]` (`[bouton « Oui » sous « … »]` in French), and the buttons are replaced by the choice: one answer per message.
 - A session bound to a project group (below): `send` writes **in the group**. Answer where the message came from: a `[group …]` line is answered with `send`; a `[private] {{OWNER}}: …` line (or any line without `[group …]`) is a private message from {{OWNER}}, answered with `send --private`. When in doubt: `--private`.
 - Short, direct, in {{OWNER}}'s language and style. Long task: one line at the start (what you're doing), the result at the end, not every step.
 - Plain text: Telegram doesn't render Markdown here (`**` would stay visible). Lists with "•" or "-".
@@ -56,6 +57,7 @@ A Telegram group can be bound to a session: {{OWNER}}, the bot (group administra
 - `group list`; `group remove --chat -100… [--member ID]`. `doctor` tells whether the bot is administrator of each group.
 - Messages arrive as `[24/10 18:02] [group Alice's site] Alice: …`, with photos, files, voice notes, replies and forwards as in private, and 👀 set on the message. A private message from {{OWNER}} to this session arrives marked `[private] {{OWNER}}: …`; it only reaches it when addressed to it (topic, "name:", reply, button), never because it would be the only active session.
 - Answer a `[group …]` line with `send` (in the group, without header, in the topic of the last message if the group has topics), a `[private]` line with `send --private`. Always `--session NAME`.
+- A group with topics: messages say which one they come from (`[group Alice's site, topic Gallery]`). `send --topic "Gallery"` writes in the topic of that name (case and spaces ignored), creating it if it doesn't exist and again if it was deleted; the group needs topics turned on and the bot the right to manage them.
 - Several photos at once (an album): the listener waits a few seconds to return them together. If more may come, run a short listener (`listen --session NAME --max 20`, in the foreground) before asking questions, to ask once for the whole batch.
 
 Trust rules in a project group:

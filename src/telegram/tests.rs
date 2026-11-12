@@ -2,7 +2,7 @@
 //! Scenarios ported from sync-telegram's test suite, so both behave alike.
 
 use super::api::{ApiError, Params, Relay, Telegram};
-use super::bot::Bot;
+use super::bot::{Bot, Extras};
 use super::store::{now, Fields, Lock, Object, Store};
 use super::text::tag;
 use serde_json::{json, Value};
@@ -425,7 +425,7 @@ fn a_file_goes_to_the_session_topic_with_its_caption() {
     h.topics();
     let pdf = h.dir.path().join("INV-000155-octobre-2026.pdf");
     std::fs::write(&pdf, b"%PDF-1.4").unwrap();
-    h.bot.send_document(&pdf, "invoices", "INV-000155 (brouillon)", false).unwrap();
+    h.bot.send_document(&pdf, "invoices", "INV-000155 (brouillon)", false, Extras::default()).unwrap();
     let sent = h.calls("sendDocument").pop().unwrap();
     assert_eq!(
         (sent.get("message_thread_id"), sent.get("caption"), sent.get("document")),
@@ -957,8 +957,8 @@ fn a_file_goes_to_the_group_or_privately() {
     h.group();
     let image = h.dir.path().join("apercu.png");
     std::fs::write(&image, b"png").unwrap();
-    h.bot.send_document(&image, "alice-site", "La nouvelle page", false).unwrap();
-    h.bot.send_document(&image, "alice-site", "pour toi", true).unwrap();
+    h.bot.send_document(&image, "alice-site", "La nouvelle page", false, Extras::default()).unwrap();
+    h.bot.send_document(&image, "alice-site", "pour toi", true, Extras::default()).unwrap();
     let sent = h.calls("sendDocument");
     assert_eq!(
         (sent[0].get("chat_id"), sent[0].get("caption"), sent[0].get("document")),
@@ -1220,4 +1220,249 @@ fn a_listener_is_the_asp_process_not_the_shell_around_it() {
     assert_eq!(super::program_name("/Applications/AgentsSleepPreventer.app/Contents/MacOS/asp telegram listen --session x"), "asp");
     assert_eq!(super::program_name("asp telegram listen --session x --max 0"), "asp");
     assert_eq!(super::program_name("/bin/zsh -c source s.sh && eval 'asp telegram listen --session x --max 0'"), "zsh");
+}
+
+// Named topics of a project group and buttons, as in sync-telegram
+// (`send --sujet`, `--boutons`): same fields in groups.json and the inboxes.
+
+impl Harness {
+    fn topics_created(&self) -> Vec<(String, String)> {
+        self.calls("createForumTopic")
+            .iter()
+            .map(|p| (p.get("chat_id").unwrap().to_string(), p.get("name").unwrap().to_string()))
+            .collect()
+    }
+
+    fn group_topics(&self) -> Value {
+        self.bot.groups()[&GROUP].get("topics").cloned().unwrap_or(Value::Null)
+    }
+
+    fn press(&self, update_id: i64, data: &str, card: &Value, sender: i64, name: &str) -> i32 {
+        self.dispatch(json!({"update_id": update_id, "callback_query": {
+            "id": format!("q{update_id}"), "from": {"id": sender, "first_name": name}, "data": data, "message": card}}))
+    }
+
+    fn answers(&self) -> Vec<String> {
+        self.calls("answerCallbackQuery").iter().map(Harness::text_of).collect()
+    }
+}
+
+fn in_topic(update_id: i64, text: &str, topic: i64, extra: Value) -> Value {
+    let mut extra = obj(extra);
+    extra.extend(obj(json!({"message_thread_id": topic, "is_topic_message": true})));
+    group_message(update_id, update_id + 100, text, ALICE, "Alice", GROUP, Value::Object(extra))
+}
+
+fn topic(name: &str) -> Extras<'_> {
+    Extras { topic: Some(name), ..Extras::default() }
+}
+
+#[test]
+fn a_named_topic_is_created_once() {
+    let h = harness();
+    h.group();
+    h.bot.send_with("Carte 1", "alice-site", false, topic("Luka Beauté")).unwrap();
+    h.bot.send_with("Carte 2", "alice-site", false, topic("  luka   beauté ")).unwrap();
+    h.bot.send_with(&"x".repeat(5000), "alice-site", false, topic("Évolutions")).unwrap(); // two messages, one topic
+    let group = GROUP.to_string();
+    assert_eq!(
+        h.topics_created(),
+        [(group.clone(), "Luka Beauté".to_string()), (group, "Évolutions".to_string())]
+    );
+    let threads: Vec<String> = h.sent().iter().map(|p| p.get("message_thread_id").unwrap().to_string()).collect();
+    assert_eq!(threads, ["77", "77", "78", "78"]);
+    assert_eq!(h.group_topics(), json!({"77": "Luka Beauté", "78": "Évolutions"}));
+    assert_eq!(h.bot.groups()[&GROUP].int("topic"), None); // where answers go doesn't move
+    let last = h.bot.store.entries().pop().unwrap();
+    assert_eq!((last.int("topic_id"), last.text("topic")), (Some(78), Some("Évolutions")));
+    h.bot.send("Sans sujet", "alice-site", false).unwrap();
+    assert!(h.last_sent().get("message_thread_id").is_none());
+}
+
+#[test]
+fn a_deleted_named_topic_is_created_again() {
+    let h = harness();
+    h.group();
+    h.bot.send_with("Un", "alice-site", false, topic("Évolutions")).unwrap();
+    h.tg.borrow_mut().lost_thread = true;
+    h.bot.send_with("Deux", "alice-site", false, topic("Évolutions")).unwrap();
+    assert_eq!(h.topics_created().len(), 2);
+    assert_eq!(h.last_sent().get("message_thread_id"), Some("78"));
+    assert_eq!(h.group_topics(), json!({"78": "Évolutions"}));
+}
+
+#[test]
+fn a_named_topic_needs_a_group_and_the_right_to_create_it() {
+    let h = harness();
+    h.group();
+    let refused = |name: &str, private: bool| {
+        h.bot.send_with("x", name, private, topic("Évolutions")).unwrap_err().to_string()
+    };
+    assert!(refused("alice-site", true).contains("groupe de projet"));
+    assert!(refused("no-group", false).contains("groupe de projet"));
+    h.tg.borrow_mut().wrong_home = true; // no topics in the group, or no right to manage them
+    assert!(refused("alice-site", false).contains("sujets activés"));
+    assert!(h.sent().is_empty());
+    assert_eq!(h.group_topics(), Value::Null);
+}
+
+#[test]
+fn a_file_in_a_named_topic() {
+    let h = harness();
+    h.group();
+    let image = h.dir.path().join("carte.png");
+    std::fs::write(&image, b"png").unwrap();
+    h.bot.send_document(&image, "alice-site", "La carte", false, topic("Luka Beauté")).unwrap();
+    let sent = h.calls("sendDocument").pop().unwrap();
+    let group = GROUP.to_string();
+    assert_eq!(
+        (sent.get("chat_id"), sent.get("message_thread_id"), sent.get("caption")),
+        (Some(group.as_str()), Some("77"), Some("La carte"))
+    );
+    assert_eq!(h.bot.store.entries().pop().unwrap().text("topic"), Some("Luka Beauté"));
+}
+
+#[test]
+fn received_messages_tell_their_topic() {
+    let mut h = harness();
+    h.group();
+    h.live("alice-site");
+    // A member creates the topic: a service message, nothing delivered, the name kept.
+    h.dispatch(in_topic(1, "", 55, json!({"forum_topic_created": {"name": "Luka Beauté", "icon_color": 1}})));
+    assert!(h.bot.take("alice-site").is_empty());
+    let opened = json!({"message_id": 101, "forum_topic_created": {"name": "Luka Beauté"}});
+    h.dispatch(in_topic(2, "oui", 55, json!({"reply_to_message": opened})));
+    let entry = h.bot.take("alice-site").remove(0);
+    assert_eq!(
+        (entry.int("topic_id"), entry.text("topic"), entry.text("text")),
+        (Some(55), Some("Luka Beauté"), Some("oui"))
+    );
+    // Renamed: the new name holds, though messages still carry the original one.
+    h.dispatch(in_topic(3, "", 55, json!({"forum_topic_edited": {"name": "Luka"}})));
+    h.dispatch(in_topic(4, "non", 55, json!({"reply_to_message": opened})));
+    assert_eq!(h.bot.take("alice-site").remove(0).text("topic"), Some("Luka"));
+    // A topic never seen: its name comes from its first message that isn't a reply.
+    let first = json!({"message_id": 9, "forum_topic_created": {"name": "Évolutions"}});
+    h.dispatch(in_topic(5, "ici", 61, json!({"reply_to_message": first})));
+    assert_eq!(h.bot.take("alice-site").remove(0).text("topic"), Some("Évolutions"));
+    h.bot.send_with("Récap", "alice-site", false, topic("évolutions")).unwrap();
+    assert_eq!(h.last_sent().get("message_thread_id"), Some("61"));
+    assert!(h.topics_created().is_empty());
+    // Unknown name (a reply, in a topic older than the bot): its number.
+    h.dispatch(in_topic(6, "et là", 70, json!({"reply_to_message": {"message_id": 8, "text": "Carte Nova"}})));
+    let entry = h.bot.take("alice-site").remove(0);
+    assert_eq!((entry.int("topic_id"), entry.text("topic")), (Some(70), None));
+    assert_eq!(h.bot.place(&entry), "groupe Site d’Alice, sujet n° 70");
+    assert_eq!(h.group_topics(), json!({"55": "Luka", "61": "Évolutions"}));
+}
+
+#[test]
+fn the_topic_shows_even_when_an_older_listener_filed_the_message() {
+    let h = harness();
+    h.group();
+    h.bot.send_with("Carte", "alice-site", false, topic("Luka Beauté")).unwrap(); // topic 77
+    // An entry as older code files it: the topic's number, not its name.
+    let entry = obj(json!({"from": "groupe", "chat_id": GROUP, "group": "Site d’Alice", "speaker": "Alice",
+                           "topic_id": 77, "text": "oui"}));
+    assert_eq!(h.bot.place(&entry), "groupe Site d’Alice, sujet Luka Beauté");
+}
+
+#[test]
+fn buttons_under_a_card_the_choice_goes_back_to_the_session() {
+    let mut h = harness();
+    h.group();
+    h.live("alice-site");
+    let text = "LUKA-3 · Couper la pub « Peau nette » ?";
+    let labels = ["Oui".to_string(), "Non".to_string()];
+    let extras = Extras { topic: Some("Luka Beauté"), buttons: &labels };
+    let id = h.bot.send_with(text, "alice-site", false, extras).unwrap()[0];
+    let sent = h.last_sent();
+    assert_eq!(buttons(&sent), ["b:0", "b:1"]);
+    let markup: Value = serde_json::from_str(sent.get("reply_markup").unwrap()).unwrap();
+    assert_eq!(markup["inline_keyboard"].as_array().unwrap().len(), 1); // short: one line
+    assert_eq!(h.bot.store.entries().pop().unwrap().get("buttons"), Some(&json!(["Oui", "Non"])));
+    let card = json!({"message_id": id, "chat": {"id": GROUP, "type": "supergroup"}, "text": text,
+                      "message_thread_id": 77, "is_topic_message": true, "reply_markup": markup});
+    assert_eq!(h.press(1, "b:0", &card, 666, "Intrus"), 1); // not a member: nothing
+    assert!(h.bot.take("alice-site").is_empty());
+    assert_eq!(h.press(2, "b:0", &card, ALICE, "Alice"), 0);
+    let entry = h.bot.take("alice-site").remove(0);
+    assert_eq!(
+        (entry.text("speaker"), entry.text("topic"), entry.text("button"), entry.text("how")),
+        (Some("Alice"), Some("Luka Beauté"), Some("Oui"), Some("choix"))
+    );
+    assert_eq!(entry.text("text"), Some(format!("[bouton « Oui » sous « {text} »]").as_str()));
+    let frozen = h.calls("editMessageReplyMarkup").pop().unwrap();
+    let group = GROUP.to_string();
+    let id_text = id.to_string();
+    assert_eq!((frozen.get("chat_id"), frozen.get("message_id")), (Some(group.as_str()), Some(id_text.as_str())));
+    let chosen: Value = serde_json::from_str(frozen.get("reply_markup").unwrap()).unwrap();
+    assert_eq!(chosen["inline_keyboard"][0][0]["text"], "✅ Oui · Alice");
+    assert_eq!(h.bot.groups()[&GROUP].int("topic"), Some(77)); // the session's next messages go there
+    // One choice per card: another member, or the frozen button, add nothing.
+    h.press(3, "b:1", &card, OWNER, "Sam");
+    let mut pressed_again = card.clone();
+    pressed_again["reply_markup"] = chosen;
+    h.press(4, "b:x", &pressed_again, ALICE, "Alice");
+    assert!(h.bot.take("alice-site").is_empty());
+    assert_eq!(
+        h.answers(),
+        [
+            "Ce bouton est réservé aux membres du projet.",
+            "Noté : Oui",
+            "Déjà répondu : Oui (Alice)",
+            "Déjà répondu : Oui (Alice)"
+        ]
+    );
+}
+
+#[test]
+fn buttons_in_private_go_back_to_the_session_that_wrote() {
+    let mut h = harness();
+    h.live("fable");
+    let labels = ["Oui".to_string(), "Plus tard, je regarde demain matin".to_string()];
+    let extras = Extras { buttons: &labels, ..Extras::default() };
+    let id = h.bot.send_with("On déploie ?", "fable", false, extras).unwrap()[0];
+    let sent = h.last_sent();
+    let owner = OWNER.to_string();
+    assert_eq!(sent.get("chat_id"), Some(owner.as_str()));
+    let markup: Value = serde_json::from_str(sent.get("reply_markup").unwrap()).unwrap();
+    assert_eq!(markup["inline_keyboard"].as_array().unwrap().len(), 2); // long labels: one per line
+    let card = json!({"message_id": id, "chat": {"id": OWNER, "type": "private"},
+                      "text": format!("{}\nOn déploie ?", tag("fable", "")), "reply_markup": markup});
+    assert_eq!(h.press(1, "b:1", &card, 666, "Intrus"), 1);
+    assert_eq!(h.press(2, "b:1", &card, OWNER, "Sam"), 0);
+    let entry = h.bot.take("fable").remove(0);
+    assert_eq!((entry.text("from"), entry.text("how")), (Some("owner"), Some("choix")));
+    assert_eq!(entry.text("text"), Some("[bouton « Plus tard, je regarde demain matin » sous « On déploie ? »]"));
+    let frozen = h.calls("editMessageReplyMarkup").pop().unwrap();
+    let id_text = id.to_string();
+    assert_eq!((frozen.get("chat_id"), frozen.get("message_id")), (Some(owner.as_str()), Some(id_text.as_str())));
+}
+
+#[test]
+fn refused_buttons_send_nothing() {
+    let h = harness();
+    h.group();
+    let refused: [Vec<String>; 3] = [
+        vec!["x".repeat(41)],
+        vec!["Oui".to_string(), " ".to_string()],
+        (0..9).map(|n| n.to_string()).collect(),
+    ];
+    for labels in &refused {
+        let extras = Extras { buttons: labels, ..Extras::default() };
+        let error = h.bot.send_with("Carte", "alice-site", false, extras).unwrap_err();
+        assert!(error.to_string().contains("--buttons"), "{error}");
+    }
+    assert!(h.sent().is_empty());
+    let labels = ["Oui".to_string(), "Non".to_string()];
+    let extras = Extras { buttons: &labels, ..Extras::default() };
+    let image = h.dir.path().join("carte.png");
+    std::fs::write(&image, b"png").unwrap();
+    h.bot.send_document(&image, "alice-site", "La carte", false, extras).unwrap();
+    assert_eq!(buttons(&h.calls("sendDocument").pop().unwrap()), ["b:0", "b:1"]);
+    h.bot.send_with(&"x".repeat(5000), "alice-site", false, extras).unwrap(); // two messages: buttons under the last
+    let sent = h.sent();
+    assert!(sent[sent.len() - 2].get("reply_markup").is_none());
+    assert_eq!(buttons(&sent[sent.len() - 1]), ["b:0", "b:1"]);
 }

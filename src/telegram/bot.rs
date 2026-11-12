@@ -63,6 +63,7 @@ const SHOWN: f64 = 7.0 * 86400.0;
 /// In a group, "Claude isn't available" at most once every 6 h.
 const ABSENT_NOTICE: f64 = 6.0 * 3600.0;
 pub(crate) const API_TIMEOUT: Duration = Duration::from_secs(70);
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const UPDATES: &str = r#"["message", "edited_message", "callback_query", "my_chat_member"]"#;
 const GROUPS: [&str; 2] = ["group", "supergroup"];
 pub(crate) const MEDIA: [&str; 6] = ["voice", "audio", "video_note", "photo", "document", "video"];
@@ -152,6 +153,30 @@ fn message_text(message: &Object) -> String {
 
 fn has_media(message: &Object) -> bool {
     MEDIA.iter().any(|kind| message.flag(kind))
+}
+
+/// A group topic's name as compared: spaces collapsed, case ignored.
+fn topic_key(name: &str) -> String {
+    name.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// Telegram's answer for a topic that was deleted.
+fn topic_gone(error: &ApiError) -> bool {
+    error.mentions(&["thread not found", "topic_deleted", "topic_id_invalid", "topic not found"])
+}
+
+/// `callback_data` of the buttons a session puts under its message
+/// (`b:<rank>`; `b:x` once one was chosen), as in sync-telegram.
+const BUTTON: &str = "b:";
+
+/// What a session's message carries besides its text.
+#[derive(Default, Clone, Copy)]
+pub struct Extras<'a> {
+    /// The topic of this name in the session's project group, created when
+    /// missing.
+    pub topic: Option<&'a str>,
+    /// Buttons under the (last) message; a press comes back to the session.
+    pub buttons: &'a [String],
 }
 
 /// The topic a message was written in, if any.
@@ -400,7 +425,9 @@ impl Bot {
 
     /// Applies `change` to the group registry (`whole`: all of groups.json,
     /// with `migrations`; otherwise its `chats`), under the registry lock.
-    fn update_groups<T>(&self, whole: bool, change: impl FnOnce(&mut Object) -> Result<T>) -> Result<T> {
+    /// `sync` false: the list of groups doesn't change (a topic's name), the
+    /// relay has nothing to learn.
+    fn update_groups<T>(&self, whole: bool, sync: bool, change: impl FnOnce(&mut Object) -> Result<T>) -> Result<T> {
         let lock = self.store.lock("registre", true);
         let file = self.store.path(&["groups.json"]);
         let mut data = self.store.read_object(&file).unwrap_or_default();
@@ -418,7 +445,9 @@ impl Bot {
         };
         self.store.write(&file, &Value::Object(data))?;
         drop(lock);
-        self.relay_sync(); // the relay files the groups' messages for this machine
+        if sync {
+            self.relay_sync(); // the relay files the groups' messages for this machine
+        }
         Ok(result)
     }
 
@@ -508,7 +537,7 @@ impl Bot {
             .or_else(|| self.seen_title(chat))
             .unwrap_or_else(|| say!(self, "groupe {chat}", "group {chat}"));
         let french = self.french();
-        self.update_groups(false, |chats| {
+        self.update_groups(false, true, |chats| {
             let key = chat.to_string();
             let mut data = chats
                 .get(&key)
@@ -546,7 +575,7 @@ impl Bot {
     pub fn group_remove(&self, chat: i64, member: Option<i64>) -> Result<Object> {
         let chat = self.latest(chat, None);
         let french = self.french();
-        self.update_groups(false, |chats| {
+        self.update_groups(false, true, |chats| {
             let key = chat.to_string();
             let Some(data) = chats.get_mut(&key).and_then(Value::as_object_mut) else {
                 bail!(if french {
@@ -580,7 +609,7 @@ impl Bot {
     /// a group not registered yet, that `group add` will follow) and the
     /// registry follows. True when it is new.
     pub fn migrate_group(&self, old: i64, new: i64, title: Option<&str>) -> Result<bool> {
-        let (fresh, registered) = self.update_groups(true, |data| {
+        let (fresh, registered) = self.update_groups(true, true, |data| {
             let mut moved = data.object("migrations").cloned().unwrap_or_default();
             let fresh = moved.get(&old.to_string()).and_then(Value::as_i64) != Some(new);
             moved.insert(old.to_string(), json!(new));
@@ -711,7 +740,7 @@ impl Bot {
         if self.groups().get(&chat).and_then(|g| g.int("topic")) == topic {
             return Ok(());
         }
-        self.update_groups(false, |chats| {
+        self.update_groups(false, false, |chats| {
             if let Some(data) = chats.get_mut(&chat.to_string()).and_then(Value::as_object_mut) {
                 data.insert("topic".into(), opt(topic));
             }
@@ -719,17 +748,140 @@ impl Bot {
         })
     }
 
-    /// A send into the group, in its last message's topic (deleted topic:
-    /// the general one). Returns (result, id, topic).
+    // The topics of a project group (a group with topics): groups.json keeps
+    // each one's name under "topics" {"<id>": "Name"}, learned when the bot
+    // creates it, when a member creates or renames it, and from the messages
+    // coming from it. Same fields as sync-telegram.
+
+    /// The known name of the group's topic `topic`.
+    pub fn topic_name(&self, chat: i64, topic: Option<i64>) -> Option<String> {
+        let topic = topic?.to_string();
+        let groups = self.groups();
+        groups.get(&chat)?.object("topics")?.text(&topic).map(str::to_string)
+    }
+
+    /// "groupe Title, sujet Name" of a group entry. The name comes from the
+    /// entry, else from the registry (an older listener may have filed it
+    /// without one); unknown, the topic's number.
+    pub fn place(&self, entry: &Object) -> String {
+        let chat = entry.int("chat_id");
+        let group = entry
+            .text("group")
+            .map(str::to_string)
+            .unwrap_or_else(|| chat.unwrap_or(0).to_string());
+        let topic = entry.int("topic_id");
+        let subject = entry
+            .text("topic")
+            .map(str::to_string)
+            .or_else(|| chat.and_then(|chat| self.topic_name(chat, topic)))
+            .or_else(|| topic.map(|topic| say!(self, "n° {topic}", "#{topic}")));
+        match subject {
+            Some(subject) => say!(self, "groupe {group}, sujet {subject}", "group {group}, topic {subject}"),
+            None => say!(self, "groupe {group}", "group {group}"),
+        }
+    }
+
+    /// The id of the group's topic of this name (case and spaces ignored).
+    fn topic_named(&self, chat: i64, name: &str) -> Option<i64> {
+        let wanted = topic_key(name);
+        let groups = self.groups();
+        groups
+            .get(&chat)?
+            .object("topics")?
+            .iter()
+            .find(|(_, known)| known.as_str().is_some_and(|known| topic_key(known) == wanted))
+            .and_then(|(topic, _)| topic.parse().ok())
+    }
+
+    /// Remembers a topic's name; `keep`: only if it has none yet (the name
+    /// read in a message is the one it was created with, not a rename).
+    /// `name` None: the topic is forgotten (deleted).
+    fn learn_topic(&self, chat: i64, topic: Option<i64>, name: Option<&str>, keep: bool) -> Result<()> {
+        let Some(topic) = topic else {
+            return Ok(());
+        };
+        let known = self.topic_name(chat, Some(topic));
+        if known.as_deref() == name || (keep && known.is_some()) {
+            return Ok(());
+        }
+        self.update_groups(false, false, |chats| {
+            let names = chats
+                .get_mut(&chat.to_string())
+                .and_then(Value::as_object_mut)
+                .and_then(|data| data.entry("topics").or_insert_with(|| json!({})).as_object_mut());
+            if let Some(names) = names {
+                match name {
+                    Some(name) => names.insert(topic.to_string(), json!(name)),
+                    None => names.remove(&topic.to_string()),
+                };
+            }
+            Ok(())
+        })
+    }
+
+    /// The group's topic `name`, created when it doesn't exist yet. Returns
+    /// (topic, the group's id).
+    fn open_topic(&self, chat: i64, group: &Object, name: &str) -> Result<(i64, i64)> {
+        let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+        if name.is_empty() {
+            bail!(say!(self, "--topic : il faut le nom du sujet", "--topic: the topic needs a name"));
+        }
+        let chat = self.latest(chat, None);
+        if let Some(found) = self.topic_named(chat, &name) {
+            return Ok((found, chat));
+        }
+        let short: String = name.chars().take(128).collect();
+        let (created, chat) =
+            match self.group_call("createForumTopic", chat, Params::new().set("name", &short), API_TIMEOUT, None) {
+                Ok(created) => created,
+                Err(error) if matches!(api_error(&error), Some(ApiError::Refused { .. })) => {
+                    let title = group.text("title").unwrap_or("");
+                    bail!(say!(
+                        self,
+                        "Sujet « {name} » impossible à créer dans « {title} » ({error}). Le groupe doit avoir les sujets activés, et le bot le droit de les gérer.",
+                        "Topic \"{name}\" can't be created in \"{title}\" ({error}). The group needs topics turned on, and the bot the right to manage them."
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+        let topic = created
+            .get("message_thread_id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow!("createForumTopic: no message_thread_id"))?;
+        self.learn_topic(chat, Some(topic), Some(&name), false)?;
+        Ok((topic, chat))
+    }
+
+    /// A send into the group (`document`: uploaded with it): in the topic
+    /// named `subject` (created when missing, again when deleted), otherwise
+    /// in its last message's topic (deleted topic: the general one). Returns
+    /// (result, id, topic).
     fn group_send(
         &self,
         method: &str,
         chat: i64,
         group: &Object,
         params: Params,
-        timeout: Duration,
+        subject: Option<&str>,
         document: Option<&Path>,
     ) -> Result<(Value, i64, Option<i64>)> {
+        let timeout = if document.is_some() { UPLOAD_TIMEOUT } else { API_TIMEOUT };
+        if let Some(subject) = subject {
+            let (mut topic, mut chat) = self.open_topic(chat, group, subject)?;
+            let mut retried = false;
+            loop {
+                let params = params.clone().set("message_thread_id", topic);
+                match self.group_call(method, chat, params, timeout, document) {
+                    Ok((result, chat)) => return Ok((result, chat, Some(topic))),
+                    Err(error) if !retried && api_error(&error).is_some_and(topic_gone) => {
+                        self.learn_topic(chat, Some(topic), None, false)?;
+                        (topic, chat) = self.open_topic(chat, group, subject)?;
+                        retried = true;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
         if let Some(topic) = group.int("topic") {
             match self.group_call(
                 method,
@@ -884,29 +1036,84 @@ impl Bot {
         Ok(id)
     }
 
-    /// A session's text in its project group: no header, the group is its own.
-    fn send_group(&self, text: &str, name: &str, chat: i64, group: &Object) -> Result<Vec<i64>> {
+    /// The keyboard of these labels: on one line when they are short,
+    /// otherwise one per line.
+    fn keyboard(&self, labels: &[String]) -> Result<Value> {
+        let labels: Vec<String> = labels
+            .iter()
+            .map(|label| label.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect();
+        if labels.is_empty()
+            || labels.len() > 8
+            || labels.iter().any(|label| label.is_empty() || label.chars().count() > 40)
+        {
+            bail!(say!(
+                self,
+                "--buttons : de 1 à 8 libellés de 40 caractères au plus, séparés par « | »",
+                "--buttons: 1 to 8 labels of at most 40 characters, separated by \"|\""
+            ));
+        }
+        let short = labels.len() <= 4 && labels.iter().map(|label| label.chars().count()).sum::<usize>() <= 30;
+        let keys: Vec<Value> = labels
+            .iter()
+            .enumerate()
+            .map(|(rank, label)| json!({"text": label, "callback_data": format!("{BUTTON}{rank}")}))
+            .collect();
+        let rows: Vec<Value> = if short {
+            vec![Value::Array(keys)]
+        } else {
+            keys.into_iter().map(|key| json!([key])).collect()
+        };
+        Ok(json!({"inline_keyboard": rows}))
+    }
+
+    /// (params, journal record) of a message, with its buttons if it has some.
+    fn with_buttons(&self, params: Params, record: Object, buttons: &[String]) -> Result<(Params, Object)> {
+        if buttons.is_empty() {
+            return Ok((params, record));
+        }
+        let mut record = record;
+        record.insert("buttons".into(), json!(buttons));
+        Ok((params.json("reply_markup", &self.keyboard(buttons)?), record))
+    }
+
+    /// The buttons of the part `index` of `count`: only under the last one.
+    fn buttons_of<'a>(extras: Extras<'a>, index: usize, count: usize) -> &'a [String] {
+        if index + 1 == count {
+            extras.buttons
+        } else {
+            &[]
+        }
+    }
+
+    /// A session's text in its project group: no header, the group is its
+    /// own; in the topic `extras.topic` when given.
+    fn send_group(&self, text: &str, name: &str, chat: i64, group: &Object, extras: Extras) -> Result<Vec<i64>> {
         let mut ids = Vec::new();
         let mut group = group.clone();
         let mut chat = chat;
-        for part in chunks(text.trim()) {
-            let (message, moved, topic) = self.group_send(
-                "sendMessage",
-                chat,
-                &group,
+        let parts = chunks(text.trim());
+        for (index, part) in parts.iter().enumerate() {
+            let (params, record) = self.with_buttons(
                 Params::new()
-                    .set("text", &part)
+                    .set("text", part)
                     .json("link_preview_options", &json!({"is_disabled": true})),
-                API_TIMEOUT,
-                None,
+                obj(json!({"text": part})),
+                Self::buttons_of(extras, index, parts.len()),
             )?;
+            let (message, moved, topic) = self.group_send("sendMessage", chat, &group, params, extras.topic, None)?;
             chat = moved;
-            group.insert("topic".into(), opt(topic));
+            if extras.topic.is_none() {
+                group.insert("topic".into(), opt(topic));
+            }
             let id = message.get("message_id").and_then(Value::as_i64).unwrap_or(0);
-            self.store.journal(&json!({
+            let mut entry = obj(json!({
                 "at": now(), "message_id": id, "from": "claude", "session": name, "chat_id": chat,
-                "group": group.get("title"), "thread_id": null, "topic_id": topic, "text": part,
+                "group": group.get("title"), "thread_id": null, "topic_id": topic,
+                "topic": self.topic_name(chat, topic),
             }));
+            entry.extend(record);
+            self.store.journal(&Value::Object(entry));
             ids.push(id);
         }
         Ok(ids)
@@ -922,26 +1129,52 @@ impl Bot {
         Ok(())
     }
 
+    /// Where a session's message goes: its project group unless `private`.
+    /// A named topic needs that group.
+    fn bound_for(&self, name: &str, private: bool, extras: Extras) -> Result<Option<(i64, Object)>> {
+        let bound = if private { None } else { self.group_of(name) };
+        if extras.topic.is_some() && bound.is_none() {
+            bail!(say!(
+                self,
+                "--topic : la session « {name} » n’écrit pas dans un groupe de projet (pas de groupe lié, ou --private)",
+                "--topic: session \"{name}\" doesn't write in a project group (no bound group, or --private)"
+            ));
+        }
+        Ok(bound)
+    }
+
     /// A session's text: in its project group if it has one (unless
     /// `private`), otherwise to the owner, in its topic or headed by its name.
     pub fn send(&self, text: &str, name: &str, private: bool) -> Result<Vec<i64>> {
+        self.send_with(text, name, private, Extras::default())
+    }
+
+    /// `send`, in a named topic of the project group and/or with buttons
+    /// under the last message.
+    pub fn send_with(&self, text: &str, name: &str, private: bool, extras: Extras) -> Result<Vec<i64>> {
         self.register_if_new(name)?;
-        if !private {
-            if let Some((chat, group)) = self.group_of(name) {
-                return self.send_group(text, name, chat, &group);
-            }
+        if !extras.buttons.is_empty() {
+            self.keyboard(extras.buttons)?; // refused labels: nothing goes
+        }
+        if let Some((chat, group)) = self.bound_for(name, private, extras)? {
+            return self.send_group(text, name, chat, &group, extras);
         }
         let mut ids = Vec::new();
-        for part in chunks(text.trim()) {
+        let parts = chunks(text.trim());
+        for (index, part) in parts.iter().enumerate() {
             for attempt in 1..=2 {
                 let thread = self.thread_of(name);
                 let params = match thread {
-                    Some(thread) => Params::new().set("text", &part).set("message_thread_id", thread),
+                    Some(thread) => Params::new().set("text", part).set("message_thread_id", thread),
                     None => Params::new()
-                        .set("text", format!("<b>{}</b>\n{}", escape(&self.tag(name)), escape(&part)))
+                        .set("text", format!("<b>{}</b>\n{}", escape(&self.tag(name)), escape(part)))
                         .set("parse_mode", "HTML"),
                 };
-                let record = obj(json!({"from": "claude", "session": name, "thread_id": thread, "text": part}));
+                let (params, record) = self.with_buttons(
+                    params,
+                    obj(json!({"from": "claude", "session": name, "thread_id": thread, "text": part})),
+                    Self::buttons_of(extras, index, parts.len()),
+                )?;
                 match self.post(params, record, None) {
                     Ok(id) => {
                         ids.push(id);
@@ -964,9 +1197,10 @@ impl Bot {
         Ok(ids)
     }
 
-    /// A file from a session (PDF, image…), where its messages go;
-    /// `caption` goes with it (Telegram cuts it at 1024 characters).
-    pub fn send_document(&self, file: &Path, name: &str, caption: &str, private: bool) -> Result<i64> {
+    /// A file from a session (PDF, image…), where its messages go (in the
+    /// group's topic `extras.topic` when given); `caption` goes with it
+    /// (Telegram cuts it at 1024 characters).
+    pub fn send_document(&self, file: &Path, name: &str, caption: &str, private: bool, extras: Extras) -> Result<i64> {
         if !file.is_file() {
             let shown = file.display();
             bail!(say!(self, "Fichier introuvable : {shown}", "File not found: {shown}"));
@@ -983,23 +1217,25 @@ impl Bot {
         } else {
             format!("[fichier] {file_name}\n{caption}")
         };
-        let upload = Duration::from_secs(120);
-        if !private {
-            if let Some((chat, group)) = self.group_of(name) {
-                let params = if caption.is_empty() {
-                    Params::new()
-                } else {
-                    Params::new().set("caption", short(caption))
-                };
-                let (message, chat, topic) =
-                    self.group_send("sendDocument", chat, &group, params, upload, Some(file))?;
-                let id = message.get("message_id").and_then(Value::as_i64).unwrap_or(0);
-                self.store.journal(&json!({
-                    "at": now(), "message_id": id, "from": "claude", "session": name, "chat_id": chat,
-                    "group": group.get("title"), "thread_id": null, "topic_id": topic, "text": journal_text,
-                }));
-                return Ok(id);
-            }
+        let record = obj(json!({"text": journal_text}));
+        if let Some((chat, group)) = self.bound_for(name, private, extras)? {
+            let params = if caption.is_empty() {
+                Params::new()
+            } else {
+                Params::new().set("caption", short(caption))
+            };
+            let (params, record) = self.with_buttons(params, record, extras.buttons)?;
+            let (message, chat, topic) =
+                self.group_send("sendDocument", chat, &group, params, extras.topic, Some(file))?;
+            let id = message.get("message_id").and_then(Value::as_i64).unwrap_or(0);
+            let mut entry = obj(json!({
+                "at": now(), "message_id": id, "from": "claude", "session": name, "chat_id": chat,
+                "group": group.get("title"), "thread_id": null, "topic_id": topic,
+                "topic": self.topic_name(chat, topic),
+            }));
+            entry.extend(record);
+            self.store.journal(&Value::Object(entry));
+            return Ok(id);
         }
         for attempt in 1..=2 {
             let thread = self.thread_of(name);
@@ -1014,13 +1250,15 @@ impl Bot {
             if !text.is_empty() {
                 params = params.set("caption", short(&text));
             }
-            match self.tg.call("sendDocument", &params, upload, Some(file)) {
+            let (params, record) = self.with_buttons(params, record.clone(), extras.buttons)?;
+            match self.tg.call("sendDocument", &params, UPLOAD_TIMEOUT, Some(file)) {
                 Ok(message) => {
                     let id = message.get("message_id").and_then(Value::as_i64).unwrap_or(0);
-                    self.store.journal(&json!({
-                        "at": now(), "message_id": id, "from": "claude", "session": name,
-                        "thread_id": thread, "text": journal_text,
+                    let mut entry = obj(json!({
+                        "at": now(), "message_id": id, "from": "claude", "session": name, "thread_id": thread,
                     }));
+                    entry.extend(record);
+                    self.store.journal(&Value::Object(entry));
                     return Ok(id);
                 }
                 Err(error) => {
@@ -1534,6 +1772,115 @@ impl Bot {
         Ok(())
     }
 
+    /// A press on a button a session put under its message (`send
+    /// --buttons`): the choice goes to that session, signed by who pressed,
+    /// and replaces the buttons (one choice per message). 1 when it comes from
+    /// someone not listened to.
+    fn pressed(&self, update: &Object, callback: &Object, settings: &Object) -> Result<i32> {
+        let card = callback.object("message").cloned().unwrap_or_default();
+        let sender = callback.object("from").cloned().unwrap_or_default();
+        let data = callback.text("data").unwrap_or("");
+        let frozen = format!("{BUTTON}x");
+        let answer = |text: &str| {
+            if let Some(id) = callback.text("id").filter(|id| !id.is_empty()) {
+                if let Err(error) = self.api("answerCallbackQuery", Params::new().set("callback_query_id", id).set("text", text)) {
+                    eprintln!("asp telegram: button press not answered ({error})");
+                }
+            }
+        };
+        let (chat, group, speaker, name) = if GROUPS.contains(&nested_text(&card, "chat", "type").unwrap_or("")) {
+            let chat = self.latest(nested_int(&card, "chat", "id").unwrap_or(0), None);
+            let group = self.groups().get(&chat).cloned();
+            let speaker = group.as_ref().and_then(|group| self.member_name(group, &sender, settings));
+            let (Some(group), Some(speaker)) = (group, speaker) else {
+                answer(&say!(self, "Ce bouton est réservé aux membres du projet.", "This button is for the project's members."));
+                return Ok(1);
+            };
+            let name = group.text("session").map(str::to_string);
+            (Some(chat), Some(group), Some(speaker), name)
+        } else if sender.int("id") != settings.int("user_id") {
+            return Ok(1);
+        } else {
+            let found = self.find(card.int("message_id"), None);
+            (None, None, None, found.and_then(|entry| entry.text("session").map(str::to_string)))
+        };
+        let message_id = card.int("message_id");
+        let taken = self.store.entries().into_iter().rev().find(|entry| {
+            entry.text("how") == Some("choix") && entry.int("chat_id") == chat && entry.int("message_id") == message_id
+        });
+        if let Some(taken) = taken {
+            let button = taken.text("button").unwrap_or("");
+            let by = taken.text("speaker").map(|who| format!(" ({who})")).unwrap_or_default();
+            answer(&say!(self, "Déjà répondu : {button}{by}", "Already answered: {button}{by}"));
+            return Ok(0);
+        }
+        let label = card
+            .object("reply_markup")
+            .map(|markup| markup.list("inline_keyboard"))
+            .unwrap_or_default()
+            .iter()
+            .filter_map(Value::as_array)
+            .flatten()
+            .filter_map(Value::as_object)
+            .find(|key| key.text("callback_data") == Some(data))
+            .and_then(|key| key.text("text"))
+            .map(str::to_string);
+        let name = name.filter(|name| !name.is_empty() && data != frozen);
+        let (Some(label), Some(name), Some(message_id)) = (label, name, message_id) else {
+            answer(&say!(self, "Ce bouton n’est plus actif.", "This button is no longer active."));
+            return Ok(0);
+        };
+        let quoted = card.text("text").or_else(|| card.text("caption")).unwrap_or("");
+        let quoted = match quoted.split_once('\n') {
+            // The "🟦 name" header of messages outside a topic.
+            Some((first, rest))
+                if !rest.is_empty() && self.sessions().keys().any(|known| self.tag(known) == first.trim()) =>
+            {
+                rest
+            }
+            _ => quoted,
+        };
+        let quoted = quoted.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut short: String = quoted.chars().take(160).collect();
+        if quoted.chars().count() > 160 {
+            short.push('…');
+        }
+        let topic = topic_of(&card);
+        let mut entry = obj(json!({
+            "at": now(), "message_id": message_id, "update_id": update.int("update_id"), "button": label,
+            "text": say!(self, "[bouton « {label} » sous « {short} »]", "[button \"{label}\" under \"{short}\"]"),
+        }));
+        match (chat, &group) {
+            (Some(chat), Some(group)) => entry.extend(obj(json!({
+                "from": "groupe", "chat_id": chat, "group": group.get("title"), "user_id": sender.int("id"),
+                "speaker": speaker, "thread_id": null, "topic_id": topic, "topic": self.topic_name(chat, topic),
+            }))),
+            _ => entry.extend(obj(json!({"from": FROM_OWNER, "thread_id": topic}))),
+        }
+        self.deliver(&name, &entry, "choix")?;
+        if let Some(chat) = chat {
+            self.set_topic(chat, topic)?; // the session's next messages go in the card's topic
+        }
+        let shown = match &speaker {
+            Some(speaker) => format!("✅ {label} · {speaker}"),
+            None => format!("✅ {label}"),
+        };
+        let params = Params::new()
+            .set("message_id", message_id)
+            .json("reply_markup", &json!({"inline_keyboard": [[{"text": shown, "callback_data": frozen}]]}));
+        let replaced = match chat {
+            Some(chat) => self.group_call("editMessageReplyMarkup", chat, params, API_TIMEOUT, None).map(drop),
+            None => self
+                .chat_id()
+                .and_then(|owner| Ok(self.api("editMessageReplyMarkup", params.set("chat_id", owner)).map(drop)?)),
+        };
+        if let Err(error) = replaced {
+            eprintln!("asp telegram: buttons not replaced ({error:#})");
+        }
+        answer(&say!(self, "Noté : {label}", "Noted: {label}"));
+        Ok(0)
+    }
+
     /// "/start@AnotherBot": a command meant for another bot of the group.
     fn for_another_bot(&self, text: &str) -> bool {
         if !text.starts_with('/') {
@@ -1747,10 +2094,24 @@ impl Bot {
         let sender = message.object("from").cloned().unwrap_or_default();
         let group = self.groups().get(&chat).cloned();
         let text = message_text(message);
-        if text.is_empty() && !has_media(message) {
-            return Ok(0); // service message (member added, title changed…)
-        }
         let topic = topic_of(message);
+        if group.is_some() && topic.is_some() {
+            // A topic created or renamed (service message): its name;
+            // otherwise the original name, which every message of the topic
+            // that isn't a reply carries.
+            let named = message
+                .object("forum_topic_created")
+                .or_else(|| message.object("forum_topic_edited"))
+                .and_then(|change| change.text("name"));
+            let first = message
+                .object("reply_to_message")
+                .and_then(|reply| reply.object("forum_topic_created"))
+                .and_then(|created| created.text("name"));
+            self.learn_topic(chat, topic, named.or(first), named.is_none())?;
+        }
+        if text.is_empty() && !has_media(message) {
+            return Ok(0); // service message (member added, title changed, topic created…)
+        }
         let at = message.int("edit_date").or_else(|| message.int("date")).unwrap_or(0);
         let shown_title = group
             .as_ref()
@@ -1821,7 +2182,10 @@ impl Bot {
         }
         let body = self.describe(message, update.int("update_id").unwrap_or(0), &text, &speaker);
         let body = if edited { say!(self, "(message modifié) {body}", "(edited message) {body}") } else { body };
-        base.extend(obj(json!({"speaker": speaker, "thread_id": null, "topic_id": topic, "text": body})));
+        base.extend(obj(json!({
+            "speaker": speaker, "thread_id": null, "topic_id": topic,
+            "topic": self.topic_name(chat, topic), "text": body,
+        })));
         if let Some(album) = message.get("media_group_id").filter(|v| !v.is_null()) {
             base.insert("album".into(), album.clone());
         }
@@ -1904,6 +2268,9 @@ impl Bot {
     /// unregistered group (ignored), 0 otherwise.
     pub fn dispatch(&self, update: &Object, settings: &Object, at: f64) -> Result<i32> {
         if let Some(callback) = update.object("callback_query") {
+            if callback.text("data").unwrap_or("").starts_with(BUTTON) {
+                return self.pressed(update, callback, settings);
+            }
             if nested_int(callback, "from", "id") != settings.int("user_id") {
                 return Ok(1);
             }
@@ -2189,7 +2556,7 @@ impl Bot {
             chat,
             &group,
             Params::new().set("text", text),
-            API_TIMEOUT,
+            None,
             None,
         ) else {
             return;
@@ -2439,6 +2806,7 @@ impl Bot {
                 name,
                 *chat,
                 group,
+                Extras::default(),
             )?;
             return Ok(data);
         }
@@ -2486,6 +2854,7 @@ impl Bot {
                     name,
                     chat,
                     &group,
+                    Extras::default(),
                 )?;
             }
             _ => {

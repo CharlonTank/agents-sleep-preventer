@@ -12,7 +12,7 @@ mod tests;
 
 use anyhow::{bail, Context, Result};
 pub(crate) use bot::Bot;
-use bot::{say, Busy};
+use bot::{say, Busy, Extras};
 pub(crate) use setup::system_prefers_french;
 use clap::Subcommand;
 use serde::Deserialize;
@@ -61,6 +61,12 @@ pub enum TelegramCommand {
         /// To the owner privately, even if the session has a group
         #[arg(long)]
         private: bool,
+        /// In the project group's topic of this name (created if missing)
+        #[arg(long, alias = "sujet")]
+        topic: Option<String>,
+        /// Buttons under the message, "Yes|No": a press comes back to the session as a message
+        #[arg(long, alias = "boutons")]
+        buttons: Option<String>,
     },
     /// Stop listening for this session
     Stop {
@@ -502,7 +508,7 @@ fn execute(command: TelegramCommand) -> Result<i32> {
                 // A session bound to a group: what doesn't come from it is
                 // marked [privé] (answer with --private).
                 let origin = match entry.text("group") {
-                    Some(group) => say!(bot, "[groupe {group}] ", "[group {group}] "),
+                    Some(_) => format!("[{}] ", bot.place(entry)),
                     None if bound => say!(bot, "[privé] ", "[private] "),
                     None => String::new(),
                 };
@@ -513,21 +519,35 @@ fn execute(command: TelegramCommand) -> Result<i32> {
             }
             Ok(if received.is_empty() { 3 } else { 0 })
         }
-        TelegramCommand::Send { session, text: message, file, document, private } => {
+        TelegramCommand::Send { session, text: message, file, document, private, topic, buttons } => {
             let name = session_name(session.as_deref())?;
             let message = match file {
                 Some(file) => Some(std::fs::read_to_string(&file).with_context(|| file.display().to_string())?),
                 None => message,
             };
-            let place = match bot.group_of(&name) {
-                Some((_, group)) if !private => {
+            let topic = topic
+                .map(|topic| topic.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|topic| !topic.is_empty());
+            let buttons: Vec<String> = buttons
+                .unwrap_or_default()
+                .split('|')
+                .filter(|label| !label.trim().is_empty())
+                .map(str::to_string)
+                .collect();
+            let extras = Extras { topic: topic.as_deref(), buttons: &buttons };
+            let place = match (bot.group_of(&name), &topic) {
+                (Some((_, group)), Some(topic)) if !private => {
+                    let title = group.text("title").unwrap_or("").to_string();
+                    say!(bot, "dans le groupe « {title} », sujet « {topic} »", "in the group \"{title}\", topic \"{topic}\"")
+                }
+                (Some((_, group)), None) if !private => {
                     let title = group.text("title").unwrap_or("").to_string();
                     say!(bot, "dans le groupe « {title} »", "in the group \"{title}\"")
                 }
                 _ => say!(bot, "à {owner}", "to {owner}"),
             };
             if let Some(document) = document {
-                bot.send_document(&document, &name, message.as_deref().unwrap_or(""), private)?;
+                bot.send_document(&document, &name, message.as_deref().unwrap_or(""), private, extras)?;
                 let shown = document.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 println!("{}", say!(bot, "Fichier envoyé {place} ({name}) : {shown}", "File sent {place} ({name}): {shown}"));
                 return Ok(0);
@@ -535,7 +555,7 @@ fn execute(command: TelegramCommand) -> Result<i32> {
             let Some(message) = message.filter(|m| !m.trim().is_empty()) else {
                 bail!(say!(bot, "Rien à envoyer : --text ou --file", "Nothing to send: --text or --file"));
             };
-            let count = bot.send(&message, &name, private)?.len();
+            let count = bot.send_with(&message, &name, private, extras)?.len();
             println!("{}", say!(bot, "Envoyé {place} ({name}) : {count} message(s).", "Sent {place} ({name}): {count} message(s)."));
             Ok(0)
         }
@@ -666,7 +686,18 @@ fn group(bot: &Bot, command: GroupCommand) -> Result<i32> {
                     .unwrap_or_else(|| say!(bot, "aucun", "none"));
                 let title = data.text("title").unwrap_or("");
                 let session = data.text("session").unwrap_or("");
-                println!("{}", say!(bot, "{chat}  « {title} » → {session}  membres : {members}", "{chat}  \"{title}\" → {session}  members: {members}"));
+                let mut topics: Vec<&str> = data
+                    .object("topics")
+                    .map(|topics| topics.values().filter_map(|name| name.as_str()).collect())
+                    .unwrap_or_default();
+                topics.sort_unstable();
+                let topics = if topics.is_empty() {
+                    String::new()
+                } else {
+                    let shown = topics.join(", ");
+                    say!(bot, " ; sujets : {shown}", "; topics: {shown}")
+                };
+                println!("{}", say!(bot, "{chat}  « {title} » → {session}  membres : {members}{topics}", "{chat}  \"{title}\" → {session}  members: {members}{topics}"));
             }
             let unknown = bot.unknown_groups();
             if !unknown.is_empty() {
@@ -766,8 +797,7 @@ fn read(bot: &Bot, name: Option<&str>, limit: usize) {
         };
         if from == "groupe" {
             let speaker = entry.text("speaker").unwrap_or("");
-            let group = entry.text("group").unwrap_or("");
-            who = say!(bot, "{speaker} [groupe {group}]", "{speaker} [group {group}]");
+            who = format!("{speaker} [{}]", bot.place(entry));
             target = match session {
                 Some(session) => format!(" → {session}"),
                 None => {
@@ -776,11 +806,7 @@ fn read(bot: &Bot, name: Option<&str>, limit: usize) {
                 }
             };
         } else if entry.int("chat_id").is_some_and(|c| c != 0) && matches!(from, "claude" | "bot") {
-            let group = entry
-                .text("group")
-                .map(str::to_string)
-                .unwrap_or_else(|| entry.int("chat_id").unwrap_or(0).to_string());
-            target = say!(bot, " → groupe {group}", " → group {group}");
+            target = format!(" → {}", bot.place(entry));
         }
         let when = text::day_and_time(entry.float("at"));
         let said = entry.text("text").unwrap_or("");
