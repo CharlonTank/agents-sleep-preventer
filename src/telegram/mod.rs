@@ -76,6 +76,16 @@ pub enum TelegramCommand {
     /// to them in the morning
     #[command(alias = "matin")]
     Morning,
+    /// Download again the attachment of a received message that couldn't be
+    /// downloaded ("[voice note not downloaded …]"); prints its line
+    Fetch {
+        /// The received message's id (the command is in its line)
+        #[arg(long)]
+        message: i64,
+        /// The project group it was written in (default: the owner's chat)
+        #[arg(long, allow_hyphen_values = true)]
+        chat: Option<i64>,
+    },
     /// Stop listening for this session
     Stop {
         #[arg(long)]
@@ -590,6 +600,10 @@ fn execute(command: TelegramCommand) -> Result<i32> {
                     "It is {time}: {state} Write {owner} a single message: what you did during the night, then the questions that were waiting."
                 )
             );
+            Ok(0)
+        }
+        TelegramCommand::Fetch { message, chat } => {
+            println!("{}", bot.refetch(message, chat)?);
             Ok(0)
         }
         TelegramCommand::Stop { session, announce_group } => {

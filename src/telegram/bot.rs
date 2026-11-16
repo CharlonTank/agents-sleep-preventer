@@ -280,7 +280,7 @@ impl Bot {
         Ok(settings)
     }
 
-    fn chat_id(&self) -> Result<i64> {
+    pub(crate) fn chat_id(&self) -> Result<i64> {
         match self.config()?.int("chat_id") {
             Some(chat) => Ok(chat),
             None => {
@@ -2285,12 +2285,15 @@ impl Bot {
         if !edited && self.group_command(text.trim(), message, &group, chat)? {
             return Ok(0);
         }
-        let body = self.describe(message, update.int("update_id").unwrap_or(0), &text, &speaker);
+        let (body, media) = self.describe(message, update.int("update_id").unwrap_or(0), &text, &speaker);
         let body = if edited { say!(self, "(message modifié) {body}", "(edited message) {body}") } else { body };
         base.extend(obj(json!({
             "speaker": speaker, "thread_id": null, "topic_id": topic,
             "topic": self.topic_name(chat, topic), "text": body,
         })));
+        if let Some(media) = media {
+            base.insert("media".into(), media);
+        }
         if let Some(album) = message.get("media_group_id").filter(|v| !v.is_null()) {
             base.insert("album".into(), album.clone());
         }
@@ -2437,13 +2440,16 @@ impl Bot {
             }
         };
         let update_id = update.int("update_id").unwrap_or(0);
-        let body = self.describe(message, update_id, &text, &self.owner());
+        let (body, media) = self.describe(message, update_id, &text, &self.owner());
         let body = if edited { say!(self, "(message modifié) {body}", "(edited message) {body}") } else { body };
-        let entry = obj(json!({
+        let mut entry = obj(json!({
             "at": message.int("edit_date").or_else(|| message.int("date")),
             "from": FROM_OWNER, "message_id": message.int("message_id"), "update_id": update_id,
             "text": body, "thread_id": topic_of(message),
         }));
+        if let Some(media) = media {
+            entry.insert("media".into(), media);
+        }
         match name {
             Some(name) => self.deliver(&name, &entry, how)?,
             None => self.ask(&entry, candidates)?,

@@ -29,6 +29,8 @@ struct FakeState {
     lost_thread: bool,
     wrong_home: bool,
     refuse_download: Option<String>,
+    flaky_downloads: u32,
+    forwarded: Option<Value>,
     migrated: HashMap<i64, i64>,
 }
 
@@ -88,6 +90,12 @@ impl Telegram for Fake {
                 state.next_thread += 1;
                 Ok(json!({"message_thread_id": state.next_thread - 1, "name": params.get("name")}))
             }
+            "forwardMessage" => {
+                state.next_id += 1;
+                let mut copy = state.forwarded.clone().unwrap_or_else(|| json!({}));
+                copy["message_id"] = json!(state.next_id);
+                Ok(copy)
+            }
             "getFile" => match &state.refuse_download {
                 Some(reason) => Err(refused(method, 400, reason, None)),
                 None => Ok(json!({"file_path": format!("files/{}", params.get("file_id").unwrap_or(""))})),
@@ -97,6 +105,11 @@ impl Telegram for Fake {
     }
 
     fn download(&self, _: &str, target: &Path) -> Result<(), ApiError> {
+        let mut state = self.0.borrow_mut();
+        if state.flaky_downloads > 0 {
+            state.flaky_downloads -= 1;
+            return Err(ApiError::Network("The read operation timed out".to_string()));
+        }
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         std::fs::write(target, b"data").unwrap();
         Ok(())
@@ -672,6 +685,71 @@ fn attachments_are_downloaded_next_to_the_update() {
     assert_eq!(h.inbox("nova-studio"), [format!("regarde\n[photo] {}", photo.display())]);
     let fetched = h.calls("getFile").pop().unwrap();
     assert_eq!(fetched.get("file_id"), Some("grand"));
+}
+
+#[test]
+fn a_download_that_times_out_is_tried_again() {
+    let mut h = harness();
+    h.live("nova-studio");
+    h.tg.borrow_mut().flaky_downloads = 2;
+    h.dispatch(message(1, 152, "", json!({"caption": "nova: le PV", "document": {"file_id": "x", "file_name": "pv.pdf"}})));
+    let file = h.dir.path().join("attachments").join("1-pv.pdf");
+    assert_eq!(h.inbox("nova-studio"), [format!("le PV\n[document] {}", file.display())]);
+}
+
+#[test]
+fn a_lost_download_keeps_what_fetches_it_again() {
+    let mut h = harness();
+    h.live("nova-studio");
+    h.tg.borrow_mut().flaky_downloads = 9;
+    let document = json!({"file_id": "x", "file_name": "pv.pdf", "file_size": 2_000_000});
+    h.dispatch(message(1, 153, "", json!({"caption": "nova: le PV", "document": document})));
+    assert_eq!(
+        h.inbox("nova-studio"),
+        ["le PV\n[document non téléchargé, 2 Mo : Telegram unreachable: The read operation timed out] (pour le récupérer : asp telegram fetch --message 153)"]
+    );
+    let entry = h.bot.store.entries().pop().unwrap();
+    assert_eq!(entry.get("media"), Some(&json!({"document": document})));
+    h.tg.borrow_mut().flaky_downloads = 0;
+    let file = h.dir.path().join("attachments").join("1-pv.pdf");
+    assert_eq!(h.bot.refetch(153, None).unwrap(), format!("[document] {}", file.display()));
+    assert!(h.calls("forwardMessage").is_empty());
+}
+
+#[test]
+fn a_lost_group_download_says_its_group() {
+    let mut h = harness();
+    h.group();
+    h.live("alice-site");
+    h.tg.borrow_mut().flaky_downloads = 9;
+    let photo = json!({"photo": [{"file_id": "p"}]});
+    h.dispatch(group_message(1, 154, "", ALICE, "Alice", GROUP, photo));
+    let line = h.inbox("alice-site").remove(0);
+    assert!(line.ends_with(&format!("(pour le récupérer : asp telegram fetch --chat {GROUP} --message 154)")), "{line}");
+    h.tg.borrow_mut().flaky_downloads = 0;
+    assert!(h.bot.refetch(154, Some(GROUP)).unwrap().starts_with("[photo] "));
+    assert!(h.bot.refetch(154, None).is_err()); // message 154 of the owner's chat: another message
+}
+
+#[test]
+fn a_file_lost_by_sync_telegram_is_fetched_through_a_silent_forward() {
+    let h = harness();
+    h.bot.store.journal(&json!({"at": now(), "from": "charles", "message_id": 4648, "update_id": 9,
+                                "text": "[vocal non téléchargé, 0 Mo : The read operation timed out]",
+                                "thread_id": 35530, "session": "evo-hub", "how": "fil"}));
+    h.tg.borrow_mut().forwarded = Some(json!({"document": {"file_id": "again", "file_name": "note.pdf"}}));
+    let file = h.dir.path().join("attachments").join("9-note.pdf");
+    assert_eq!(h.bot.refetch(4648, None).unwrap(), format!("[document] {}", file.display()));
+    let forward = h.calls("forwardMessage").pop().unwrap();
+    let owner = OWNER.to_string();
+    assert_eq!(
+        (forward.get("chat_id"), forward.get("from_chat_id"), forward.get("message_id")),
+        (Some(owner.as_str()), Some(owner.as_str()), Some("4648"))
+    );
+    assert_eq!((forward.get("disable_notification"), forward.get("message_thread_id")), (Some("true"), Some("35530")));
+    let deleted = h.calls("deleteMessage").pop().unwrap();
+    assert_eq!(deleted.get("message_id"), Some("501")); // the copy, right away
+    assert!(h.bot.refetch(4649, None).is_err());
 }
 
 // Listeners.

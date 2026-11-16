@@ -2,10 +2,12 @@
 //! text, downloaded attachments and transcribed voice notes.
 
 use super::api::{ApiError, Params};
-use super::bot::{say, Bot, API_TIMEOUT};
+use super::bot::{say, Bot, API_TIMEOUT, MEDIA};
 use super::store::{Fields, Object};
+use anyhow::{anyhow, bail, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Below this peak the note is silent (microphone off is about -91 dB):
 /// on silence Parakeet invents words ("Thank you."), so it isn't asked.
@@ -17,29 +19,136 @@ const FAILED: i32 = 2;
 const SILENT: i32 = 3;
 const NO_MODEL: i32 = 4;
 
+/// Pauses before trying a failed download again: Telegram's file server
+/// sometimes doesn't answer in time, and a lost voice note has to be said
+/// again.
+const DOWNLOAD_PAUSES: [Duration; 2] = if cfg!(test) {
+    [Duration::ZERO; 2]
+} else {
+    [Duration::from_secs(3), Duration::from_secs(10)]
+};
+
+/// No answer, or a failure on Telegram's side: worth trying again later.
+fn transient(error: &ApiError) -> bool {
+    match error {
+        ApiError::Network(_) => true,
+        ApiError::Refused { code, .. } => *code >= 500 || *code == 429,
+    }
+}
+
+/// An attachment that couldn't be downloaded: its line, and whether
+/// fetching it again later can work.
+struct Missing {
+    line: String,
+    transient: bool,
+}
+
 enum Unheard {
     Silent(f32),
     Failed(String),
 }
 
 impl Bot {
-    pub(crate) fn describe(&self, message: &Object, update_id: i64, text: &str, speaker: &str) -> String {
+    /// The message as text, and its attachments when one couldn't be
+    /// downloaded for now (kept in the journal entry as `media`, for
+    /// `asp telegram fetch`).
+    pub(crate) fn describe(&self, message: &Object, update_id: i64, text: &str, speaker: &str) -> (String, Option<Value>) {
         let mut lines = self.context(message, speaker);
         if !text.is_empty() {
             lines.push(text.to_string());
         }
+        let mut media = None;
         if let Err(missing) = self.attachments(message, update_id, &mut lines) {
-            lines.push(missing);
+            if missing.transient {
+                let id = message.int("message_id").unwrap_or(0);
+                let command = match message.object("chat") {
+                    Some(chat) if chat.text("type") != Some("private") => {
+                        format!("asp telegram fetch --chat {} --message {id}", chat.int("id").unwrap_or(0))
+                    }
+                    _ => format!("asp telegram fetch --message {id}"),
+                };
+                let line = &missing.line;
+                lines.push(say!(self, "{line} (pour le récupérer : {command})", "{line} (to get it: {command})"));
+                let kept: Object = MEDIA
+                    .iter()
+                    .filter_map(|kind| message.get(*kind).map(|item| (kind.to_string(), item.clone())))
+                    .collect();
+                media = Some(Value::Object(kept));
+            } else {
+                lines.push(missing.line);
+            }
         }
-        if lines.is_empty() {
+        let body = if lines.is_empty() {
             say!(self, "(message sans texte)", "(message without text)")
         } else {
             lines.join("\n")
-        }
+        };
+        (body, media)
     }
 
-    /// Stops at the first attachment that can't be downloaded, as a line.
-    fn attachments(&self, message: &Object, update_id: i64, lines: &mut Vec<String>) -> Result<(), String> {
+    /// The attachments of received message `message_id` (of the group
+    /// `chat`, else the owner's chat), downloaded again: from the `media`
+    /// its journal entry kept, or else through a copy forwarded silently to
+    /// the owner and deleted at once, which gives their file_id back (an
+    /// entry filed by sync-telegram doesn't keep it).
+    pub fn refetch(&self, message_id: i64, chat: Option<i64>) -> Result<String> {
+        let owner = self.chat_id()?;
+        let chat = chat.filter(|chat| *chat != owner);
+        let entry = self.store.entries().into_iter().rev().find(|entry| {
+            entry.int("message_id") == Some(message_id)
+                && entry.get("update_id").is_some_and(|id| !id.is_null())
+                && entry.int("chat_id").filter(|id| *id != 0 && *id != owner) == chat
+        });
+        let Some(entry) = entry else {
+            bail!(say!(
+                self,
+                "Message {message_id} absent du journal des messages reçus",
+                "Message {message_id} is not among the received messages in the journal"
+            ));
+        };
+        let message = match entry.object("media") {
+            Some(media) => media.clone(),
+            None => self.forwarded(chat.unwrap_or(owner), message_id, entry.int("thread_id"))?,
+        };
+        let mut lines = Vec::new();
+        self.attachments(&message, entry.int("update_id").unwrap_or(message_id), &mut lines)
+            .map_err(|missing| anyhow!(missing.line))?;
+        if lines.is_empty() {
+            bail!(say!(self, "Rien à télécharger dans le message {message_id}", "Nothing to download in message {message_id}"));
+        }
+        Ok(lines.join("\n"))
+    }
+
+    /// Message `id` of `chat`, forwarded to the owner without sound and
+    /// deleted right away: Telegram answers with the whole message.
+    fn forwarded(&self, chat: i64, id: i64, thread: Option<i64>) -> Result<Object> {
+        let owner = self.chat_id()?;
+        let params = Params::new()
+            .set("chat_id", owner)
+            .set("from_chat_id", chat)
+            .set("message_id", id)
+            .set("disable_notification", true);
+        let copy = match thread.filter(|_| chat == owner) {
+            Some(thread) => self
+                .call("forwardMessage", params.clone().set("message_thread_id", thread))
+                .or_else(|_| self.call("forwardMessage", params))?,
+            None => self.call("forwardMessage", params)?,
+        };
+        if let Some(copy_id) = copy.get("message_id").and_then(Value::as_i64) {
+            let deleted = self.call("deleteMessage", Params::new().set("chat_id", owner).set("message_id", copy_id));
+            if let Err(error) = deleted {
+                eprintln!("asp telegram: forwarded copy {copy_id} not deleted ({error})");
+            }
+        }
+        Ok(copy.as_object().cloned().unwrap_or_default())
+    }
+
+    fn call(&self, method: &str, params: Params) -> Result<Value, ApiError> {
+        self.telegram().call(method, &params, API_TIMEOUT, None)
+    }
+
+    /// Stops at the first attachment that can't be downloaded.
+    fn attachments(&self, message: &Object, update_id: i64, lines: &mut Vec<String>) -> Result<(), Missing> {
         let voice = message
             .object("voice")
             .or_else(|| message.object("audio"))
@@ -68,7 +177,7 @@ impl Bot {
         Ok(())
     }
 
-    fn fetch(&self, item: &Object, kind: &str, name: &str) -> Result<PathBuf, String> {
+    fn fetch(&self, item: &Object, kind: &str, name: &str) -> Result<PathBuf, Missing> {
         let download = || -> Result<PathBuf, ApiError> {
             let file_id = item.text("file_id").unwrap_or("");
             let info = self
@@ -82,7 +191,17 @@ impl Bot {
             self.telegram().download(remote, &target)?;
             Ok(target)
         };
-        download().map_err(|error| {
+        let mut pauses = DOWNLOAD_PAUSES.iter();
+        let result = loop {
+            match download() {
+                Err(error) if transient(&error) => match pauses.next() {
+                    Some(pause) => std::thread::sleep(*pause),
+                    None => break Err(error),
+                },
+                other => break other,
+            }
+        };
+        result.map_err(|error| {
             let heavy = item
                 .int("file_size")
                 .filter(|size| *size > 0)
@@ -91,7 +210,10 @@ impl Bot {
                     say!(self, ", {megabytes:.0} Mo", ", {megabytes:.0} MB")
                 })
                 .unwrap_or_default();
-            say!(self, "[{kind} non téléchargé{heavy} : {error}]", "[{kind} not downloaded{heavy}: {error}]")
+            Missing {
+                line: say!(self, "[{kind} non téléchargé{heavy} : {error}]", "[{kind} not downloaded{heavy}: {error}]"),
+                transient: transient(&error),
+            }
         })
     }
 
