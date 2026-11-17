@@ -3,6 +3,7 @@
 
 mod api;
 mod bot;
+mod codex;
 mod media;
 mod setup;
 mod store;
@@ -12,6 +13,8 @@ mod tests;
 
 use anyhow::{bail, Context, Result};
 pub(crate) use bot::Bot;
+#[cfg(target_os = "macos")]
+pub(crate) use codex::{hook_group as codex_hook_group, is_hook_group as is_codex_hook_group};
 use bot::{say, Busy, Extras};
 pub(crate) use setup::system_prefers_french;
 use clap::Subcommand;
@@ -116,8 +119,13 @@ pub enum TelegramCommand {
         #[arg(long)]
         sync: bool,
     },
-    /// Install the /telegram skill in every Claude Code profile
+    /// Install the /telegram skill in every Claude Code profile, and in
+    /// Codex with the Stop hook it listens through
     Skill,
+    /// Codex's Stop hook: while this Codex session listens on Telegram,
+    /// waits for the owner's messages and hands them to Codex as its next
+    /// prompt (reads the hook's JSON on stdin)
+    Codex,
     /// The voice-note model: where it is, or (Linux) download it
     Voice,
     /// Transcribe one voice note and exit (the listener runs it as a child)
@@ -485,6 +493,67 @@ pub fn run(command: TelegramCommand) -> i32 {
     }
 }
 
+/// The received entries as the session reads them.
+fn heard(bot: &Bot, name: &str, received: &[store::Object]) -> Vec<String> {
+    let owner = bot.owner();
+    let bound = bot.group_of(name).is_some();
+    received
+        .iter()
+        .map(|entry| {
+            // A session bound to a group: what doesn't come from it is
+            // marked [privé] (answer with --private).
+            let origin = match entry.text("group") {
+                Some(_) => format!("[{}] ", bot.place(entry)),
+                None if bound => say!(bot, "[privé] ", "[private] "),
+                None => String::new(),
+            };
+            let speaker = entry.text("speaker").map_or(owner.clone(), str::to_string);
+            let when = text::day_and_time(entry.float("at"));
+            let said = entry.text("text").unwrap_or("");
+            say!(bot, "[{when}] {origin}{speaker} : {said}", "[{when}] {origin}{speaker}: {said}")
+        })
+        .collect()
+}
+
+/// Codex's Stop hook never fails the turn: a problem goes to stderr.
+fn codex_stop() -> i32 {
+    let mut input = String::new();
+    if std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).is_err() {
+        return 0;
+    }
+    let bot = match open_bot() {
+        Ok(bot) => bot,
+        Err(error) => {
+            eprintln!("asp telegram codex: {error:#}");
+            return 0;
+        }
+    };
+    if let Some(answer) = codex::on_stop(&bot, &input, codex::WAIT, |name, received| heard(&bot, name, received)) {
+        println!("{answer}");
+    }
+    0
+}
+
+/// Binds this Codex session to `name` and says what is left to do.
+fn codex_start(bot: &Bot, thread: &str, name: &str) -> Result<String> {
+    codex::bind(&bot.store, thread, name)?;
+    let Some(home) = codex::home() else {
+        bail!("~/.codex not found");
+    };
+    Ok(match codex::install_hook(&home)? {
+        codex::Hook::Trusted => say!(
+            bot,
+            "Codex : rien à lancer en tâche de fond. Termine ton tour : le hook Stop de Codex (asp telegram codex) écoute et te rend ses messages.",
+            "Codex: nothing to run in the background. End your turn: Codex's Stop hook (asp telegram codex) listens and hands you the messages."
+        ),
+        codex::Hook::Added | codex::Hook::Untrusted => say!(
+            bot,
+            "Codex ne fait pas encore confiance au hook qui écoute (asp telegram codex, ajouté à ~/.codex/hooks.json) : rien n’écoute tant qu’il n’est pas approuvé. Dis-le à l’utilisateur en une ligne : taper /hooks dans Codex, faire confiance au hook « asp telegram codex », puis relancer $telegram.",
+            "Codex doesn't trust the listening hook yet (asp telegram codex, added to ~/.codex/hooks.json): nothing listens until it is approved. Tell the user in one line: type /hooks in Codex, trust the \"asp telegram codex\" hook, then $telegram again."
+        ),
+    })
+}
+
 fn execute(command: TelegramCommand) -> Result<i32> {
     match &command {
         TelegramCommand::Setup => {
@@ -492,12 +561,13 @@ fn execute(command: TelegramCommand) -> Result<i32> {
             return setup::run(&settings).map(|()| 0);
         }
         TelegramCommand::Hear { file, model } => return Ok(media::hear_once(file, model.as_deref())),
+        TelegramCommand::Codex => return Ok(codex_stop()),
         _ => {}
     }
     let bot = open_bot()?;
     let owner = bot.owner();
     match command {
-        TelegramCommand::Setup | TelegramCommand::Hear { .. } => unreachable!(),
+        TelegramCommand::Setup | TelegramCommand::Hear { .. } | TelegramCommand::Codex => unreachable!(),
         TelegramCommand::Start { session, alias, announce_group } => {
             let name = session_name(session.as_deref())?;
             bot.start(&name, &alias, announce_group)?;
@@ -508,6 +578,15 @@ fn execute(command: TelegramCommand) -> Result<i32> {
                 }
                 _ => say!(bot, "à {owner}", "to {owner}"),
             };
+            if let Some(thread) = codex::thread() {
+                let next = codex_start(&bot, &thread, &name)?;
+                println!("{}", say!(
+                    bot,
+                    "Session « {name} » annoncée {told}.\n{next}\nRéponse : asp telegram send --session {name} --text \"…\"",
+                    "Session \"{name}\" announced {told}.\n{next}\nAnswer: asp telegram send --session {name} --text \"…\""
+                ));
+                return Ok(0);
+            }
             println!("{}", say!(
                 bot,
                 "Session « {name} » annoncée {told}.\nÉcoute (en tâche de fond) : asp telegram listen --session {name} --max 0\nRéponse : asp telegram send --session {name} --text \"…\"",
@@ -521,19 +600,8 @@ fn execute(command: TelegramCommand) -> Result<i32> {
             if ignored > 0 {
                 println!("{}", say!(bot, "({ignored} message(s) d’un autre compte ignoré(s))", "({ignored} message(s) from another account ignored)"));
             }
-            let bound = bot.group_of(&name).is_some();
-            for entry in &received {
-                // A session bound to a group: what doesn't come from it is
-                // marked [privé] (answer with --private).
-                let origin = match entry.text("group") {
-                    Some(_) => format!("[{}] ", bot.place(entry)),
-                    None if bound => say!(bot, "[privé] ", "[private] "),
-                    None => String::new(),
-                };
-                let speaker = entry.text("speaker").map_or(owner.clone(), str::to_string);
-                let when = text::day_and_time(entry.float("at"));
-                let said = entry.text("text").unwrap_or("");
-                println!("{}", say!(bot, "[{when}] {origin}{speaker} : {said}", "[{when}] {origin}{speaker}: {said}"));
+            for line in heard(&bot, &name, &received) {
+                println!("{line}");
             }
             Ok(if received.is_empty() { 3 } else { 0 })
         }
@@ -609,6 +677,7 @@ fn execute(command: TelegramCommand) -> Result<i32> {
         TelegramCommand::Stop { session, announce_group } => {
             let name = session_name(session.as_deref())?;
             bot.stop(&name, announce_group)?;
+            codex::unbind(&bot.store, &name);
             println!("{}", say!(bot, "Session « {name} » arrêtée (arrêter aussi sa tâche d’écoute).", "Session \"{name}\" stopped (stop its listening task too)."));
             Ok(0)
         }
@@ -617,9 +686,18 @@ fn execute(command: TelegramCommand) -> Result<i32> {
             Ok(0)
         }
         TelegramCommand::Skill => {
-            let settings = bot.config()?;
-            let username = settings.text("username").unwrap_or("").to_string();
-            for (file, written) in install_skill(&owner, &username) {
+            let username = bot.bot_username();
+            let mut done = install_skill(&owner, &username);
+            if let Some(home) = codex::home() {
+                let text = codex::skill(SKILL).replace("{{OWNER}}", &owner).replace("{{BOT}}", &username);
+                done.push(codex::install_skill(&home, &text));
+                let hook = match codex::install_hook(&home)? {
+                    codex::Hook::Trusted => say!(bot, "approuvé", "trusted"),
+                    _ => say!(bot, "à approuver dans Codex : /hooks", "to approve in Codex: /hooks"),
+                };
+                println!("{}", say!(bot, "Hook Codex (asp telegram codex) : {hook}", "Codex hook (asp telegram codex): {hook}"));
+            }
+            for (file, written) in done {
                 let shown = file.display();
                 if written {
                     println!("{}", say!(bot, "Skill installé : {shown}", "Skill installed: {shown}"));

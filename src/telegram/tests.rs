@@ -1720,3 +1720,109 @@ fn ipv4_goes_first_unless_the_machine_has_no_ipv4_route() {
         ["[2001:67c:4e8:f004::9]:443", "[2001:67c:4e8:f004::a]:443", "149.154.167.220:443"]
     );
 }
+
+fn codex_input(thread: &str, continued: bool) -> String {
+    json!({"session_id": thread, "hook_event_name": "Stop", "stop_hook_active": continued}).to_string()
+}
+
+fn codex_heard(_: &str, received: &[Object]) -> Vec<String> {
+    received.iter().map(|entry| entry.text("text").unwrap_or("").to_string()).collect()
+}
+
+#[test]
+fn a_codex_session_that_doesnt_listen_ends_its_turn() {
+    let h = harness();
+    assert_eq!(super::codex::on_stop(&h.bot, &codex_input("t-1", false), 1, codex_heard), None);
+    assert_eq!(super::codex::on_stop(&h.bot, "not json", 1, codex_heard), None);
+    assert!(h.calls("getUpdates").is_empty());
+}
+
+#[test]
+fn the_codex_hook_hands_the_owners_messages_to_codex() {
+    let mut h = harness();
+    h.session("acme-backend", false, json!({}));
+    super::codex::bind(&h.bot.store, "t-1", "acme-backend").unwrap();
+    let entry = json!({"at": now(), "from": "owner", "message_id": 70, "update_id": 9, "text": "lance les tests",
+                       "session": "acme-backend", "how": "nom", "routed_at": now()});
+    h.bot.store.write(&h.bot.store.path(&["inbox", "acme-backend", "9.json"]), &entry).unwrap();
+    let answer = super::codex::on_stop(&h.bot, &codex_input("t-1", true), 1, codex_heard).unwrap();
+    assert_eq!(answer["decision"], "block");
+    let reason = answer["reason"].as_str().unwrap();
+    assert!(reason.starts_with("[asp telegram, session « acme-backend »] Messages de Sam"), "{reason}");
+    assert!(reason.ends_with("\n\nlance les tests"), "{reason}");
+    assert!(h.bot.store.released("session.acme-backend"));
+}
+
+#[test]
+fn after_an_hour_without_a_message_the_codex_hook_lets_codex_breathe() {
+    let mut h = harness();
+    h.session("acme-backend", false, json!({}));
+    super::codex::bind(&h.bot.store, "t-1", "acme-backend").unwrap();
+    let answer = super::codex::on_stop(&h.bot, &codex_input("t-1", true), 1, codex_heard).unwrap();
+    assert_eq!(answer["decision"], "block");
+    assert!(answer["reason"].as_str().unwrap().contains("Termine ton tour sans rien écrire"));
+}
+
+#[test]
+fn a_stopped_session_unbinds_its_codex_thread() {
+    let mut h = harness();
+    h.session("acme-backend", false, json!({"stopped": true}));
+    super::codex::bind(&h.bot.store, "t-1", "acme-backend").unwrap();
+    assert_eq!(super::codex::on_stop(&h.bot, &codex_input("t-1", false), 1, codex_heard), None);
+    assert_eq!(super::codex::bound(&h.bot.store, "t-1"), None);
+}
+
+#[test]
+fn a_name_binds_one_codex_thread_only() {
+    let h = harness();
+    super::codex::bind(&h.bot.store, "t-1", "acme-backend").unwrap();
+    super::codex::bind(&h.bot.store, "t-2", "acme-backend").unwrap();
+    super::codex::bind(&h.bot.store, "t-3", "nova-studio").unwrap();
+    assert_eq!(super::codex::bound(&h.bot.store, "t-1"), None);
+    assert_eq!(super::codex::bound(&h.bot.store, "t-2").as_deref(), Some("acme-backend"));
+    super::codex::unbind(&h.bot.store, "acme-backend");
+    assert_eq!(super::codex::bound(&h.bot.store, "t-2"), None);
+    assert_eq!(super::codex::bound(&h.bot.store, "t-3").as_deref(), Some("nova-studio"));
+}
+
+#[test]
+fn a_busy_name_is_said_once_then_codex_stops_listening() {
+    let mut h = harness();
+    h.live("acme-backend");
+    super::codex::bind(&h.bot.store, "t-1", "acme-backend").unwrap();
+    let answer = super::codex::on_stop(&h.bot, &codex_input("t-1", false), 1, codex_heard).unwrap();
+    assert!(answer["reason"].as_str().unwrap().contains("Une autre écoute tient déjà « acme-backend »"));
+    assert_eq!(super::codex::on_stop(&h.bot, &codex_input("t-1", true), 1, codex_heard), None);
+}
+
+#[test]
+fn the_codex_skill_listens_through_the_hook() {
+    let skill = super::codex::skill(include_str!("SKILL.md"));
+    for gone in ["run_in_background", "TaskStop", "--max 0", "(or `matin`), in the background", "asks for recaps"] {
+        assert!(!skill.contains(gone), "{gone}");
+    }
+    for kept in ["## Start", "Stop hook", "## Each time the hook wakes you", "## Answer", "## At night",
+                 "The hook's first prompt after the night", "## Project group", "## Stop", "\"$telegram\"", "Installed by Agent Session Pilot"] {
+        assert!(skill.contains(kept), "{kept}");
+    }
+    assert!(skill.starts_with("---\nname: telegram\n"));
+}
+
+#[test]
+fn the_codex_hook_is_added_once_and_trusted_by_its_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let hooks = dir.path().join("hooks.json");
+    let theirs = json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "their-stop", "timeout": 5}]}]}});
+    std::fs::write(&hooks, theirs.to_string()).unwrap();
+    assert_eq!(super::codex::install_hook(dir.path()).unwrap(), super::codex::Hook::Added);
+    assert_eq!(super::codex::install_hook(dir.path()).unwrap(), super::codex::Hook::Untrusted);
+    let written: Value = serde_json::from_str(&std::fs::read_to_string(&hooks).unwrap()).unwrap();
+    let groups = written["hooks"]["Stop"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0], theirs["hooks"]["Stop"][0]);
+    assert!(super::codex::is_hook_group(&groups[1]));
+    assert_eq!(groups[1]["hooks"][0]["timeout"], 3900);
+    let key = format!("{}:stop:1:0", hooks.display());
+    std::fs::write(dir.path().join("config.toml"), format!("[hooks.state.\"{key}\"]\ntrusted_hash = \"sha256:x\"\n")).unwrap();
+    assert_eq!(super::codex::install_hook(dir.path()).unwrap(), super::codex::Hook::Trusted);
+}

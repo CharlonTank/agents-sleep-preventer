@@ -3198,6 +3198,11 @@ fn install_codex_hooks(home: &Path, app_binary: &str) -> Result<()> {
         hooks_json["hooks"] = json!({});
     }
 
+    // The Telegram listening hook is ASP's too, but only there for those
+    // who use it: kept, at the same place (Codex trusts it by position).
+    let telegram_hook = hooks_json["hooks"]["Stop"]
+        .as_array()
+        .is_some_and(|groups| groups.iter().any(telegram::is_codex_hook_group));
     if let Some(hooks) = hooks_json.get_mut("hooks") {
         remove_owned_hook_groups(hooks, &OWNED_HOOK_MARKERS);
         prune_empty_hook_events(hooks);
@@ -3230,6 +3235,9 @@ fn install_codex_hooks(home: &Path, app_binary: &str) -> Result<()> {
         command_hook_group(&refresh_command, Some("*")),
     );
     append_hook_group(hooks, "Stop", command_hook_group(&stop_command, None));
+    if telegram_hook {
+        append_hook_group(hooks, "Stop", telegram::codex_hook_group(Path::new(app_binary)));
+    }
 
     fs::write(&hooks_file, serde_json::to_string_pretty(&hooks_json)?)
         .with_context(|| format!("Failed to write {}", hooks_file.display()))?;

@@ -1999,7 +1999,7 @@ impl Bot {
     }
 
     /// The bot's @username, from bot.json, else asked once to Telegram.
-    fn bot_username(&self) -> String {
+    pub(crate) fn bot_username(&self) -> String {
         if let Some(name) = self
             .config()
             .ok()

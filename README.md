@@ -11,7 +11,7 @@
 
 <br>
 
-[![Download DMG](https://img.shields.io/badge/Download-DMG%20Installer-blue?style=for-the-badge&logo=apple)](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-5.8.8.dmg)
+[![Download DMG](https://img.shields.io/badge/Download-DMG%20Installer-blue?style=for-the-badge&logo=apple)](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-5.8.9.dmg)
 
 <br>
 
@@ -51,7 +51,7 @@ Install this tool. Your computer stays awake while your agent works; normal slee
 - A macOS menu bar app or Windows tray app, with automatic and manual sleep controls
 - Auto-resume on macOS: when a network drop cuts Claude Code or Codex off, it types "continue" into the agent's terminal once the connection is back
 - Safety nets on macOS: a nightly sleep time, and sleep at low battery (10% by default), even with agents still working
-- Telegram on macOS and Linux: talk to every Claude Code session from your phone through your own bot (`asp telegram setup`, then `/telegram` in a session), voice notes transcribed locally
+- Telegram on macOS and Linux: talk to every Claude Code or Codex session from your phone through your own bot (`asp telegram setup`, then `/telegram` in a session, `$telegram` in Codex), voice notes transcribed locally
 - RAM and disk watch on macOS and Linux: names the session behind a memory or disk drift, by notification and on Telegram
 - Every session by name on macOS: the menu and `asp sessions` show each Claude Code session's name (`/rename`), its profile (`CLAUDE_CONFIG_DIR`) and the Claude account each profile uses
 - Workshop on macOS and Linux: `asp workshop` opens your named Claude Code sessions in iTerm or tmux in one go
@@ -71,9 +71,9 @@ Install this tool. Your computer stays awake while your agent works; normal slee
 For a machine that never turns off, without a desktop. Download the archive from GitHub, check it, then install it (no root needed):
 
 ```bash
-curl -fLO https://github.com/CharlonTank/agents-sleep-preventer/releases/download/v5.8.8/AgentsSleepPreventer-5.8.8-linux-x86_64.tar.gz
-sha256sum AgentsSleepPreventer-5.8.8-linux-x86_64.tar.gz   # same as on the release page and on asp.charlon.dev?
-tar -xzf AgentsSleepPreventer-5.8.8-linux-x86_64.tar.gz asp
+curl -fLO https://github.com/CharlonTank/agents-sleep-preventer/releases/download/v5.8.9/AgentsSleepPreventer-5.8.9-linux-x86_64.tar.gz
+sha256sum AgentsSleepPreventer-5.8.9-linux-x86_64.tar.gz   # same as on the release page and on asp.charlon.dev?
+tar -xzf AgentsSleepPreventer-5.8.9-linux-x86_64.tar.gz asp
 install -Dm755 asp ~/.local/bin/asp
 ~/.local/bin/asp service install
 ~/.local/bin/asp telegram setup
@@ -91,7 +91,7 @@ Either way you get `asp` in `~/.local/bin`, plus a systemd user service (`asp se
 
 ### Windows 10 / 11
 
-[Download the Windows ZIP](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-5.8.8-windows-x86_64.zip), extract it, and run `asp.exe` for the system tray app. To install native Claude Code/Codex hooks and start at login, run this in PowerShell from the extracted folder:
+[Download the Windows ZIP](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-5.8.9-windows-x86_64.zip), extract it, and run `asp.exe` for the system tray app. To install native Claude Code/Codex hooks and start at login, run this in PowerShell from the extracted folder:
 
 ```powershell
 .\asp.exe install --yes
@@ -103,7 +103,7 @@ Requires macOS 14 Sonoma or later on Apple Silicon.
 
 ### 🍎 Download DMG (Easiest)
 
-1. [Download the latest DMG](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-5.8.8.dmg)
+1. [Download the latest DMG](https://github.com/CharlonTank/agents-sleep-preventer/releases/latest/download/AgentsSleepPreventer-5.8.9.dmg)
 2. Drag `AgentsSleepPreventer.app` to Applications
 3. Launch the app - it will auto-configure on first run
 4. Restart your coding agents
