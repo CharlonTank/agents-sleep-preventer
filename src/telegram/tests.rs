@@ -1,7 +1,7 @@
 //! The bot against a fake Telegram: routing, topics, groups, listeners.
 //! Scenarios ported from sync-telegram's test suite, so both behave alike.
 
-use super::api::{ApiError, Params, Relay, Telegram};
+use super::api::{ipv4_first, ApiError, Params, Relay, Telegram};
 use super::bot::{within, Bot, Extras, Notice};
 use super::store::{now, Fields, Lock, Object, Store};
 use super::text::tag;
@@ -1702,4 +1702,21 @@ fn at_night_the_bots_notices_and_the_ram_alerts_go_without_sound() {
 fn by_day_morning_returns_at_once() {
     let h = harness();
     assert!(h.bot.morning(Duration::from_secs(3600)) < 1.0);
+}
+
+#[test]
+fn ipv4_goes_first_unless_the_machine_has_no_ipv4_route() {
+    let found: Vec<std::net::SocketAddr> = ["[2001:67c:4e8:f004::9]:443", "149.154.167.220:443", "[2001:67c:4e8:f004::a]:443"]
+        .iter()
+        .map(|address| address.parse().unwrap())
+        .collect();
+    let text = |ordered: Vec<std::net::SocketAddr>| ordered.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(
+        text(ipv4_first(&found, |_| true)),
+        ["149.154.167.220:443", "[2001:67c:4e8:f004::9]:443", "[2001:67c:4e8:f004::a]:443"]
+    );
+    assert_eq!(
+        text(ipv4_first(&found, |_| false)),
+        ["[2001:67c:4e8:f004::9]:443", "[2001:67c:4e8:f004::a]:443", "149.154.167.220:443"]
+    );
 }

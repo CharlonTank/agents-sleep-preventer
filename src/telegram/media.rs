@@ -19,6 +19,9 @@ const FAILED: i32 = 2;
 const SILENT: i32 = 3;
 const NO_MODEL: i32 = 4;
 
+/// getFile only names the file: an answer that takes longer is a hung call.
+const FILE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Pauses before trying a failed download again: Telegram's file server
 /// sometimes doesn't answer in time, and a lost voice note has to be said
 /// again.
@@ -182,7 +185,7 @@ impl Bot {
             let file_id = item.text("file_id").unwrap_or("");
             let info = self
                 .telegram()
-                .call("getFile", &Params::new().set("file_id", file_id), API_TIMEOUT, None)?;
+                .call("getFile", &Params::new().set("file_id", file_id), FILE_TIMEOUT, None)?;
             let remote = info
                 .get("file_path")
                 .and_then(Value::as_str)

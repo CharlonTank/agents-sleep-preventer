@@ -6,8 +6,18 @@ use std::cell::OnceCell;
 use std::fmt;
 use std::fs::File;
 use std::io;
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::Path;
 use std::time::Duration;
+use ureq::config::Config;
+use ureq::http::Uri;
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
+
+/// Opening a connection (TCP and TLS) longer than this: the next address.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// A file the server hasn't started sending by then won't come.
+const FILE_FIRST_BYTE: Duration = Duration::from_secs(20);
 
 /// Form parameters of an API call, in order; values are already strings
 /// (numbers formatted, nested objects as JSON).
@@ -100,6 +110,49 @@ pub trait Telegram {
     fn download(&self, file_path: &str, target: &Path) -> Result<(), ApiError>;
 }
 
+/// From some networks, calls to api.telegram.org over IPv6 hang now and
+/// then while IPv4 answers every time, and a hung call holds the listener
+/// for its whole timeout. IPv4 goes first; IPv6 stays the fallback, and
+/// comes first on a machine without an IPv4 route (an IPv6-only server).
+#[derive(Debug, Default)]
+struct Ipv4First(DefaultResolver);
+
+impl Resolver for Ipv4First {
+    fn resolve(&self, uri: &Uri, config: &Config, timeout: NextTimeout) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        let found = self.0.resolve(uri, config, timeout)?;
+        let routable = |address: &SocketAddr| {
+            UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+                .and_then(|socket| socket.connect(address))
+                .is_ok()
+        };
+        let mut ordered = self.empty();
+        for address in ipv4_first(&found, routable) {
+            ordered.push(address);
+        }
+        Ok(ordered)
+    }
+}
+
+/// IPv4 addresses the machine can reach first, then IPv6, then the rest;
+/// each group keeps the resolver's order.
+pub(crate) fn ipv4_first(found: &[SocketAddr], routable: impl Fn(&SocketAddr) -> bool) -> Vec<SocketAddr> {
+    let mut ordered = found.to_vec();
+    ordered.sort_by_cached_key(|address| match address {
+        SocketAddr::V4(_) if routable(address) => 0,
+        SocketAddr::V6(_) => 1,
+        SocketAddr::V4(_) => 2,
+    });
+    ordered
+}
+
+fn agent() -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .build();
+    ureq::Agent::with_parts(config, DefaultConnector::new(), Ipv4First::default())
+}
+
 pub struct HttpTelegram {
     token: String,
     agent: ureq::Agent,
@@ -107,11 +160,7 @@ pub struct HttpTelegram {
 
 impl HttpTelegram {
     pub fn new(token: String) -> Self {
-        let agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .build()
-            .new_agent();
-        Self { token, agent }
+        Self { token, agent: agent() }
     }
 
     /// An error text never carries the token (it is in every URL).
@@ -228,6 +277,7 @@ impl Telegram for HttpTelegram {
             .get(&url)
             .config()
             .timeout_global(Some(Duration::from_secs(300)))
+            .timeout_recv_response(Some(FILE_FIRST_BYTE))
             .build()
             .call()
             .map_err(|e| self.network(e))?;
@@ -276,11 +326,7 @@ pub struct HttpRelay {
 
 impl HttpRelay {
     pub fn new(read_token: TokenReader) -> Self {
-        let agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .build()
-            .new_agent();
-        Self { read_token, token: OnceCell::new(), agent }
+        Self { read_token, token: OnceCell::new(), agent: agent() }
     }
 
     fn token(&self) -> anyhow::Result<&str> {
