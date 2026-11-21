@@ -32,9 +32,11 @@ const DU_KEEP: f64 = 35.0 * 60.0;
 const DU_TIMEOUT: Duration = Duration::from_secs(120);
 /// No repeat per (session, type) for 20 minutes…
 const RENEWAL: f64 = 20.0 * 60.0;
-/// …or 2 hours for the whole Mac's swap and memory pressure, which last for
-/// days on a busy Mac: the heaviest sessions were told again every 20
-/// minutes (95 alerts in a day for one session, each one a turn of it)…
+/// …or 2 hours for the whole Mac's swap, memory pressure and low disk, which
+/// last for days on a busy Mac: every 20 minutes, the heaviest sessions were
+/// told again (95 alerts in a day for one session, each one a turn of it),
+/// and so was the owner, for sessions without a listener and for the disk
+/// (375 messages in a day)…
 const MACHINE_RENEWAL: f64 = 2.0 * 3600.0;
 /// …unless the value grew this much.
 const MULTIPLIER: f64 = 1.5;
@@ -686,15 +688,15 @@ pub struct Said {
 }
 
 fn renewal(kind: &str) -> f64 {
-    if matches!(kind, "swap" | "pression") {
+    if matches!(kind, "swap" | "pression" | "disque_bas") {
         MACHINE_RENEWAL
     } else {
         RENEWAL
     }
 }
 
-/// No new alert for 20 minutes (2 hours for swap and pressure), unless more
-/// severe or the value ×1.5.
+/// No new alert for 20 minutes (2 hours for swap, pressure and low disk),
+/// unless more severe or the value ×1.5.
 pub fn filter(alerts: Vec<Alert>, memory: &mut BTreeMap<String, Said>, at: f64) -> Vec<Alert> {
     let mut emitted = Vec::new();
     for alert in alerts {
@@ -1277,6 +1279,23 @@ mod tests {
         assert_eq!((alerts[0].kind.as_str(), alerts[0].session.as_deref()), ("disque_chute", Some("dev")));
         let unknown = disk_alerts(&snap, &history, &HashMap::new(), 600.0, &limits, false);
         assert!(unknown[0].resume.contains("not measured"));
+    }
+
+    #[test]
+    fn a_lasting_low_disk_is_said_again_after_two_hours_or_when_critical() {
+        let limits = Thresholds::default();
+        let low = |free: u64| {
+            let mut snap = snapshot(Vec::new());
+            snap.free = free * GIB;
+            disk_alerts(&snap, &[], &HashMap::new(), 0.0, &limits, true)
+        };
+        assert_eq!(low(20)[0].kind, "disque_bas");
+        let mut memory = BTreeMap::new();
+        assert_eq!(filter(low(20), &mut memory, 1000.0).len(), 1);
+        assert!(filter(low(20), &mut memory, 1000.0 + RENEWAL + 60.0).is_empty());
+        assert!(filter(low(18), &mut memory, 1000.0 + RENEWAL + 90.0).is_empty(), "a little lower");
+        assert_eq!(filter(low(14), &mut memory, 1000.0 + RENEWAL + 120.0).len(), 1, "critical");
+        assert_eq!(filter(low(14), &mut memory, 1000.0 + RENEWAL + 120.0 + MACHINE_RENEWAL).len(), 1);
     }
 
     #[test]
