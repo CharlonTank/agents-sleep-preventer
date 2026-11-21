@@ -447,13 +447,13 @@ fn scan_codex_sessions() {
                     record_failure(Agent::Codex, pid, cause, message, Some(turn));
                 }
             }
-            Some(TurnOutcome::Completed { at }) => {
-                // The resumed turn went through: the streak is over.
+            // The resumed turn went through: the streak is over.
+            Some(TurnOutcome::Completed { at })
                 if previous.is_some_and(|record| {
                     record.stage == Stage::Resumed && at >= record.resumed_at.unwrap_or(u64::MAX)
-                }) {
-                    remove(pid);
-                }
+                }) =>
+            {
+                remove(pid);
             }
             _ => {}
         }

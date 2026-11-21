@@ -350,7 +350,7 @@ fn run_event_tap(tx: Sender<GlobeKeyEvent>, stop_flag: Arc<AtomicBool>) {
         return;
     }
 
-    EVENT_TAP.store(tap as *mut std::ffi::c_void, Ordering::SeqCst);
+    EVENT_TAP.store(tap, Ordering::SeqCst);
     logging::log(&format!("[globe_key] CGEventTap created: {:p}", tap));
 
     // Enable the tap

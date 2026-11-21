@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
 
@@ -45,7 +45,7 @@ impl WhisperTranscriber {
     /// Find whisper-cli: bundled first, then homebrew, then system PATH
     fn find_whisper_cli() -> PathBuf {
         // Try bundled version first (in app's Resources folder)
-        if let Some(exe_path) = env::current_exe().ok() {
+        if let Ok(exe_path) = env::current_exe() {
             let resources = exe_path
                 .parent() // MacOS
                 .and_then(|p| p.parent()) // Contents
@@ -185,7 +185,7 @@ impl WhisperTranscriber {
         self.model.clone()
     }
 
-    pub fn transcribe(&self, audio_path: &PathBuf) -> Result<String, String> {
+    pub fn transcribe(&self, audio_path: &Path) -> Result<String, String> {
         let (engine, model_path) = self
             .model
             .as_ref()
@@ -199,8 +199,8 @@ impl WhisperTranscriber {
 
     fn transcribe_whisper(
         &self,
-        model_path: &PathBuf,
-        audio_path: &PathBuf,
+        model_path: &Path,
+        audio_path: &Path,
     ) -> Result<String, String> {
         let language = preferred_language().unwrap_or_else(|| "auto".to_string());
         let vocabulary = get_vocabulary_prompt();
@@ -377,7 +377,7 @@ pub(crate) fn transcribe_recording(model_dir: &std::path::Path, samples: &[f32])
     ))
 }
 
-fn transcribe_parakeet(model_dir: &PathBuf, audio_path: &PathBuf) -> Result<String, String> {
+fn transcribe_parakeet(model_dir: &Path, audio_path: &Path) -> Result<String, String> {
     let start = std::time::Instant::now();
     let mut model = ParakeetModel::load(model_dir, &Quantization::Int8)
         .map_err(|e| format!("Failed to load Parakeet model: {}", e))?;
@@ -467,7 +467,7 @@ pub(crate) fn download_model_with_window(
 }
 
 fn download_model_with_progress(
-    model_path: &PathBuf,
+    model_path: &Path,
     model_url: &str,
     progress: &native_dialogs::SetupWindowHandle,
     percent_base: f64,
@@ -559,6 +559,80 @@ fn extract_percent(line: &str) -> Option<f64> {
     line[start..percent_index].trim().parse().ok()
 }
 
+fn preferred_language() -> Option<String> {
+    // Check settings first
+    let settings = AppSettings::load();
+    let lang = &settings.speech_to_text.language;
+    if !lang.is_empty() && lang != "auto" {
+        return Some(lang.clone());
+    }
+
+    // Fallback to environment/system detection
+    preferred_language_from_env().or_else(preferred_language_from_system)
+}
+
+/// Get vocabulary words as a prompt string for whisper-cli
+fn get_vocabulary_prompt() -> String {
+    let settings = AppSettings::load();
+    let words = &settings.speech_to_text.vocabulary_words;
+    if words.is_empty() {
+        return String::new();
+    }
+
+    // Join vocabulary words with spaces for the initial prompt
+    words.join(" ")
+}
+
+fn preferred_language_from_env() -> Option<String> {
+    let candidates = ["LC_ALL", "LC_CTYPE", "LANG"];
+    for key in candidates {
+        if let Ok(value) = env::var(key) {
+            if let Some(code) = parse_language_code(&value) {
+                return Some(code);
+            }
+        }
+    }
+    None
+}
+
+fn preferred_language_from_system() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let languages: *mut objc::runtime::Object = msg_send![class!(NSLocale), preferredLanguages];
+        let count: usize = msg_send![languages, count];
+        if count == 0 {
+            return None;
+        }
+        let first: *mut objc::runtime::Object = msg_send![languages, objectAtIndex: 0usize];
+        let c_str: *const std::os::raw::c_char = msg_send![first, UTF8String];
+        if c_str.is_null() {
+            return None;
+        }
+        let lang = std::ffi::CStr::from_ptr(c_str).to_string_lossy();
+        parse_language_code(&lang)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+fn parse_language_code(value: &str) -> Option<String> {
+    let trimmed = value.split('.').next().unwrap_or(value).trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut iter = trimmed.split(['_', '-']);
+    let primary = iter.next().unwrap_or("").trim();
+    if primary.is_empty() || primary.eq_ignore_ascii_case("C") {
+        return None;
+    }
+
+    Some(primary.to_lowercase())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,78 +719,4 @@ mod tests {
         let _ = fs::remove_file(&aiff);
         let _ = fs::remove_file(&wav);
     }
-}
-
-fn preferred_language() -> Option<String> {
-    // Check settings first
-    let settings = AppSettings::load();
-    let lang = &settings.speech_to_text.language;
-    if !lang.is_empty() && lang != "auto" {
-        return Some(lang.clone());
-    }
-
-    // Fallback to environment/system detection
-    preferred_language_from_env().or_else(preferred_language_from_system)
-}
-
-/// Get vocabulary words as a prompt string for whisper-cli
-fn get_vocabulary_prompt() -> String {
-    let settings = AppSettings::load();
-    let words = &settings.speech_to_text.vocabulary_words;
-    if words.is_empty() {
-        return String::new();
-    }
-
-    // Join vocabulary words with spaces for the initial prompt
-    words.join(" ")
-}
-
-fn preferred_language_from_env() -> Option<String> {
-    let candidates = ["LC_ALL", "LC_CTYPE", "LANG"];
-    for key in candidates {
-        if let Ok(value) = env::var(key) {
-            if let Some(code) = parse_language_code(&value) {
-                return Some(code);
-            }
-        }
-    }
-    None
-}
-
-fn preferred_language_from_system() -> Option<String> {
-    #[cfg(target_os = "macos")]
-    unsafe {
-        let languages: *mut objc::runtime::Object = msg_send![class!(NSLocale), preferredLanguages];
-        let count: usize = msg_send![languages, count];
-        if count == 0 {
-            return None;
-        }
-        let first: *mut objc::runtime::Object = msg_send![languages, objectAtIndex: 0usize];
-        let c_str: *const std::os::raw::c_char = msg_send![first, UTF8String];
-        if c_str.is_null() {
-            return None;
-        }
-        let lang = std::ffi::CStr::from_ptr(c_str).to_string_lossy();
-        parse_language_code(&lang)
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
-    }
-}
-
-fn parse_language_code(value: &str) -> Option<String> {
-    let trimmed = value.split('.').next().unwrap_or(value).trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let mut iter = trimmed.split(|c| c == '_' || c == '-');
-    let primary = iter.next().unwrap_or("").trim();
-    if primary.is_empty() || primary.eq_ignore_ascii_case("C") {
-        return None;
-    }
-
-    Some(primary.to_lowercase())
 }

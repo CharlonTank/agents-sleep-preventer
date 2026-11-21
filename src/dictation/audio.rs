@@ -14,7 +14,7 @@ extern "C" {}
 pub fn check_microphone_permission() -> MicrophonePermission {
     unsafe {
         let media_type: *mut objc::runtime::Object =
-            msg_send![class!(NSString), stringWithUTF8String: b"soun\0".as_ptr()];
+            msg_send![class!(NSString), stringWithUTF8String: c"soun".as_ptr()];
 
         let status: i64 =
             msg_send![class!(AVCaptureDevice), authorizationStatusForMediaType: media_type];
@@ -37,7 +37,7 @@ pub fn request_microphone_permission_sync() -> bool {
 
     unsafe {
         let media_type: *mut objc::runtime::Object =
-            msg_send![class!(NSString), stringWithUTF8String: b"soun\0".as_ptr()];
+            msg_send![class!(NSString), stringWithUTF8String: c"soun".as_ptr()];
 
         // Create completion handler block
         let block = ConcreteBlock::new(move |granted: bool| {

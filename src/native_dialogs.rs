@@ -97,10 +97,10 @@ pub fn show_dialog(message: &str, title: &str) {
         // NSAlertStyleInformational = 1
         let _: () = msg_send![alert, setAlertStyle: 1i64];
 
-        let title_str = nsstring(&title);
+        let title_str = nsstring(title);
         let _: () = msg_send![alert, setMessageText: title_str];
 
-        let message_str = nsstring(&message);
+        let message_str = nsstring(message);
         let _: () = msg_send![alert, setInformativeText: message_str];
 
         let ok_str = nsstring("OK");
@@ -468,7 +468,7 @@ impl SetupWindow {
             let _: () = msg_send![primary, setFont: primary_font];
 
             let target: Id = msg_send![setup_target_class(), new];
-            let target_obj = target as *mut Object;
+            let target_obj: *mut Object = target;
             (*target_obj).set_ivar("rustState", state_ptr_send.into_ptr());
 
             let _: () = msg_send![primary, setTarget: target];

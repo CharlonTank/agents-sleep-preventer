@@ -566,7 +566,7 @@ fn read_procargs(pid: u32, buffer: &mut [u8]) -> Option<usize> {
 /// `KERN_PROCARGS2`: argc, the executable path, NUL padding, then the
 /// NUL-terminated arguments, then the environment. Gives argc and the
 /// strings from the first argument on.
-fn procargs_strings(buffer: &[u8]) -> Option<(usize, std::slice::Split<'_, u8, impl FnMut(&u8) -> bool>)> {
+fn procargs_strings(buffer: &[u8]) -> Option<(usize, impl Iterator<Item = &[u8]>)> {
     let argc = i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?);
     let rest = &buffer[4..];
     let path_end = rest.iter().position(|&b| b == 0)?;
@@ -1122,7 +1122,7 @@ fn attention_reasons(processes: &[ProcessInfo]) -> HashMap<u32, String> {
             let marker_age = get_file_age(&entry.path()).unwrap_or(ATTENTION_FALLBACK_EXPIRY_SECS);
             let status = (kind == AgentKind::Claude)
                 .then_some(())
-                .and_then(|_| home.as_deref())
+                .and(home.as_deref())
                 .and_then(|home| claude_attention_status(home, pid));
 
             if should_keep_attention_marker(marker_age, status) {
@@ -1876,8 +1876,7 @@ fn is_sleep_disabled() -> bool {
             return false;
         }
 
-        let result = CFBoolean::wrap_under_create_rule(property as _).into();
-        result
+        CFBoolean::wrap_under_create_rule(property as _).into()
     }
 }
 
@@ -2308,7 +2307,7 @@ fn build_agent_list_items(
             }
 
             let state = agent_state(attention.contains_key(&pid), working.contains_key(&pid));
-            let kind = process.and_then(|process| classify_agent_process(process));
+            let kind = process.and_then(classify_agent_process);
             let claude = kind == Some(AgentKind::Claude);
             AgentListItem {
                 pid,
@@ -2566,8 +2565,7 @@ fn is_lid_closed() -> bool {
             return false;
         }
 
-        let result = CFBoolean::wrap_under_create_rule(property as _).into();
-        result
+        CFBoolean::wrap_under_create_rule(property as _).into()
     }
 }
 
@@ -3556,6 +3554,1301 @@ fn remove_hermes_hooks(home: &Path) -> Result<usize> {
     Ok(removed)
 }
 
+fn remove_codex_hooks(home: &Path) -> Result<bool> {
+    let hooks_file = home.join(".codex/hooks.json");
+    if !hooks_file.exists() {
+        return Ok(false);
+    }
+
+    let content = fs::read_to_string(&hooks_file)
+        .with_context(|| format!("Failed to read {}", hooks_file.display()))?;
+    let Ok(mut hooks_json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        eprintln!(
+            "Warning: could not parse {}, leaving it unchanged",
+            hooks_file.display()
+        );
+        return Ok(false);
+    };
+
+    let changed = hooks_json
+        .get_mut("hooks")
+        .map(|hooks| remove_owned_hook_groups(hooks, &OWNED_HOOK_MARKERS))
+        .unwrap_or(false);
+    if !changed {
+        return Ok(false);
+    }
+
+    if let Some(hooks) = hooks_json.get_mut("hooks") {
+        prune_empty_hook_events(hooks);
+    }
+
+    if let Some(root) = hooks_json.as_object_mut() {
+        let hooks_empty = root
+            .get("hooks")
+            .and_then(serde_json::Value::as_object)
+            .map(|hooks| hooks.is_empty())
+            .unwrap_or(false);
+        if hooks_empty {
+            root.remove("hooks");
+        }
+        if root.is_empty() {
+            fs::remove_file(&hooks_file)
+                .with_context(|| format!("Failed to remove {}", hooks_file.display()))?;
+            return Ok(true);
+        }
+    }
+
+    fs::write(&hooks_file, serde_json::to_string_pretty(&hooks_json)?)
+        .with_context(|| format!("Failed to write {}", hooks_file.display()))?;
+
+    Ok(true)
+}
+
+fn is_codex_hooks_installed(home: &Path) -> bool {
+    let hooks_file = home.join(".codex/hooks.json");
+    let Ok(content) = fs::read_to_string(hooks_file) else {
+        return false; // missing file: setup can create it
+    };
+    let Ok(hooks_json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        // Unparseable hooks.json: install would fail on the same parse, so
+        // gating here would make every launch prompt-and-exit. Fail open.
+        return true;
+    };
+    hook_value_contains_owned_command(&hooks_json)
+}
+
+fn is_claude_hooks_installed(home: &Path) -> bool {
+    // agent-attention.sh checked too so upgrades from pre-notification
+    // versions re-run setup and pick up the Notification hook.
+    if !home.join(".claude/hooks/prevent-sleep.sh").exists()
+        || !home.join(".claude/hooks/agent-attention.sh").exists()
+    {
+        return false;
+    }
+
+    // The SubagentStop keep-awake hook is required so upgrades from
+    // pre-subagent versions re-run setup and pick up the subagent +
+    // PostToolUse events.
+    let Ok(content) = fs::read_to_string(home.join(".claude/settings.json")) else {
+        return false; // missing file: setup can create it
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        // Unparseable settings.json: install would fail on the same parse
+        // error, so gating here would make every launch prompt-and-exit.
+        // Run with the existing (script-based) hooks instead.
+        return true;
+    };
+    json.get("hooks")
+        .and_then(|hooks| hooks.get("SubagentStop"))
+        .map(|groups| hook_value_contains_marker(groups, &[".claude/hooks/refresh-sleep.sh"]))
+        .unwrap_or(false)
+}
+
+fn is_installed() -> bool {
+    let home = resolve_user_home().unwrap_or_default();
+    is_claude_hooks_installed(&home) && is_codex_hooks_installed(&home)
+}
+
+fn run_first_time_setup() -> Result<()> {
+    let message = "Agent Session Pilot needs to be configured for supported coding agents.
+
+This will:
+• Install the CLI tool
+• Configure coding agent hooks
+• Set up automatic startup
+
+Administrator password required.";
+
+    if !native_dialogs::show_confirm_dialog(message, "Agent Session Pilot", "Set Up", "Cancel") {
+        return Ok(());
+    }
+
+    let script = "/Applications/AgentsSleepPreventer.app/Contents/MacOS/asp install -y";
+
+    match authorization::execute_script_with_privileges(script) {
+        Ok(true) => {
+            native_dialogs::show_dialog(
+                "Setup complete!\n\nRestart your coding agents to activate sleep prevention.",
+                "Agent Session Pilot",
+            );
+            relaunch_app_after_install();
+        }
+        Ok(false) => {
+            // User cancelled
+        }
+        Err(e) => {
+            native_dialogs::show_dialog(&format!("Setup failed: {}", e), "Agent Session Pilot");
+        }
+    }
+
+    Ok(())
+}
+
+/// macOS Gatekeeper "App Translocation" runs a quarantined .app from a
+/// randomized read-only path whenever it's launched from outside
+/// /Applications (straight off a mounted DMG, ~/Downloads, etc). TCC
+/// permission grants (Accessibility, Microphone) are tied to that path,
+/// so every such launch gets a fresh random path and looks like the OS
+/// silently revoked previously-granted permissions. The fix is to move the
+/// bundle into /Applications (a stable path) and relaunch from there.
+fn ensure_running_from_applications() {
+    let Some(bundle_path) = objc_utils::main_bundle_path() else {
+        return;
+    };
+    if !bundle_path.ends_with(".app") || bundle_path == APP_BUNDLE_PATH {
+        return;
+    }
+
+    logging::log(&format!(
+        "[main] App running from non-standard location: {}",
+        bundle_path
+    ));
+
+    let message = format!(
+        "Agent Session Pilot is running from:\n{}\n\nmacOS permissions (Accessibility, Microphone) only stay granted reliably when the app runs from /Applications — otherwise they can silently reset and the dictation shortcut stops working.\n\nMove it to /Applications and relaunch now?",
+        bundle_path
+    );
+
+    if !native_dialogs::show_confirm_dialog(
+        &message,
+        "Move to Applications?",
+        "Move & Relaunch",
+        "Not Now",
+    ) {
+        logging::log("[main] User declined moving app to /Applications");
+        return;
+    }
+
+    if Path::new(APP_BUNDLE_PATH).exists() {
+        let _ = fs::remove_dir_all(APP_BUNDLE_PATH);
+    }
+
+    let copied = Command::new("ditto")
+        .args([bundle_path.as_str(), APP_BUNDLE_PATH])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if !copied {
+        logging::log("[main] Failed to copy app to /Applications");
+        native_dialogs::show_dialog(
+            "Couldn't move the app automatically. Please drag AgentsSleepPreventer.app to your Applications folder yourself, then relaunch it.",
+            "Move Failed",
+        );
+        return;
+    }
+
+    let _ = Command::new("xattr")
+        .args(["-dr", "com.apple.quarantine", APP_BUNDLE_PATH])
+        .status();
+
+    logging::log("[main] Moved app to /Applications, relaunching...");
+    match Command::new("open").args(["-n", APP_BUNDLE_PATH]).status() {
+        Ok(status) if status.success() => std::process::exit(0),
+        Ok(status) => logging::log(&format!("[main] Relaunch failed with status: {}", status)),
+        Err(e) => logging::log(&format!("[main] Relaunch failed: {}", e)),
+    }
+}
+
+fn relaunch_app_after_install() {
+    logging::log("[main] Relaunching app after install...");
+    match Command::new("open")
+        .args(["-n", "/Applications/AgentsSleepPreventer.app"])
+        .status()
+    {
+        Ok(status) if status.success() => {
+            std::process::exit(0);
+        }
+        Ok(status) => {
+            logging::log(&format!("[main] Relaunch failed with status: {}", status));
+        }
+        Err(e) => {
+            logging::log(&format!("[main] Relaunch failed: {}", e));
+        }
+    }
+}
+
+fn get_process_tty(pid: u32) -> Option<String> {
+    Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "tty="])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "??")
+}
+
+fn focus_terminal_by_tty(tty: &str) {
+    let tty_path = if tty.starts_with("/dev/") {
+        tty.to_string()
+    } else {
+        format!("/dev/{}", tty)
+    };
+
+    // Try Terminal.app first
+    let terminal_script = format!(
+        r#"
+        tell application "Terminal"
+            set windowList to every window
+            repeat with w in windowList
+                set tabList to every tab of w
+                repeat with t in tabList
+                    if tty of t is "{}" then
+                        set frontmost of w to true
+                        set selected of t to true
+                        activate
+                        return true
+                    end if
+                end repeat
+            end repeat
+        end tell
+        return false
+        "#,
+        tty_path
+    );
+
+    let result = Command::new("osascript")
+        .args(["-e", &terminal_script])
+        .output();
+
+    if let Ok(output) = result {
+        if String::from_utf8_lossy(&output.stdout).trim() == "true" {
+            return;
+        }
+    }
+
+    // Try iTerm2 - double activate to ensure space switch
+    let iterm_script = format!(
+        r#"
+        tell application "iTerm2"
+            set windowList to every window
+            repeat with w in windowList
+                set tabList to every tab of w
+                repeat with t in tabList
+                    set sessionList to every session of t
+                    repeat with s in sessionList
+                        if tty of s is "{}" then
+                            activate
+                            delay 0.1
+                            select w
+                            select t
+                            select s
+                            activate
+                            return true
+                        end if
+                    end repeat
+                end repeat
+            end repeat
+        end tell
+        return false
+        "#,
+        tty_path
+    );
+
+    let _ = Command::new("osascript")
+        .args(["-e", &iterm_script])
+        .output();
+}
+
+fn focus_terminal_by_pid(pid: u32) {
+    if let Some(tty) = get_process_tty(pid) {
+        focus_terminal_by_tty(&tty);
+    }
+}
+
+fn cmd_focus(pid: u32) -> Result<()> {
+    logging::init();
+    logging::log(&format!("[focus] requested pid={}", pid));
+    focus_terminal_by_pid(pid);
+    Ok(())
+}
+
+/// Signals each task with everything it spawned: stopping only the wrapper
+/// shell would orphan the server or poll loop it runs. Only Bash tasks of
+/// live agents are touched, whatever PIDs are passed.
+fn cmd_stop_tasks(pids: &[u32]) -> Result<()> {
+    logging::init();
+    let processes = load_process_table();
+    for &agent_pid in pids {
+        let is_agent = processes
+            .iter()
+            .any(|process| process.pid == agent_pid && classify_agent_process(process).is_some());
+        if !is_agent {
+            continue;
+        }
+        // Run from a Claude Bash tool call, its own wrapper is one of the tasks.
+        let own_chain = own_call_chain(&processes, agent_pid);
+        for task in agent_tasks(&processes, agent_pid)
+            .into_iter()
+            .filter(|task| !own_chain.contains(&task.pid))
+        {
+            let mut tree = descendant_pids(&processes, task.pid);
+            tree.push(task.pid);
+            for pid in tree {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
+            }
+            logging::log(&format!(
+                "[tasks] stopped task pid={} of agent pid={}",
+                task.pid, agent_pid
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn get_instance_items() -> Vec<(u32, u64, f32, String)> {
+    let mut items = Vec::new();
+    if let Ok(entries) = fs::read_dir(runtime_dir::pids_dir()) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let pid: u32 = entry.file_name().to_string_lossy().parse().unwrap_or(0);
+            if pid > 0 {
+                let age = get_file_age(&entry.path()).unwrap_or(0);
+                let cpu = get_process_cpu(pid);
+                let location = format_process_location(pid);
+                items.push((pid, age, cpu, location));
+            }
+        }
+    }
+    items
+}
+
+fn quit_app() {
+    unsafe {
+        let app: objc_utils::Id = msg_send![class!(NSApplication), sharedApplication];
+        if app.is_null() {
+            return;
+        }
+        let _: () = msg_send![app, terminate: objc_utils::NIL];
+    }
+}
+
+fn cmd_menubar() -> Result<()> {
+    // Initialize logging
+    logging::init();
+    logging::log("[main] Starting menubar app");
+
+    ensure_running_from_applications();
+
+    if !is_installed() {
+        run_first_time_setup()?;
+        if !is_installed() {
+            return Ok(());
+        }
+    }
+
+    // Load settings and initialize sleep prevention state
+    let app_settings = settings::AppSettings::load();
+    MANUAL_SLEEP_PREVENTION.store(app_settings.sleep_prevention.enabled, Ordering::SeqCst);
+    logging::log(&format!(
+        "[main] Loaded settings: sleep_prevention={}",
+        app_settings.sleep_prevention.enabled
+    ));
+
+    let mut event_loop = EventLoopBuilder::new().build();
+    event_loop.set_activation_policy(ActivationPolicy::Accessory);
+    let tick_proxy = event_loop.create_proxy();
+
+    let initial_instances = get_instance_items();
+    let manual_enabled = MANUAL_SLEEP_PREVENTION.load(Ordering::SeqCst);
+
+    notifications::init_click_handler();
+
+    // Initialize dictation manager
+    let mut dictation_manager = DictationManager::new();
+
+    // Create a minimal menu for right-click, but show popover on left-click
+    let minimal_menu = Menu::new();
+    let settings_item = MenuItem::new("Settings...", true, None);
+    let settings_item_id = settings_item.id().clone();
+    let _ = minimal_menu.append(&settings_item);
+    let quit_item = MenuItem::new("Quit", true, None);
+    let quit_item_id = quit_item.id().clone();
+    let _ = minimal_menu.append(&quit_item);
+
+    let tray = TrayIconBuilder::new()
+        .with_menu(Box::new(minimal_menu))
+        .with_menu_on_left_click(false) // Left-click shows popover, right-click shows menu
+        .with_title(create_tray_title(initial_instances.len(), manual_enabled))
+        .with_tooltip("Agent Session Pilot")
+        .build()?;
+
+    let menu_channel = MenuEvent::receiver();
+    let tray_event_channel = TrayIconEvent::receiver();
+
+    // Initialize popover window
+    let mut popover = popover::PopoverWindow::new();
+
+    // Register global hotkeys
+    let hotkey_manager = GlobalHotKeyManager::new().unwrap();
+    let hotkey_active = HotKey::new(
+        Some(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SUPER),
+        Code::KeyJ,
+    );
+    let hotkey_inactive = HotKey::new(
+        Some(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SUPER),
+        Code::KeyL,
+    );
+    let hotkey_active_id = hotkey_active.id();
+    let hotkey_inactive_id = hotkey_inactive.id();
+    hotkey_manager.register(hotkey_active).unwrap();
+    hotkey_manager.register(hotkey_inactive).unwrap();
+    let hotkey_receiver = GlobalHotKeyEvent::receiver();
+
+    start_clamshell_notifications();
+
+    std::thread::spawn(move || {
+        let mut tick_counter = 0u64;
+        let _ = tick_proxy.send_event(());
+
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            tick_counter += 1;
+
+            if LID_JUST_CLOSED.swap(false, Ordering::SeqCst) {
+                let active = count_active_pids();
+                if active > 0 {
+                    play_lid_close_sound();
+                }
+            }
+
+            if tick_counter.is_multiple_of(100) {
+                cleanup_stale_pids();
+                menubar_sync_sleep();
+            }
+
+            if tick_counter.is_multiple_of(300)
+                && check_thermal_warning() {
+                    let _ = set_sleep_disabled(false);
+                    logging::log("[thermal] Sleep re-enabled due to thermal warning");
+                }
+
+            let _ = tick_proxy.send_event(());
+        }
+    });
+
+    let mut last_update = std::time::Instant::now() - Duration::from_secs(10);
+
+    let mut click_check_counter = 0u64;
+    let mut onboarding_checked = false;
+    event_loop.run(move |event, _, control_flow| {
+        // Drive updates from the tick thread to avoid relying on user input events.
+        *control_flow = ControlFlow::Wait;
+
+        if !onboarding_checked {
+            if let Event::NewEvents(StartCause::Init) = event {
+                onboarding_checked = true;
+                run_onboarding_if_needed(false);
+                let dictation_available = dictation_manager.is_available();
+                let dictation_enabled = dictation_manager.is_enabled();
+                logging::log(&format!(
+                    "[dictation] available={}, enabled={}",
+                    dictation_available, dictation_enabled
+                ));
+                if dictation_available {
+                    if let Err(e) = dictation_manager.start() {
+                        logging::log(&format!("[dictation] Failed to start: {}", e));
+                    }
+                }
+            }
+        }
+
+        click_check_counter += 1;
+        if click_check_counter.is_multiple_of(100) {
+            eprintln!("[DEBUG] Event loop iteration #{}", click_check_counter);
+        }
+        while let Ok(menu_event) = menu_channel.try_recv() {
+            if menu_event.id == settings_item_id {
+                logging::log("[menu] Settings selected");
+                popover.hide();
+                if let Some(new_settings) = settings::window::show_settings() {
+                    // Update manual sleep prevention based on settings.
+                    // Interactive: the user just clicked Save, never
+                    // force-sleep a lid-closed (docked) Mac from here.
+                    MANUAL_SLEEP_PREVENTION
+                        .store(new_settings.sleep_prevention.enabled, Ordering::SeqCst);
+                    let _ = sync_sleep_state_impl(
+                        "settings",
+                        new_settings.sleep_prevention.enabled,
+                        true,
+                    );
+                    logging::log(&format!(
+                        "[menu] Settings saved: sleep_enabled={}, model={}",
+                        new_settings.sleep_prevention.enabled, new_settings.speech_to_text.model
+                    ));
+
+                    // If the selected dictation model isn't downloaded yet,
+                    // offer to download it now, then pick it up.
+                    dictation::ensure_selected_model_downloaded();
+                    apply_dictation_settings(&mut dictation_manager);
+                }
+            } else if menu_event.id == quit_item_id {
+                logging::log("[menu] Quit selected");
+                dictation_manager.stop();
+                quit_app();
+                logging::log("[menu] Forcing process exit");
+                unsafe {
+                    libc::_exit(0);
+                }
+            }
+        }
+
+        // Check for tray events every iteration
+        while let Ok(tray_event) = tray_event_channel.try_recv() {
+            eprintln!("[TRAY EVENT] {:?}", tray_event);
+            logging::log(&format!("[tray] EVENT: {:?}", tray_event));
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Down,
+                rect,
+                ..
+            } = tray_event
+            {
+                logging::log(&format!("[tray] Left click at rect: {:?}", rect));
+                if popover.is_visible() {
+                    popover.hide();
+                } else {
+                    let icon_rect = objc_utils::tray_rect_to_appkit((
+                        rect.position.x,
+                        rect.position.y,
+                        rect.size.width as f64,
+                        rect.size.height as f64,
+                    ));
+                    let pstate = popover::PopoverState {
+                        manual_enabled: MANUAL_SLEEP_PREVENTION.load(Ordering::SeqCst),
+                        instances: get_instance_items(),
+                        inactive: get_inactive_agent_pids(),
+                        thermal_warning: check_thermal_warning(),
+                        dictation_enabled: dictation_manager.is_enabled(),
+                        dictation_available: dictation_manager.is_available(),
+                        sleep_disabled: is_sleep_disabled(),
+                    };
+                    popover.show(icon_rect, &pstate);
+                }
+            }
+        }
+
+        // Update dictation manager (handles Fn+Space events)
+        dictation_manager.update();
+
+        if last_update.elapsed() >= Duration::from_secs(2) {
+            last_update = std::time::Instant::now();
+
+            let instances = get_instance_items();
+            let manual_enabled = MANUAL_SLEEP_PREVENTION.load(Ordering::SeqCst);
+
+            tray.set_title(Some(&create_tray_title(instances.len(), manual_enabled)));
+
+            notifications::drain_and_post();
+        }
+
+        // Menu events commented out - we use popover instead
+        // The menu handling code has been removed since we no longer attach a menu
+
+        // Handle global hotkeys
+        if let Ok(event) = hotkey_receiver.try_recv() {
+            if event.state == global_hotkey::HotKeyState::Pressed {
+                logging::log(&format!("[hotkey] Pressed id={}", event.id));
+                if event.id == hotkey_active_id {
+                    let instances = get_instance_items();
+                    if !instances.is_empty() {
+                        let idx =
+                            CURRENT_PID_INDEX.fetch_add(1, Ordering::SeqCst) % instances.len();
+                        focus_terminal_by_pid(instances[idx].0);
+                    }
+                } else if event.id == hotkey_inactive_id {
+                    let inactive = get_inactive_agent_pids();
+                    if !inactive.is_empty() {
+                        let idx =
+                            CURRENT_INACTIVE_INDEX.fetch_add(1, Ordering::SeqCst) % inactive.len();
+                        focus_terminal_by_pid(inactive[idx]);
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Pick up a changed dictation shortcut or model in a running listener.
+fn apply_dictation_settings(dictation_manager: &mut DictationManager) {
+    let was_available = dictation_manager.is_available();
+    dictation_manager.reload_transcriber();
+    dictation_manager.reload_hotkey();
+    if !was_available && dictation_manager.is_available() {
+        if let Err(e) = dictation_manager.start() {
+            logging::log(&format!("[dictation] Failed to start: {}", e));
+        }
+    }
+}
+
+fn settings_modified_time() -> Option<std::time::SystemTime> {
+    fs::metadata(settings::AppSettings::settings_path())
+        .and_then(|metadata| metadata.modified())
+        .ok()
+}
+
+fn cmd_agent() -> Result<()> {
+    logging::init();
+    logging::log("[agent] Starting background agent");
+
+    let _agent_lock = match acquire_agent_lock() {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            logging::log("[agent] Another agent is already running; exiting");
+            return Ok(());
+        }
+        Err(e) => {
+            logging::log(&format!("[agent] Failed to acquire lock: {}", e));
+            return Ok(());
+        }
+    };
+
+    unsafe {
+        let _: objc_utils::Id = msg_send![class!(NSApplication), sharedApplication];
+    }
+    forward_quit_to_menu_bar_app();
+    // The Swift menu bar app moves itself to /Applications before spawning
+    // the agent; asking here too only exited the agent and left the
+    // translocated app running.
+
+    run_onboarding_if_needed(true);
+
+    // Load settings and initialize sleep prevention state
+    let app_settings = settings::AppSettings::load();
+    MANUAL_SLEEP_PREVENTION.store(app_settings.sleep_prevention.enabled, Ordering::SeqCst);
+    logging::log(&format!(
+        "[agent] Loaded settings: sleep_prevention={}",
+        app_settings.sleep_prevention.enabled
+    ));
+
+    start_clamshell_notifications();
+    notifications::init_click_handler();
+
+    let mut dictation_manager = DictationManager::new();
+    let dictation_available = dictation_manager.is_available();
+    let dictation_enabled = dictation_manager.is_enabled();
+    logging::log(&format!(
+        "[agent] dictation available={}, enabled={}",
+        dictation_available, dictation_enabled
+    ));
+    if dictation_available {
+        if let Err(e) = dictation_manager.start() {
+            logging::log(&format!("[agent] Failed to start dictation: {}", e));
+        }
+    }
+
+    auto_resume::spawn();
+
+    let mut settings_modified = settings_modified_time();
+    let home = resolve_user_home().ok();
+    monitor::spawn();
+    let mut tick_counter = 0u64;
+
+    loop {
+        dictation_manager.update();
+        objc_utils::pump_run_loop_once();
+        std::thread::sleep(Duration::from_millis(50));
+        tick_counter += 1;
+
+        // Every 1s: cleanup stale PIDs, sync sleep state, post notifications
+        if tick_counter.is_multiple_of(20) {
+            cleanup_stale_pids();
+            menubar_sync_sleep();
+            notifications::drain_and_post();
+        }
+
+        // Every 3s: thermal check + lid close
+        if tick_counter.is_multiple_of(60) {
+            if check_thermal_warning() {
+                let _ = set_sleep_disabled(false);
+                logging::log("[agent][thermal] Sleep re-enabled due to thermal warning");
+            }
+
+            if LID_JUST_CLOSED.swap(false, Ordering::SeqCst) {
+                let active = count_active_pids();
+                if active > 0 {
+                    play_lid_close_sound();
+                }
+            }
+        }
+
+        // At startup: an `asp` on the PATH left as a copy by an older
+        // install becomes a link that follows the app's updates.
+        if tick_counter == 1 && Path::new("/usr/local/bin/asp").exists() {
+            match sync_installed_cli() {
+                Ok(true) => logging::log("[cli] /usr/local/bin/asp now links to the app"),
+                Ok(false) => {}
+                Err(e) => logging::log(&format!("[cli] Could not link /usr/local/bin/asp: {e}")),
+            }
+        }
+
+        // At startup, then every 60s: hook up Claude Code profiles
+        // (CLAUDE_CONFIG_DIR) created or first used since the install.
+        if tick_counter % 1200 == 1 {
+            if let Some(home) = &home {
+                for settings_file in install_claude_profile_hooks(home) {
+                    logging::log(&format!(
+                        "[hooks] Added keep-awake hooks to {}",
+                        settings_file.display()
+                    ));
+                }
+            }
+        }
+
+        // Every 1s: the Settings window runs as a separate `asp settings`
+        // process, so apply its saved changes (dictation shortcut, model,
+        // sleep prevention) as soon as settings.json changes on disk.
+        if tick_counter.is_multiple_of(20) {
+            let modified = settings_modified_time();
+            if modified != settings_modified {
+                settings_modified = modified;
+                let new_settings = settings::AppSettings::load();
+                MANUAL_SLEEP_PREVENTION
+                    .store(new_settings.sleep_prevention.enabled, Ordering::SeqCst);
+                apply_dictation_settings(&mut dictation_manager);
+                logging::log(&format!(
+                    "[agent] Settings changed: shortcut={}, model={}",
+                    new_settings.resolved_hotkey().label,
+                    new_settings.speech_to_text.model
+                ));
+            }
+        }
+    }
+}
+
+/// The agent lives in the app bundle, so LaunchServices lists it as a second
+/// "Agent Session Pilot" and `quit app "AgentsSleepPreventer"` (AppleScript,
+/// launchers, logout) reaches it. It pumps events itself instead of running
+/// NSApplication, which is what installs AppKit's quit handler, so the quit
+/// was refused (-1708) and the app kept running. Hand it to the menu bar app
+/// that started this agent: quitting it stops the agent too.
+fn forward_quit_to_menu_bar_app() {
+    extern "C" fn handle_quit(
+        _: &objc::runtime::Object,
+        _: objc::runtime::Sel,
+        _: objc_utils::Id,
+        _: objc_utils::Id,
+    ) {
+        logging::log("[agent] Quit requested");
+        if !terminate_menu_bar_app() {
+            std::process::exit(0);
+        }
+    }
+    const CORE_EVENT_CLASS: u32 = u32::from_be_bytes(*b"aevt");
+    const QUIT_APPLICATION: u32 = u32::from_be_bytes(*b"quit");
+
+    let Some(mut decl) = objc::declare::ClassDecl::new("ASPQuitHandler", class!(NSObject)) else {
+        return;
+    };
+    unsafe {
+        decl.add_method(
+            sel!(handleQuit:withReplyEvent:),
+            handle_quit
+                as extern "C" fn(&objc::runtime::Object, objc::runtime::Sel, objc_utils::Id, objc_utils::Id),
+        );
+        let handler: objc_utils::Id = msg_send![decl.register(), new];
+        let manager: objc_utils::Id =
+            msg_send![class!(NSAppleEventManager), sharedAppleEventManager];
+        let _: () = msg_send![manager,
+            setEventHandler: handler
+            andSelector: sel!(handleQuit:withReplyEvent:)
+            forEventClass: CORE_EVENT_CLASS
+            andEventID: QUIT_APPLICATION];
+    }
+}
+
+/// Asks the parent process to quit when it is this bundle's menu bar app;
+/// false when the agent runs on its own.
+fn terminate_menu_bar_app() -> bool {
+    unsafe {
+        let parent: objc_utils::Id = msg_send![class!(NSRunningApplication),
+            runningApplicationWithProcessIdentifier: libc::getppid()];
+        if parent.is_null() {
+            return false;
+        }
+        let parent_bundle: objc_utils::Id = msg_send![parent, bundleIdentifier];
+        let bundle: objc_utils::Id = msg_send![class!(NSBundle), mainBundle];
+        let own_bundle: objc_utils::Id = msg_send![bundle, bundleIdentifier];
+        let same_bundle = objc_utils::nsstring_to_string(parent_bundle)
+            .is_some_and(|id| Some(id) == objc_utils::nsstring_to_string(own_bundle));
+        if !same_bundle {
+            return false;
+        }
+        let sent: objc::runtime::BOOL = msg_send![parent, terminate];
+        sent == objc::runtime::YES
+    }
+}
+
+fn acquire_agent_lock() -> Result<Option<std::fs::File>> {
+    let lock_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("AgentsSleepPreventer");
+    fs::create_dir_all(&lock_dir)?;
+    let lock_path = lock_dir.join("agent.lock");
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    let fd = file.as_raw_fd();
+    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Ok(None);
+    }
+    let _ = file.set_len(0);
+    let _ = writeln!(file, "pid={}", std::process::id());
+    Ok(Some(file))
+}
+
+fn ask_yes_no(prompt: &str) -> bool {
+    use std::io::{self, BufRead};
+    print!("{} [Y/n]: ", prompt);
+    let _ = io::Write::flush(&mut io::stdout());
+    let stdin = io::stdin();
+    let answer = stdin
+        .lock()
+        .lines()
+        .next()
+        .and_then(|l| l.ok())
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    answer.is_empty() || answer == "y" || answer == "yes"
+}
+
+/// Puts `asp` on the PATH as links to the app's binary, so the command
+/// follows every Sparkle update (copies stayed at the version of the last
+/// `asp install`: 5.2.1 under a 5.4.2 app).
+fn sync_installed_cli() -> Result<bool> {
+    let binary = if Path::new(APP_BINARY_PATH).exists() {
+        PathBuf::from(APP_BINARY_PATH)
+    } else {
+        std::env::current_exe().context("Could not find current executable")?
+    };
+    fs::create_dir_all("/usr/local/bin")?;
+
+    let mut updated = false;
+    for target in [
+        Path::new("/usr/local/bin/asp"),
+        Path::new("/usr/local/bin/agents-sleep-preventer"),
+    ] {
+        if binary == target || fs::read_link(target).ok().as_deref() == Some(binary.as_path()) {
+            continue;
+        }
+        let _ = fs::remove_file(target);
+        std::os::unix::fs::symlink(&binary, target).with_context(|| {
+            format!("Failed to link {} to {}", target.display(), binary.display())
+        })?;
+        updated = true;
+    }
+
+    let _ = fs::remove_file("/usr/local/bin/claude-sleep-preventer");
+
+    Ok(updated)
+}
+
+fn cmd_install(auto_yes: bool) -> Result<()> {
+    let home = resolve_user_home()?;
+    let hooks_dir = home.join(".claude").join("hooks");
+    let settings_file = home.join(".claude").join("settings.json");
+    let launch_agents_dir = home.join("Library/LaunchAgents");
+
+    match sync_installed_cli() {
+        Ok(true) => println!("Updated /usr/local/bin/asp"),
+        Ok(false) => {}
+        Err(e) => eprintln!("Warning: could not update /usr/local/bin/asp: {}", e),
+    }
+
+    fs::create_dir_all(&hooks_dir)?;
+
+    let prevent_script = format!(
+        "#!/bin/bash\n[ -x \"{}\" ] && \"{}\" start 2>/dev/null || true\n",
+        APP_BINARY_PATH, APP_BINARY_PATH
+    );
+    let refresh_script = format!(
+        "#!/bin/bash\n[ -x \"{}\" ] && \"{}\" refresh 2>/dev/null || true\n",
+        APP_BINARY_PATH, APP_BINARY_PATH
+    );
+    let allow_script = format!(
+        "#!/bin/bash\n[ -x \"{}\" ] && \"{}\" stop 2>/dev/null || true\n",
+        APP_BINARY_PATH, APP_BINARY_PATH
+    );
+    // Forwards the hook JSON (with the "message" field) from stdin.
+    let attention_script = format!(
+        "#!/bin/bash\n[ -x \"{}\" ] && cat | \"{}\" attention 2>/dev/null || true\n",
+        APP_BINARY_PATH, APP_BINARY_PATH
+    );
+
+    fs::write(hooks_dir.join("prevent-sleep.sh"), prevent_script)?;
+    fs::write(hooks_dir.join("refresh-sleep.sh"), refresh_script)?;
+    fs::write(hooks_dir.join("allow-sleep.sh"), allow_script)?;
+    fs::write(hooks_dir.join("agent-attention.sh"), attention_script)?;
+    write_interrupted_hook_script(&hooks_dir)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for script in [
+            "prevent-sleep.sh",
+            "refresh-sleep.sh",
+            "allow-sleep.sh",
+            "agent-attention.sh",
+        ] {
+            fs::set_permissions(hooks_dir.join(script), fs::Permissions::from_mode(0o755))?;
+        }
+
+        fix_user_ownership(&hooks_dir);
+    }
+
+    println!("Setting up passwordless sudo for pmset...");
+    // Get the real user (not root) for the sudoers entry
+    let real_user = resolve_real_user()
+        .or_else(|| std::env::var("USER").ok().filter(|user| user != "root"))
+        .context("Could not determine which user should receive passwordless pmset access")?;
+    // Restricted to the exact pmset command lines the app runs; anything else
+    // still requires a password.
+    let sudoers_content = format!(
+        "{} ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset -a sleep 5, /usr/bin/pmset sleepnow\n",
+        real_user
+    );
+
+    // Write directly if we're root, otherwise use sudo
+    let is_root = unsafe { libc::geteuid() == 0 };
+    let mut child = if is_root {
+        Command::new("tee")
+            .arg("/etc/sudoers.d/agents-pmset")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()?
+    } else {
+        Command::new("sudo")
+            .args(["tee", "/etc/sudoers.d/agents-pmset"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()?
+    };
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(sudoers_content.as_bytes())?;
+    }
+    child.wait()?;
+
+    if is_root {
+        Command::new("chmod")
+            .args(["440", "/etc/sudoers.d/agents-pmset"])
+            .output()?;
+        let _ = Command::new("rm")
+            .args(["-f", "/etc/sudoers.d/claude-pmset"])
+            .output();
+    } else {
+        Command::new("sudo")
+            .args(["chmod", "440", "/etc/sudoers.d/agents-pmset"])
+            .output()?;
+        let _ = Command::new("sudo")
+            .args(["rm", "-f", "/etc/sudoers.d/claude-pmset"])
+            .output();
+    }
+
+    // A malformed sudoers file can break sudo system-wide; validate and roll
+    // back rather than leave a bad file behind.
+    let visudo_args = ["/usr/sbin/visudo", "-c", "-f", "/etc/sudoers.d/agents-pmset"];
+    let visudo = if is_root {
+        Command::new(visudo_args[0]).args(&visudo_args[1..]).output()?
+    } else {
+        Command::new("sudo").args(visudo_args).output()?
+    };
+    if !visudo.status.success() {
+        if is_root {
+            let _ = Command::new("rm")
+                .args(["-f", "/etc/sudoers.d/agents-pmset"])
+                .output();
+        } else {
+            let _ = Command::new("sudo")
+                .args(["rm", "-f", "/etc/sudoers.d/agents-pmset"])
+                .output();
+        }
+        anyhow::bail!(
+            "Generated sudoers file failed visudo validation and was removed: {}",
+            String::from_utf8_lossy(&visudo.stderr).trim()
+        );
+    }
+
+    println!("Configuring coding agent hooks...");
+
+    install_claude_hooks(&settings_file, &hooks_dir)?;
+
+    #[cfg(unix)]
+    fix_user_ownership(&settings_file);
+
+    for profile_settings in install_claude_profile_hooks(&home) {
+        #[cfg(unix)]
+        fix_user_ownership(&profile_settings);
+    }
+
+    println!("Configuring CLI agent hooks...");
+    install_codex_hooks(&home, APP_BINARY_PATH)?;
+
+    println!("Configuring Hermes hooks...");
+    let hermes_profiles = install_hermes_hooks(&home, APP_BINARY_PATH)?;
+    if hermes_profiles == 0 {
+        println!("  No Hermes config.yaml found; skipping Hermes hook configuration");
+    }
+
+    if is_root {
+        Command::new("pmset").args(["-a", "sleep", "5"]).output()?;
+        Command::new("pmset")
+            .args(["-a", "disablesleep", "0"])
+            .output()?;
+    } else {
+        Command::new("sudo")
+            .args(["pmset", "-a", "sleep", "5"])
+            .output()?;
+        Command::new("sudo")
+            .args(["pmset", "-a", "disablesleep", "0"])
+            .output()?;
+    }
+
+    println!();
+    if auto_yes || ask_yes_no("Launch menu bar app at login?") {
+        fs::create_dir_all(&launch_agents_dir)?;
+
+        let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.charlontank.agents-sleep-preventer</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/open</string>
+        <string>/Applications/AgentsSleepPreventer.app</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>"#;
+
+        let plist_path = launch_agents_dir.join("com.charlontank.agents-sleep-preventer.plist");
+        fs::write(&plist_path, plist)?;
+
+        println!("  Created LaunchAgent for login startup");
+        println!("  Note: Copy AgentsSleepPreventer.app to /Applications");
+    }
+
+    println!("\n✅ Installation complete!");
+    println!("\nRestart your coding agents to activate.");
+    println!("\nCommands:");
+    println!("  asp status   - Show current state");
+    println!("  asp cleanup  - Clean up stale PIDs");
+    println!("  asp reset    - Force enable sleep");
+    println!("  asp menubar  - Run native menu bar");
+    println!("  asp daemon   - Run background daemon");
+
+    // Try to launch the app
+    let _ = Command::new("open")
+        .arg("/Applications/AgentsSleepPreventer.app")
+        .spawn();
+
+    Ok(())
+}
+
+fn cmd_uninstall(keep_model: bool, keep_hooks: bool, keep_data: bool) -> Result<()> {
+    let home = resolve_user_home()?;
+    let hooks_dir = home.join(".claude").join("hooks");
+    let launch_agents_dir = home.join("Library/LaunchAgents");
+
+    // Remove hook scripts (unless keeping hooks)
+    if !keep_hooks {
+        let _ = fs::remove_file(hooks_dir.join("prevent-sleep.sh"));
+        let _ = fs::remove_file(hooks_dir.join("refresh-sleep.sh"));
+        let _ = fs::remove_file(hooks_dir.join("allow-sleep.sh"));
+        let _ = fs::remove_file(hooks_dir.join("agent-attention.sh"));
+        let _ = fs::remove_file(hooks_dir.join("agent-interrupted.sh"));
+
+        // Remove ASP-owned hooks from every Claude profile, preserving user hooks
+        for dir in claude_config_dirs(&home) {
+            let settings_file = dir.join("settings.json");
+            if remove_claude_hooks(&settings_file) {
+                println!("Removed ASP hooks from {}", settings_file.display());
+            }
+        }
+        if remove_codex_hooks(&home)? {
+            println!("Removed Codex hooks");
+        }
+        let hermes_removed = remove_hermes_hooks(&home)?;
+        if hermes_removed > 0 {
+            println!("Removed Hermes hook scripts");
+        }
+        println!("Removed coding agent hooks");
+    }
+
+    // Remove LaunchAgents
+    for label in [
+        "com.charlontank.agents-sleep-preventer.plist",
+        "com.charlontank.claude-sleep-preventer.plist",
+    ] {
+        let plist_path = launch_agents_dir.join(label);
+        if plist_path.exists() {
+            let _ = Command::new("launchctl")
+                .args(["unload", plist_path.to_str().unwrap()])
+                .output();
+            let _ = fs::remove_file(&plist_path);
+            println!("Removed LaunchAgent {}", label);
+        }
+    }
+
+    // Remove sudoers config
+    for sudoers_path in ["/etc/sudoers.d/agents-pmset", "/etc/sudoers.d/claude-pmset"] {
+        Command::new("sudo")
+            .args(["rm", "-f", sudoers_path])
+            .output()?;
+    }
+
+    // Remove PID tracking, attention and notification spool directories
+    for dir in [
+        runtime_dir::pids_dir(),
+        runtime_dir::attention_dir(),
+        runtime_dir::notifications_dir(),
+    ] {
+        let _ = fs::remove_dir_all(dir);
+    }
+    for dir in runtime_dir::LEGACY_TMP_DIRS {
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // Reset sleep settings
+    Command::new("sudo")
+        .args(["pmset", "-a", "disablesleep", "0"])
+        .output()?;
+
+    // Remove app data and preferences (unless keeping data)
+    if !keep_data {
+        for app_support in [
+            home.join("Library/Application Support/AgentsSleepPreventer"),
+            home.join("Library/Application Support/ClaudeSleepPreventer"),
+        ] {
+            if app_support.exists() {
+                if keep_model {
+                    if let Ok(entries) = fs::read_dir(&app_support) {
+                        for entry in entries.flatten() {
+                            let name = entry.file_name();
+                            if name == std::ffi::OsStr::new("models") {
+                                continue;
+                            }
+                            let path = entry.path();
+                            if path.is_dir() {
+                                let _ = fs::remove_dir_all(&path);
+                            } else {
+                                let _ = fs::remove_file(&path);
+                            }
+                        }
+                    }
+                    println!("Removed app data (kept Whisper model)");
+                } else {
+                    let _ = fs::remove_dir_all(&app_support);
+                    println!("Removed app data and Whisper model");
+                }
+            }
+        }
+
+        // Remove logs
+        let _ = fs::remove_dir_all(home.join("Library/Logs/AgentsSleepPreventer"));
+        let _ = fs::remove_dir_all(home.join("Library/Logs/ClaudeSleepPreventer"));
+        println!("Removed logs");
+    }
+
+    // Remove the app from /Applications
+    Command::new("sudo")
+        .args([
+            "rm",
+            "-rf",
+            "/Applications/AgentsSleepPreventer.app",
+            "/Applications/ClaudeSleepPreventer.app",
+        ])
+        .output()?;
+    println!("Removed app from /Applications");
+
+    let _ = fs::remove_file("/usr/local/bin/asp");
+    let _ = fs::remove_file("/usr/local/bin/agents-sleep-preventer");
+    let _ = fs::remove_file("/usr/local/bin/claude-sleep-preventer");
+
+    println!("Uninstalled successfully");
+
+    Ok(())
+}
+
+fn cmd_settings() -> Result<()> {
+    logging::init();
+    logging::log("[settings] Opening settings window");
+
+    // Initialize NSApplication for GUI
+    unsafe {
+        let _: objc_utils::Id = msg_send![class!(NSApplication), sharedApplication];
+    }
+
+    if let Some(new_settings) = settings::window::show_settings() {
+        logging::log(&format!(
+            "[settings] Settings saved: sleep_enabled={}, language={}, model={}",
+            new_settings.sleep_prevention.enabled,
+            new_settings.speech_to_text.language,
+            new_settings.speech_to_text.model
+        ));
+        // Apply immediately; interactive: the user is present, never
+        // force-sleep a lid-closed (docked) Mac from a settings change.
+        let _ = sync_sleep_state_impl("settings", new_settings.sleep_prevention.enabled, true);
+        // Offer to download the selected model if it isn't present yet.
+        dictation::ensure_selected_model_downloaded();
+    } else {
+        logging::log("[settings] Settings cancelled");
+    }
+
+    Ok(())
+}
+
+fn cmd_debug() -> Result<()> {
+    println!("sysinfo processes:");
+    let sys = System::new_all();
+    for (pid, proc) in sys.processes() {
+        let name = proc.name().to_string_lossy();
+        let lower = name.to_lowercase();
+        if lower.contains("claude") || lower.contains("codex") || lower.contains("hermes") {
+            println!("  PID {}: name={:?}", pid.as_u32(), name);
+        }
+    }
+
+    println!("\nps command:");
+    let output = Command::new("ps")
+        .args(["-eo", "pid=,ppid=,comm=,args="])
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let lower = line.to_lowercase();
+        if lower.contains("claude") || lower.contains("codex") || lower.contains("hermes") {
+            println!("  {}", line.trim());
+        }
+    }
+
+    println!("\nDetected agent PIDs:");
+    for process in get_all_agent_processes() {
+        let kind = match classify_agent_process(&process) {
+            Some(AgentKind::Claude) => "claude",
+            Some(AgentKind::Codex) => "codex",
+            Some(AgentKind::Hermes) => "hermes",
+            None => "unknown",
+        };
+        println!(
+            "  PID {}: kind={}, ppid={}, args={}",
+            process.pid, kind, process.ppid, process.args
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4440,1299 +5733,4 @@ hooks = false
         assert!(script.contains("hook_event_name"));
         assert!(script.contains("on_session_end|on_session_finalize|on_session_reset"));
     }
-}
-
-fn remove_codex_hooks(home: &Path) -> Result<bool> {
-    let hooks_file = home.join(".codex/hooks.json");
-    if !hooks_file.exists() {
-        return Ok(false);
-    }
-
-    let content = fs::read_to_string(&hooks_file)
-        .with_context(|| format!("Failed to read {}", hooks_file.display()))?;
-    let Ok(mut hooks_json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        eprintln!(
-            "Warning: could not parse {}, leaving it unchanged",
-            hooks_file.display()
-        );
-        return Ok(false);
-    };
-
-    let changed = hooks_json
-        .get_mut("hooks")
-        .map(|hooks| remove_owned_hook_groups(hooks, &OWNED_HOOK_MARKERS))
-        .unwrap_or(false);
-    if !changed {
-        return Ok(false);
-    }
-
-    if let Some(hooks) = hooks_json.get_mut("hooks") {
-        prune_empty_hook_events(hooks);
-    }
-
-    if let Some(root) = hooks_json.as_object_mut() {
-        let hooks_empty = root
-            .get("hooks")
-            .and_then(serde_json::Value::as_object)
-            .map(|hooks| hooks.is_empty())
-            .unwrap_or(false);
-        if hooks_empty {
-            root.remove("hooks");
-        }
-        if root.is_empty() {
-            fs::remove_file(&hooks_file)
-                .with_context(|| format!("Failed to remove {}", hooks_file.display()))?;
-            return Ok(true);
-        }
-    }
-
-    fs::write(&hooks_file, serde_json::to_string_pretty(&hooks_json)?)
-        .with_context(|| format!("Failed to write {}", hooks_file.display()))?;
-
-    Ok(true)
-}
-
-fn is_codex_hooks_installed(home: &Path) -> bool {
-    let hooks_file = home.join(".codex/hooks.json");
-    let Ok(content) = fs::read_to_string(hooks_file) else {
-        return false; // missing file: setup can create it
-    };
-    let Ok(hooks_json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        // Unparseable hooks.json: install would fail on the same parse, so
-        // gating here would make every launch prompt-and-exit. Fail open.
-        return true;
-    };
-    hook_value_contains_owned_command(&hooks_json)
-}
-
-fn is_claude_hooks_installed(home: &Path) -> bool {
-    // agent-attention.sh checked too so upgrades from pre-notification
-    // versions re-run setup and pick up the Notification hook.
-    if !home.join(".claude/hooks/prevent-sleep.sh").exists()
-        || !home.join(".claude/hooks/agent-attention.sh").exists()
-    {
-        return false;
-    }
-
-    // The SubagentStop keep-awake hook is required so upgrades from
-    // pre-subagent versions re-run setup and pick up the subagent +
-    // PostToolUse events.
-    let Ok(content) = fs::read_to_string(home.join(".claude/settings.json")) else {
-        return false; // missing file: setup can create it
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        // Unparseable settings.json: install would fail on the same parse
-        // error, so gating here would make every launch prompt-and-exit.
-        // Run with the existing (script-based) hooks instead.
-        return true;
-    };
-    json.get("hooks")
-        .and_then(|hooks| hooks.get("SubagentStop"))
-        .map(|groups| hook_value_contains_marker(groups, &[".claude/hooks/refresh-sleep.sh"]))
-        .unwrap_or(false)
-}
-
-fn is_installed() -> bool {
-    let home = resolve_user_home().unwrap_or_default();
-    is_claude_hooks_installed(&home) && is_codex_hooks_installed(&home)
-}
-
-fn run_first_time_setup() -> Result<()> {
-    let message = "Agent Session Pilot needs to be configured for supported coding agents.
-
-This will:
-• Install the CLI tool
-• Configure coding agent hooks
-• Set up automatic startup
-
-Administrator password required.";
-
-    if !native_dialogs::show_confirm_dialog(message, "Agent Session Pilot", "Set Up", "Cancel") {
-        return Ok(());
-    }
-
-    let script = "/Applications/AgentsSleepPreventer.app/Contents/MacOS/asp install -y";
-
-    match authorization::execute_script_with_privileges(script) {
-        Ok(true) => {
-            native_dialogs::show_dialog(
-                "Setup complete!\n\nRestart your coding agents to activate sleep prevention.",
-                "Agent Session Pilot",
-            );
-            relaunch_app_after_install();
-        }
-        Ok(false) => {
-            // User cancelled
-        }
-        Err(e) => {
-            native_dialogs::show_dialog(&format!("Setup failed: {}", e), "Agent Session Pilot");
-        }
-    }
-
-    Ok(())
-}
-
-/// macOS Gatekeeper "App Translocation" runs a quarantined .app from a
-/// randomized read-only path whenever it's launched from outside
-/// /Applications (straight off a mounted DMG, ~/Downloads, etc). TCC
-/// permission grants (Accessibility, Microphone) are tied to that path,
-/// so every such launch gets a fresh random path and looks like the OS
-/// silently revoked previously-granted permissions. The fix is to move the
-/// bundle into /Applications (a stable path) and relaunch from there.
-fn ensure_running_from_applications() {
-    let Some(bundle_path) = objc_utils::main_bundle_path() else {
-        return;
-    };
-    if !bundle_path.ends_with(".app") || bundle_path == APP_BUNDLE_PATH {
-        return;
-    }
-
-    logging::log(&format!(
-        "[main] App running from non-standard location: {}",
-        bundle_path
-    ));
-
-    let message = format!(
-        "Agent Session Pilot is running from:\n{}\n\nmacOS permissions (Accessibility, Microphone) only stay granted reliably when the app runs from /Applications — otherwise they can silently reset and the dictation shortcut stops working.\n\nMove it to /Applications and relaunch now?",
-        bundle_path
-    );
-
-    if !native_dialogs::show_confirm_dialog(
-        &message,
-        "Move to Applications?",
-        "Move & Relaunch",
-        "Not Now",
-    ) {
-        logging::log("[main] User declined moving app to /Applications");
-        return;
-    }
-
-    if Path::new(APP_BUNDLE_PATH).exists() {
-        let _ = fs::remove_dir_all(APP_BUNDLE_PATH);
-    }
-
-    let copied = Command::new("ditto")
-        .args([bundle_path.as_str(), APP_BUNDLE_PATH])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    if !copied {
-        logging::log("[main] Failed to copy app to /Applications");
-        native_dialogs::show_dialog(
-            "Couldn't move the app automatically. Please drag AgentsSleepPreventer.app to your Applications folder yourself, then relaunch it.",
-            "Move Failed",
-        );
-        return;
-    }
-
-    let _ = Command::new("xattr")
-        .args(["-dr", "com.apple.quarantine", APP_BUNDLE_PATH])
-        .status();
-
-    logging::log("[main] Moved app to /Applications, relaunching...");
-    match Command::new("open").args(["-n", APP_BUNDLE_PATH]).status() {
-        Ok(status) if status.success() => std::process::exit(0),
-        Ok(status) => logging::log(&format!("[main] Relaunch failed with status: {}", status)),
-        Err(e) => logging::log(&format!("[main] Relaunch failed: {}", e)),
-    }
-}
-
-fn relaunch_app_after_install() {
-    logging::log("[main] Relaunching app after install...");
-    match Command::new("open")
-        .args(["-n", "/Applications/AgentsSleepPreventer.app"])
-        .status()
-    {
-        Ok(status) if status.success() => {
-            std::process::exit(0);
-        }
-        Ok(status) => {
-            logging::log(&format!("[main] Relaunch failed with status: {}", status));
-        }
-        Err(e) => {
-            logging::log(&format!("[main] Relaunch failed: {}", e));
-        }
-    }
-}
-
-fn get_process_tty(pid: u32) -> Option<String> {
-    Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "tty="])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && s != "??")
-}
-
-fn focus_terminal_by_tty(tty: &str) {
-    let tty_path = if tty.starts_with("/dev/") {
-        tty.to_string()
-    } else {
-        format!("/dev/{}", tty)
-    };
-
-    // Try Terminal.app first
-    let terminal_script = format!(
-        r#"
-        tell application "Terminal"
-            set windowList to every window
-            repeat with w in windowList
-                set tabList to every tab of w
-                repeat with t in tabList
-                    if tty of t is "{}" then
-                        set frontmost of w to true
-                        set selected of t to true
-                        activate
-                        return true
-                    end if
-                end repeat
-            end repeat
-        end tell
-        return false
-        "#,
-        tty_path
-    );
-
-    let result = Command::new("osascript")
-        .args(["-e", &terminal_script])
-        .output();
-
-    if let Ok(output) = result {
-        if String::from_utf8_lossy(&output.stdout).trim() == "true" {
-            return;
-        }
-    }
-
-    // Try iTerm2 - double activate to ensure space switch
-    let iterm_script = format!(
-        r#"
-        tell application "iTerm2"
-            set windowList to every window
-            repeat with w in windowList
-                set tabList to every tab of w
-                repeat with t in tabList
-                    set sessionList to every session of t
-                    repeat with s in sessionList
-                        if tty of s is "{}" then
-                            activate
-                            delay 0.1
-                            select w
-                            select t
-                            select s
-                            activate
-                            return true
-                        end if
-                    end repeat
-                end repeat
-            end repeat
-        end tell
-        return false
-        "#,
-        tty_path
-    );
-
-    let _ = Command::new("osascript")
-        .args(["-e", &iterm_script])
-        .output();
-}
-
-fn focus_terminal_by_pid(pid: u32) {
-    if let Some(tty) = get_process_tty(pid) {
-        focus_terminal_by_tty(&tty);
-    }
-}
-
-fn cmd_focus(pid: u32) -> Result<()> {
-    logging::init();
-    logging::log(&format!("[focus] requested pid={}", pid));
-    focus_terminal_by_pid(pid);
-    Ok(())
-}
-
-/// Signals each task with everything it spawned: stopping only the wrapper
-/// shell would orphan the server or poll loop it runs. Only Bash tasks of
-/// live agents are touched, whatever PIDs are passed.
-fn cmd_stop_tasks(pids: &[u32]) -> Result<()> {
-    logging::init();
-    let processes = load_process_table();
-    for &agent_pid in pids {
-        let is_agent = processes
-            .iter()
-            .any(|process| process.pid == agent_pid && classify_agent_process(process).is_some());
-        if !is_agent {
-            continue;
-        }
-        // Run from a Claude Bash tool call, its own wrapper is one of the tasks.
-        let own_chain = own_call_chain(&processes, agent_pid);
-        for task in agent_tasks(&processes, agent_pid)
-            .into_iter()
-            .filter(|task| !own_chain.contains(&task.pid))
-        {
-            let mut tree = descendant_pids(&processes, task.pid);
-            tree.push(task.pid);
-            for pid in tree {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGTERM);
-                }
-            }
-            logging::log(&format!(
-                "[tasks] stopped task pid={} of agent pid={}",
-                task.pid, agent_pid
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn get_instance_items() -> Vec<(u32, u64, f32, String)> {
-    let mut items = Vec::new();
-    if let Ok(entries) = fs::read_dir(runtime_dir::pids_dir()) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let pid: u32 = entry.file_name().to_string_lossy().parse().unwrap_or(0);
-            if pid > 0 {
-                let age = get_file_age(&entry.path()).unwrap_or(0);
-                let cpu = get_process_cpu(pid);
-                let location = format_process_location(pid);
-                items.push((pid, age, cpu, location));
-            }
-        }
-    }
-    items
-}
-
-fn quit_app() {
-    unsafe {
-        let app: objc_utils::Id = msg_send![class!(NSApplication), sharedApplication];
-        if app.is_null() {
-            return;
-        }
-        let _: () = msg_send![app, terminate: objc_utils::NIL];
-    }
-}
-
-fn cmd_menubar() -> Result<()> {
-    // Initialize logging
-    logging::init();
-    logging::log("[main] Starting menubar app");
-
-    ensure_running_from_applications();
-
-    if !is_installed() {
-        run_first_time_setup()?;
-        if !is_installed() {
-            return Ok(());
-        }
-    }
-
-    // Load settings and initialize sleep prevention state
-    let app_settings = settings::AppSettings::load();
-    MANUAL_SLEEP_PREVENTION.store(app_settings.sleep_prevention.enabled, Ordering::SeqCst);
-    logging::log(&format!(
-        "[main] Loaded settings: sleep_prevention={}",
-        app_settings.sleep_prevention.enabled
-    ));
-
-    let mut event_loop = EventLoopBuilder::new().build();
-    event_loop.set_activation_policy(ActivationPolicy::Accessory);
-    let tick_proxy = event_loop.create_proxy();
-
-    let initial_instances = get_instance_items();
-    let manual_enabled = MANUAL_SLEEP_PREVENTION.load(Ordering::SeqCst);
-
-    notifications::init_click_handler();
-
-    // Initialize dictation manager
-    let mut dictation_manager = DictationManager::new();
-
-    // Create a minimal menu for right-click, but show popover on left-click
-    let minimal_menu = Menu::new();
-    let settings_item = MenuItem::new("Settings...", true, None);
-    let settings_item_id = settings_item.id().clone();
-    let _ = minimal_menu.append(&settings_item);
-    let quit_item = MenuItem::new("Quit", true, None);
-    let quit_item_id = quit_item.id().clone();
-    let _ = minimal_menu.append(&quit_item);
-
-    let tray = TrayIconBuilder::new()
-        .with_menu(Box::new(minimal_menu))
-        .with_menu_on_left_click(false) // Left-click shows popover, right-click shows menu
-        .with_title(&create_tray_title(initial_instances.len(), manual_enabled))
-        .with_tooltip("Agent Session Pilot")
-        .build()?;
-
-    let menu_channel = MenuEvent::receiver();
-    let tray_event_channel = TrayIconEvent::receiver();
-
-    // Initialize popover window
-    let mut popover = popover::PopoverWindow::new();
-
-    // Register global hotkeys
-    let hotkey_manager = GlobalHotKeyManager::new().unwrap();
-    let hotkey_active = HotKey::new(
-        Some(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SUPER),
-        Code::KeyJ,
-    );
-    let hotkey_inactive = HotKey::new(
-        Some(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SUPER),
-        Code::KeyL,
-    );
-    let hotkey_active_id = hotkey_active.id();
-    let hotkey_inactive_id = hotkey_inactive.id();
-    hotkey_manager.register(hotkey_active).unwrap();
-    hotkey_manager.register(hotkey_inactive).unwrap();
-    let hotkey_receiver = GlobalHotKeyEvent::receiver();
-
-    start_clamshell_notifications();
-
-    std::thread::spawn(move || {
-        let mut tick_counter = 0u64;
-        let _ = tick_proxy.send_event(());
-
-        loop {
-            std::thread::sleep(Duration::from_millis(100));
-            tick_counter += 1;
-
-            if LID_JUST_CLOSED.swap(false, Ordering::SeqCst) {
-                let active = count_active_pids();
-                if active > 0 {
-                    play_lid_close_sound();
-                }
-            }
-
-            if tick_counter % 100 == 0 {
-                cleanup_stale_pids();
-                menubar_sync_sleep();
-            }
-
-            if tick_counter % 300 == 0 {
-                if check_thermal_warning() {
-                    let _ = set_sleep_disabled(false);
-                    logging::log("[thermal] Sleep re-enabled due to thermal warning");
-                }
-            }
-
-            let _ = tick_proxy.send_event(());
-        }
-    });
-
-    let mut last_update = std::time::Instant::now() - Duration::from_secs(10);
-
-    let mut click_check_counter = 0u64;
-    let mut onboarding_checked = false;
-    event_loop.run(move |event, _, control_flow| {
-        // Drive updates from the tick thread to avoid relying on user input events.
-        *control_flow = ControlFlow::Wait;
-
-        if !onboarding_checked {
-            if let Event::NewEvents(StartCause::Init) = event {
-                onboarding_checked = true;
-                run_onboarding_if_needed(false);
-                let dictation_available = dictation_manager.is_available();
-                let dictation_enabled = dictation_manager.is_enabled();
-                logging::log(&format!(
-                    "[dictation] available={}, enabled={}",
-                    dictation_available, dictation_enabled
-                ));
-                if dictation_available {
-                    if let Err(e) = dictation_manager.start() {
-                        logging::log(&format!("[dictation] Failed to start: {}", e));
-                    }
-                }
-            }
-        }
-
-        click_check_counter += 1;
-        if click_check_counter % 100 == 0 {
-            eprintln!("[DEBUG] Event loop iteration #{}", click_check_counter);
-        }
-        while let Ok(menu_event) = menu_channel.try_recv() {
-            if menu_event.id == settings_item_id {
-                logging::log("[menu] Settings selected");
-                popover.hide();
-                if let Some(new_settings) = settings::window::show_settings() {
-                    // Update manual sleep prevention based on settings.
-                    // Interactive: the user just clicked Save, never
-                    // force-sleep a lid-closed (docked) Mac from here.
-                    MANUAL_SLEEP_PREVENTION
-                        .store(new_settings.sleep_prevention.enabled, Ordering::SeqCst);
-                    let _ = sync_sleep_state_impl(
-                        "settings",
-                        new_settings.sleep_prevention.enabled,
-                        true,
-                    );
-                    logging::log(&format!(
-                        "[menu] Settings saved: sleep_enabled={}, model={}",
-                        new_settings.sleep_prevention.enabled, new_settings.speech_to_text.model
-                    ));
-
-                    // If the selected dictation model isn't downloaded yet,
-                    // offer to download it now, then pick it up.
-                    dictation::ensure_selected_model_downloaded();
-                    apply_dictation_settings(&mut dictation_manager);
-                }
-            } else if menu_event.id == quit_item_id {
-                logging::log("[menu] Quit selected");
-                dictation_manager.stop();
-                quit_app();
-                logging::log("[menu] Forcing process exit");
-                unsafe {
-                    libc::_exit(0);
-                }
-            }
-        }
-
-        // Check for tray events every iteration
-        while let Ok(tray_event) = tray_event_channel.try_recv() {
-            eprintln!("[TRAY EVENT] {:?}", tray_event);
-            logging::log(&format!("[tray] EVENT: {:?}", tray_event));
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Down,
-                rect,
-                ..
-            } = tray_event
-            {
-                logging::log(&format!("[tray] Left click at rect: {:?}", rect));
-                if popover.is_visible() {
-                    popover.hide();
-                } else {
-                    let icon_rect = objc_utils::tray_rect_to_appkit((
-                        rect.position.x,
-                        rect.position.y,
-                        rect.size.width as f64,
-                        rect.size.height as f64,
-                    ));
-                    let pstate = popover::PopoverState {
-                        manual_enabled: MANUAL_SLEEP_PREVENTION.load(Ordering::SeqCst),
-                        instances: get_instance_items(),
-                        inactive: get_inactive_agent_pids(),
-                        thermal_warning: check_thermal_warning(),
-                        dictation_enabled: dictation_manager.is_enabled(),
-                        dictation_available: dictation_manager.is_available(),
-                        sleep_disabled: is_sleep_disabled(),
-                    };
-                    popover.show(icon_rect, &pstate);
-                }
-            }
-        }
-
-        // Update dictation manager (handles Fn+Space events)
-        dictation_manager.update();
-
-        if last_update.elapsed() >= Duration::from_secs(2) {
-            last_update = std::time::Instant::now();
-
-            let instances = get_instance_items();
-            let manual_enabled = MANUAL_SLEEP_PREVENTION.load(Ordering::SeqCst);
-
-            tray.set_title(Some(&create_tray_title(instances.len(), manual_enabled)));
-
-            notifications::drain_and_post();
-        }
-
-        // Menu events commented out - we use popover instead
-        // The menu handling code has been removed since we no longer attach a menu
-
-        // Handle global hotkeys
-        if let Ok(event) = hotkey_receiver.try_recv() {
-            if event.state == global_hotkey::HotKeyState::Pressed {
-                logging::log(&format!("[hotkey] Pressed id={}", event.id));
-                if event.id == hotkey_active_id {
-                    let instances = get_instance_items();
-                    if !instances.is_empty() {
-                        let idx =
-                            CURRENT_PID_INDEX.fetch_add(1, Ordering::SeqCst) % instances.len();
-                        focus_terminal_by_pid(instances[idx].0);
-                    }
-                } else if event.id == hotkey_inactive_id {
-                    let inactive = get_inactive_agent_pids();
-                    if !inactive.is_empty() {
-                        let idx =
-                            CURRENT_INACTIVE_INDEX.fetch_add(1, Ordering::SeqCst) % inactive.len();
-                        focus_terminal_by_pid(inactive[idx]);
-                    }
-                }
-            }
-        }
-    });
-}
-
-/// Pick up a changed dictation shortcut or model in a running listener.
-fn apply_dictation_settings(dictation_manager: &mut DictationManager) {
-    let was_available = dictation_manager.is_available();
-    dictation_manager.reload_transcriber();
-    dictation_manager.reload_hotkey();
-    if !was_available && dictation_manager.is_available() {
-        if let Err(e) = dictation_manager.start() {
-            logging::log(&format!("[dictation] Failed to start: {}", e));
-        }
-    }
-}
-
-fn settings_modified_time() -> Option<std::time::SystemTime> {
-    fs::metadata(settings::AppSettings::settings_path())
-        .and_then(|metadata| metadata.modified())
-        .ok()
-}
-
-fn cmd_agent() -> Result<()> {
-    logging::init();
-    logging::log("[agent] Starting background agent");
-
-    let _agent_lock = match acquire_agent_lock() {
-        Ok(Some(lock)) => lock,
-        Ok(None) => {
-            logging::log("[agent] Another agent is already running; exiting");
-            return Ok(());
-        }
-        Err(e) => {
-            logging::log(&format!("[agent] Failed to acquire lock: {}", e));
-            return Ok(());
-        }
-    };
-
-    unsafe {
-        let _: objc_utils::Id = msg_send![class!(NSApplication), sharedApplication];
-    }
-    forward_quit_to_menu_bar_app();
-    // The Swift menu bar app moves itself to /Applications before spawning
-    // the agent; asking here too only exited the agent and left the
-    // translocated app running.
-
-    run_onboarding_if_needed(true);
-
-    // Load settings and initialize sleep prevention state
-    let app_settings = settings::AppSettings::load();
-    MANUAL_SLEEP_PREVENTION.store(app_settings.sleep_prevention.enabled, Ordering::SeqCst);
-    logging::log(&format!(
-        "[agent] Loaded settings: sleep_prevention={}",
-        app_settings.sleep_prevention.enabled
-    ));
-
-    start_clamshell_notifications();
-    notifications::init_click_handler();
-
-    let mut dictation_manager = DictationManager::new();
-    let dictation_available = dictation_manager.is_available();
-    let dictation_enabled = dictation_manager.is_enabled();
-    logging::log(&format!(
-        "[agent] dictation available={}, enabled={}",
-        dictation_available, dictation_enabled
-    ));
-    if dictation_available {
-        if let Err(e) = dictation_manager.start() {
-            logging::log(&format!("[agent] Failed to start dictation: {}", e));
-        }
-    }
-
-    auto_resume::spawn();
-
-    let mut settings_modified = settings_modified_time();
-    let home = resolve_user_home().ok();
-    monitor::spawn();
-    let mut tick_counter = 0u64;
-
-    loop {
-        dictation_manager.update();
-        objc_utils::pump_run_loop_once();
-        std::thread::sleep(Duration::from_millis(50));
-        tick_counter += 1;
-
-        // Every 1s: cleanup stale PIDs, sync sleep state, post notifications
-        if tick_counter % 20 == 0 {
-            cleanup_stale_pids();
-            menubar_sync_sleep();
-            notifications::drain_and_post();
-        }
-
-        // Every 3s: thermal check + lid close
-        if tick_counter % 60 == 0 {
-            if check_thermal_warning() {
-                let _ = set_sleep_disabled(false);
-                logging::log("[agent][thermal] Sleep re-enabled due to thermal warning");
-            }
-
-            if LID_JUST_CLOSED.swap(false, Ordering::SeqCst) {
-                let active = count_active_pids();
-                if active > 0 {
-                    play_lid_close_sound();
-                }
-            }
-        }
-
-        // At startup: an `asp` on the PATH left as a copy by an older
-        // install becomes a link that follows the app's updates.
-        if tick_counter == 1 && Path::new("/usr/local/bin/asp").exists() {
-            match sync_installed_cli() {
-                Ok(true) => logging::log("[cli] /usr/local/bin/asp now links to the app"),
-                Ok(false) => {}
-                Err(e) => logging::log(&format!("[cli] Could not link /usr/local/bin/asp: {e}")),
-            }
-        }
-
-        // At startup, then every 60s: hook up Claude Code profiles
-        // (CLAUDE_CONFIG_DIR) created or first used since the install.
-        if tick_counter % 1200 == 1 {
-            if let Some(home) = &home {
-                for settings_file in install_claude_profile_hooks(home) {
-                    logging::log(&format!(
-                        "[hooks] Added keep-awake hooks to {}",
-                        settings_file.display()
-                    ));
-                }
-            }
-        }
-
-        // Every 1s: the Settings window runs as a separate `asp settings`
-        // process, so apply its saved changes (dictation shortcut, model,
-        // sleep prevention) as soon as settings.json changes on disk.
-        if tick_counter % 20 == 0 {
-            let modified = settings_modified_time();
-            if modified != settings_modified {
-                settings_modified = modified;
-                let new_settings = settings::AppSettings::load();
-                MANUAL_SLEEP_PREVENTION
-                    .store(new_settings.sleep_prevention.enabled, Ordering::SeqCst);
-                apply_dictation_settings(&mut dictation_manager);
-                logging::log(&format!(
-                    "[agent] Settings changed: shortcut={}, model={}",
-                    new_settings.resolved_hotkey().label,
-                    new_settings.speech_to_text.model
-                ));
-            }
-        }
-    }
-}
-
-/// The agent lives in the app bundle, so LaunchServices lists it as a second
-/// "Agent Session Pilot" and `quit app "AgentsSleepPreventer"` (AppleScript,
-/// launchers, logout) reaches it. It pumps events itself instead of running
-/// NSApplication, which is what installs AppKit's quit handler, so the quit
-/// was refused (-1708) and the app kept running. Hand it to the menu bar app
-/// that started this agent: quitting it stops the agent too.
-fn forward_quit_to_menu_bar_app() {
-    extern "C" fn handle_quit(
-        _: &objc::runtime::Object,
-        _: objc::runtime::Sel,
-        _: objc_utils::Id,
-        _: objc_utils::Id,
-    ) {
-        logging::log("[agent] Quit requested");
-        if !terminate_menu_bar_app() {
-            std::process::exit(0);
-        }
-    }
-    const CORE_EVENT_CLASS: u32 = u32::from_be_bytes(*b"aevt");
-    const QUIT_APPLICATION: u32 = u32::from_be_bytes(*b"quit");
-
-    let Some(mut decl) = objc::declare::ClassDecl::new("ASPQuitHandler", class!(NSObject)) else {
-        return;
-    };
-    unsafe {
-        decl.add_method(
-            sel!(handleQuit:withReplyEvent:),
-            handle_quit
-                as extern "C" fn(&objc::runtime::Object, objc::runtime::Sel, objc_utils::Id, objc_utils::Id),
-        );
-        let handler: objc_utils::Id = msg_send![decl.register(), new];
-        let manager: objc_utils::Id =
-            msg_send![class!(NSAppleEventManager), sharedAppleEventManager];
-        let _: () = msg_send![manager,
-            setEventHandler: handler
-            andSelector: sel!(handleQuit:withReplyEvent:)
-            forEventClass: CORE_EVENT_CLASS
-            andEventID: QUIT_APPLICATION];
-    }
-}
-
-/// Asks the parent process to quit when it is this bundle's menu bar app;
-/// false when the agent runs on its own.
-fn terminate_menu_bar_app() -> bool {
-    unsafe {
-        let parent: objc_utils::Id = msg_send![class!(NSRunningApplication),
-            runningApplicationWithProcessIdentifier: libc::getppid()];
-        if parent.is_null() {
-            return false;
-        }
-        let parent_bundle: objc_utils::Id = msg_send![parent, bundleIdentifier];
-        let bundle: objc_utils::Id = msg_send![class!(NSBundle), mainBundle];
-        let own_bundle: objc_utils::Id = msg_send![bundle, bundleIdentifier];
-        let same_bundle = objc_utils::nsstring_to_string(parent_bundle)
-            .is_some_and(|id| Some(id) == objc_utils::nsstring_to_string(own_bundle));
-        if !same_bundle {
-            return false;
-        }
-        let sent: objc::runtime::BOOL = msg_send![parent, terminate];
-        sent == objc::runtime::YES
-    }
-}
-
-fn acquire_agent_lock() -> Result<Option<std::fs::File>> {
-    let lock_dir = dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("AgentsSleepPreventer");
-    fs::create_dir_all(&lock_dir)?;
-    let lock_path = lock_dir.join("agent.lock");
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(&lock_path)?;
-    let fd = file.as_raw_fd();
-    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        return Ok(None);
-    }
-    let _ = file.set_len(0);
-    let _ = writeln!(file, "pid={}", std::process::id());
-    Ok(Some(file))
-}
-
-fn ask_yes_no(prompt: &str) -> bool {
-    use std::io::{self, BufRead};
-    print!("{} [Y/n]: ", prompt);
-    let _ = io::Write::flush(&mut io::stdout());
-    let stdin = io::stdin();
-    let answer = stdin
-        .lock()
-        .lines()
-        .next()
-        .and_then(|l| l.ok())
-        .unwrap_or_default()
-        .trim()
-        .to_lowercase();
-    answer.is_empty() || answer == "y" || answer == "yes"
-}
-
-/// Puts `asp` on the PATH as links to the app's binary, so the command
-/// follows every Sparkle update (copies stayed at the version of the last
-/// `asp install`: 5.2.1 under a 5.4.2 app).
-fn sync_installed_cli() -> Result<bool> {
-    let binary = if Path::new(APP_BINARY_PATH).exists() {
-        PathBuf::from(APP_BINARY_PATH)
-    } else {
-        std::env::current_exe().context("Could not find current executable")?
-    };
-    fs::create_dir_all("/usr/local/bin")?;
-
-    let mut updated = false;
-    for target in [
-        Path::new("/usr/local/bin/asp"),
-        Path::new("/usr/local/bin/agents-sleep-preventer"),
-    ] {
-        if binary == target || fs::read_link(target).ok().as_deref() == Some(binary.as_path()) {
-            continue;
-        }
-        let _ = fs::remove_file(target);
-        std::os::unix::fs::symlink(&binary, target).with_context(|| {
-            format!("Failed to link {} to {}", target.display(), binary.display())
-        })?;
-        updated = true;
-    }
-
-    let _ = fs::remove_file("/usr/local/bin/claude-sleep-preventer");
-
-    Ok(updated)
-}
-
-fn cmd_install(auto_yes: bool) -> Result<()> {
-    let home = resolve_user_home()?;
-    let hooks_dir = home.join(".claude").join("hooks");
-    let settings_file = home.join(".claude").join("settings.json");
-    let launch_agents_dir = home.join("Library/LaunchAgents");
-
-    match sync_installed_cli() {
-        Ok(true) => println!("Updated /usr/local/bin/asp"),
-        Ok(false) => {}
-        Err(e) => eprintln!("Warning: could not update /usr/local/bin/asp: {}", e),
-    }
-
-    fs::create_dir_all(&hooks_dir)?;
-
-    let prevent_script = format!(
-        "#!/bin/bash\n[ -x \"{}\" ] && \"{}\" start 2>/dev/null || true\n",
-        APP_BINARY_PATH, APP_BINARY_PATH
-    );
-    let refresh_script = format!(
-        "#!/bin/bash\n[ -x \"{}\" ] && \"{}\" refresh 2>/dev/null || true\n",
-        APP_BINARY_PATH, APP_BINARY_PATH
-    );
-    let allow_script = format!(
-        "#!/bin/bash\n[ -x \"{}\" ] && \"{}\" stop 2>/dev/null || true\n",
-        APP_BINARY_PATH, APP_BINARY_PATH
-    );
-    // Forwards the hook JSON (with the "message" field) from stdin.
-    let attention_script = format!(
-        "#!/bin/bash\n[ -x \"{}\" ] && cat | \"{}\" attention 2>/dev/null || true\n",
-        APP_BINARY_PATH, APP_BINARY_PATH
-    );
-
-    fs::write(hooks_dir.join("prevent-sleep.sh"), prevent_script)?;
-    fs::write(hooks_dir.join("refresh-sleep.sh"), refresh_script)?;
-    fs::write(hooks_dir.join("allow-sleep.sh"), allow_script)?;
-    fs::write(hooks_dir.join("agent-attention.sh"), attention_script)?;
-    write_interrupted_hook_script(&hooks_dir)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        for script in [
-            "prevent-sleep.sh",
-            "refresh-sleep.sh",
-            "allow-sleep.sh",
-            "agent-attention.sh",
-        ] {
-            fs::set_permissions(hooks_dir.join(script), fs::Permissions::from_mode(0o755))?;
-        }
-
-        fix_user_ownership(&hooks_dir);
-    }
-
-    println!("Setting up passwordless sudo for pmset...");
-    // Get the real user (not root) for the sudoers entry
-    let real_user = resolve_real_user()
-        .or_else(|| std::env::var("USER").ok().filter(|user| user != "root"))
-        .context("Could not determine which user should receive passwordless pmset access")?;
-    // Restricted to the exact pmset command lines the app runs; anything else
-    // still requires a password.
-    let sudoers_content = format!(
-        "{} ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset -a sleep 5, /usr/bin/pmset sleepnow\n",
-        real_user
-    );
-
-    // Write directly if we're root, otherwise use sudo
-    let is_root = unsafe { libc::geteuid() == 0 };
-    let mut child = if is_root {
-        Command::new("tee")
-            .arg("/etc/sudoers.d/agents-pmset")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .spawn()?
-    } else {
-        Command::new("sudo")
-            .args(["tee", "/etc/sudoers.d/agents-pmset"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .spawn()?
-    };
-
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(sudoers_content.as_bytes())?;
-    }
-    child.wait()?;
-
-    if is_root {
-        Command::new("chmod")
-            .args(["440", "/etc/sudoers.d/agents-pmset"])
-            .output()?;
-        let _ = Command::new("rm")
-            .args(["-f", "/etc/sudoers.d/claude-pmset"])
-            .output();
-    } else {
-        Command::new("sudo")
-            .args(["chmod", "440", "/etc/sudoers.d/agents-pmset"])
-            .output()?;
-        let _ = Command::new("sudo")
-            .args(["rm", "-f", "/etc/sudoers.d/claude-pmset"])
-            .output();
-    }
-
-    // A malformed sudoers file can break sudo system-wide; validate and roll
-    // back rather than leave a bad file behind.
-    let visudo_args = ["/usr/sbin/visudo", "-c", "-f", "/etc/sudoers.d/agents-pmset"];
-    let visudo = if is_root {
-        Command::new(visudo_args[0]).args(&visudo_args[1..]).output()?
-    } else {
-        Command::new("sudo").args(visudo_args).output()?
-    };
-    if !visudo.status.success() {
-        if is_root {
-            let _ = Command::new("rm")
-                .args(["-f", "/etc/sudoers.d/agents-pmset"])
-                .output();
-        } else {
-            let _ = Command::new("sudo")
-                .args(["rm", "-f", "/etc/sudoers.d/agents-pmset"])
-                .output();
-        }
-        anyhow::bail!(
-            "Generated sudoers file failed visudo validation and was removed: {}",
-            String::from_utf8_lossy(&visudo.stderr).trim()
-        );
-    }
-
-    println!("Configuring coding agent hooks...");
-
-    install_claude_hooks(&settings_file, &hooks_dir)?;
-
-    #[cfg(unix)]
-    fix_user_ownership(&settings_file);
-
-    for profile_settings in install_claude_profile_hooks(&home) {
-        #[cfg(unix)]
-        fix_user_ownership(&profile_settings);
-    }
-
-    println!("Configuring CLI agent hooks...");
-    install_codex_hooks(&home, APP_BINARY_PATH)?;
-
-    println!("Configuring Hermes hooks...");
-    let hermes_profiles = install_hermes_hooks(&home, APP_BINARY_PATH)?;
-    if hermes_profiles == 0 {
-        println!("  No Hermes config.yaml found; skipping Hermes hook configuration");
-    }
-
-    if is_root {
-        Command::new("pmset").args(["-a", "sleep", "5"]).output()?;
-        Command::new("pmset")
-            .args(["-a", "disablesleep", "0"])
-            .output()?;
-    } else {
-        Command::new("sudo")
-            .args(["pmset", "-a", "sleep", "5"])
-            .output()?;
-        Command::new("sudo")
-            .args(["pmset", "-a", "disablesleep", "0"])
-            .output()?;
-    }
-
-    println!();
-    if auto_yes || ask_yes_no("Launch menu bar app at login?") {
-        fs::create_dir_all(&launch_agents_dir)?;
-
-        let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.charlontank.agents-sleep-preventer</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/bin/open</string>
-        <string>/Applications/AgentsSleepPreventer.app</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <false/>
-</dict>
-</plist>"#;
-
-        let plist_path = launch_agents_dir.join("com.charlontank.agents-sleep-preventer.plist");
-        fs::write(&plist_path, plist)?;
-
-        println!("  Created LaunchAgent for login startup");
-        println!("  Note: Copy AgentsSleepPreventer.app to /Applications");
-    }
-
-    println!("\n✅ Installation complete!");
-    println!("\nRestart your coding agents to activate.");
-    println!("\nCommands:");
-    println!("  asp status   - Show current state");
-    println!("  asp cleanup  - Clean up stale PIDs");
-    println!("  asp reset    - Force enable sleep");
-    println!("  asp menubar  - Run native menu bar");
-    println!("  asp daemon   - Run background daemon");
-
-    // Try to launch the app
-    let _ = Command::new("open")
-        .arg("/Applications/AgentsSleepPreventer.app")
-        .spawn();
-
-    Ok(())
-}
-
-fn cmd_uninstall(keep_model: bool, keep_hooks: bool, keep_data: bool) -> Result<()> {
-    let home = resolve_user_home()?;
-    let hooks_dir = home.join(".claude").join("hooks");
-    let launch_agents_dir = home.join("Library/LaunchAgents");
-
-    // Remove hook scripts (unless keeping hooks)
-    if !keep_hooks {
-        let _ = fs::remove_file(hooks_dir.join("prevent-sleep.sh"));
-        let _ = fs::remove_file(hooks_dir.join("refresh-sleep.sh"));
-        let _ = fs::remove_file(hooks_dir.join("allow-sleep.sh"));
-        let _ = fs::remove_file(hooks_dir.join("agent-attention.sh"));
-        let _ = fs::remove_file(hooks_dir.join("agent-interrupted.sh"));
-
-        // Remove ASP-owned hooks from every Claude profile, preserving user hooks
-        for dir in claude_config_dirs(&home) {
-            let settings_file = dir.join("settings.json");
-            if remove_claude_hooks(&settings_file) {
-                println!("Removed ASP hooks from {}", settings_file.display());
-            }
-        }
-        if remove_codex_hooks(&home)? {
-            println!("Removed Codex hooks");
-        }
-        let hermes_removed = remove_hermes_hooks(&home)?;
-        if hermes_removed > 0 {
-            println!("Removed Hermes hook scripts");
-        }
-        println!("Removed coding agent hooks");
-    }
-
-    // Remove LaunchAgents
-    for label in [
-        "com.charlontank.agents-sleep-preventer.plist",
-        "com.charlontank.claude-sleep-preventer.plist",
-    ] {
-        let plist_path = launch_agents_dir.join(label);
-        if plist_path.exists() {
-            let _ = Command::new("launchctl")
-                .args(["unload", plist_path.to_str().unwrap()])
-                .output();
-            let _ = fs::remove_file(&plist_path);
-            println!("Removed LaunchAgent {}", label);
-        }
-    }
-
-    // Remove sudoers config
-    for sudoers_path in ["/etc/sudoers.d/agents-pmset", "/etc/sudoers.d/claude-pmset"] {
-        Command::new("sudo")
-            .args(["rm", "-f", sudoers_path])
-            .output()?;
-    }
-
-    // Remove PID tracking, attention and notification spool directories
-    for dir in [
-        runtime_dir::pids_dir(),
-        runtime_dir::attention_dir(),
-        runtime_dir::notifications_dir(),
-    ] {
-        let _ = fs::remove_dir_all(dir);
-    }
-    for dir in runtime_dir::LEGACY_TMP_DIRS {
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    // Reset sleep settings
-    Command::new("sudo")
-        .args(["pmset", "-a", "disablesleep", "0"])
-        .output()?;
-
-    // Remove app data and preferences (unless keeping data)
-    if !keep_data {
-        for app_support in [
-            home.join("Library/Application Support/AgentsSleepPreventer"),
-            home.join("Library/Application Support/ClaudeSleepPreventer"),
-        ] {
-            if app_support.exists() {
-                if keep_model {
-                    if let Ok(entries) = fs::read_dir(&app_support) {
-                        for entry in entries.flatten() {
-                            let name = entry.file_name();
-                            if name == std::ffi::OsStr::new("models") {
-                                continue;
-                            }
-                            let path = entry.path();
-                            if path.is_dir() {
-                                let _ = fs::remove_dir_all(&path);
-                            } else {
-                                let _ = fs::remove_file(&path);
-                            }
-                        }
-                    }
-                    println!("Removed app data (kept Whisper model)");
-                } else {
-                    let _ = fs::remove_dir_all(&app_support);
-                    println!("Removed app data and Whisper model");
-                }
-            }
-        }
-
-        // Remove logs
-        let _ = fs::remove_dir_all(home.join("Library/Logs/AgentsSleepPreventer"));
-        let _ = fs::remove_dir_all(home.join("Library/Logs/ClaudeSleepPreventer"));
-        println!("Removed logs");
-    }
-
-    // Remove the app from /Applications
-    Command::new("sudo")
-        .args([
-            "rm",
-            "-rf",
-            "/Applications/AgentsSleepPreventer.app",
-            "/Applications/ClaudeSleepPreventer.app",
-        ])
-        .output()?;
-    println!("Removed app from /Applications");
-
-    let _ = fs::remove_file("/usr/local/bin/asp");
-    let _ = fs::remove_file("/usr/local/bin/agents-sleep-preventer");
-    let _ = fs::remove_file("/usr/local/bin/claude-sleep-preventer");
-
-    println!("Uninstalled successfully");
-
-    Ok(())
-}
-
-fn cmd_settings() -> Result<()> {
-    logging::init();
-    logging::log("[settings] Opening settings window");
-
-    // Initialize NSApplication for GUI
-    unsafe {
-        let _: objc_utils::Id = msg_send![class!(NSApplication), sharedApplication];
-    }
-
-    if let Some(new_settings) = settings::window::show_settings() {
-        logging::log(&format!(
-            "[settings] Settings saved: sleep_enabled={}, language={}, model={}",
-            new_settings.sleep_prevention.enabled,
-            new_settings.speech_to_text.language,
-            new_settings.speech_to_text.model
-        ));
-        // Apply immediately; interactive: the user is present, never
-        // force-sleep a lid-closed (docked) Mac from a settings change.
-        let _ = sync_sleep_state_impl("settings", new_settings.sleep_prevention.enabled, true);
-        // Offer to download the selected model if it isn't present yet.
-        dictation::ensure_selected_model_downloaded();
-    } else {
-        logging::log("[settings] Settings cancelled");
-    }
-
-    Ok(())
-}
-
-fn cmd_debug() -> Result<()> {
-    println!("sysinfo processes:");
-    let sys = System::new_all();
-    for (pid, proc) in sys.processes() {
-        let name = proc.name().to_string_lossy();
-        let lower = name.to_lowercase();
-        if lower.contains("claude") || lower.contains("codex") || lower.contains("hermes") {
-            println!("  PID {}: name={:?}", pid.as_u32(), name);
-        }
-    }
-
-    println!("\nps command:");
-    let output = Command::new("ps")
-        .args(["-eo", "pid=,ppid=,comm=,args="])
-        .output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let lower = line.to_lowercase();
-        if lower.contains("claude") || lower.contains("codex") || lower.contains("hermes") {
-            println!("  {}", line.trim());
-        }
-    }
-
-    println!("\nDetected agent PIDs:");
-    for process in get_all_agent_processes() {
-        let kind = match classify_agent_process(&process) {
-            Some(AgentKind::Claude) => "claude",
-            Some(AgentKind::Codex) => "codex",
-            Some(AgentKind::Hermes) => "hermes",
-            None => "unknown",
-        };
-        println!(
-            "  PID {}: kind={}, ppid={}, args={}",
-            process.pid, kind, process.ppid, process.args
-        );
-    }
-
-    Ok(())
 }

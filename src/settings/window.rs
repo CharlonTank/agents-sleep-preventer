@@ -664,7 +664,7 @@ impl SettingsWindow {
 
                 // Create target for callbacks
                 let target: Id = msg_send![settings_target_class(), new];
-                let target_obj = target as *mut Object;
+                let target_obj: *mut Object = target;
                 (*target_obj).set_ivar("rustState", state_ptr_send.into_ptr());
 
                 // Set window delegate for close notification

@@ -51,8 +51,8 @@ impl PopoverWindow {
         let (icon_x, icon_y, icon_w, _icon_h) = icon_rect;
 
         let icon_center_x = icon_x + (icon_w / 2.0);
-        let popover_x = icon_center_x - (POPOVER_WIDTH as f64 / 2.0);
-        let popover_y = icon_y - POPOVER_HEIGHT as f64 - 5.0;
+        let popover_x = icon_center_x - (POPOVER_WIDTH / 2.0);
+        let popover_y = icon_y - POPOVER_HEIGHT - 5.0;
 
         unsafe {
             let frame = NSRect::new(
