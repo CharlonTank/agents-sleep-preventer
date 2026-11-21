@@ -2,7 +2,7 @@
 //! Scenarios ported from sync-telegram's test suite, so both behave alike.
 
 use super::api::{ipv4_first, ApiError, Params, Relay, Telegram};
-use super::bot::{within, Bot, Extras, Notice};
+use super::bot::{within, Bot, Extras, Notice, Renewal};
 use super::store::{now, Fields, Lock, Object, Store};
 use super::text::tag;
 use serde_json::{json, Value};
@@ -808,6 +808,73 @@ fn a_409_conflict_gives_up_the_reading_then_resumes() {
     h.tg.borrow_mut().conflicts = 1;
     let (received, _) = h.bot.listen("acme-backend", 30).unwrap();
     assert_eq!(received.iter().map(|e| e.text("text").unwrap()).collect::<Vec<_>>(), ["après le conflit"]);
+}
+
+#[test]
+fn a_listener_hands_over_once_its_build_is_replaced() {
+    let mut h = harness();
+    h.locks.push(h.bot.store.lock("poll", false).unwrap());
+    let renewal = Renewal { built: 1234.5, replaced: &|| true };
+    let (received, _, left) = h.bot.listen_renewing("acme-backend", 0, Some(&renewal)).unwrap();
+    assert!(received.is_empty());
+    assert_eq!(left, Some(0));
+    let listener = h.bot.sessions()["acme-backend"].object("listener").cloned().unwrap();
+    assert_eq!(Value::Object(listener), json!({"pid": std::process::id(), "built": 1234.5}));
+    assert!(h.bot.store.released("session.acme-backend"));
+    let (_, _, left) = h.bot.listen_renewing("acme-backend", 30, Some(&renewal)).unwrap();
+    assert!(matches!(left, Some(29..=30)), "{left:?}");
+    assert!(h.calls("getUpdates").is_empty());
+}
+
+#[test]
+fn a_waiting_message_goes_out_before_the_hand_over() {
+    let mut h = harness();
+    h.locks.push(h.bot.store.lock("poll", false).unwrap());
+    let entry = json!({"at": now(), "from": "owner", "message_id": 70, "update_id": 9, "text": "coucou",
+                       "session": "acme-backend", "how": "nom", "routed_at": now()});
+    h.bot.store.write(&h.bot.store.path(&["inbox", "acme-backend", "9.json"]), &entry).unwrap();
+    let renewal = Renewal { built: 1.0, replaced: &|| true };
+    let (received, _, left) = h.bot.listen_renewing("acme-backend", 0, Some(&renewal)).unwrap();
+    assert_eq!(received.iter().map(|e| e.text("text").unwrap()).collect::<Vec<_>>(), ["coucou"]);
+    assert_eq!(left, None);
+}
+
+#[test]
+fn a_build_counts_as_replaced_once_the_new_one_has_settled() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("asp");
+    let install = |text: &str, mode: u32| {
+        let staged = dir.path().join("asp.new");
+        std::fs::write(&staged, text).unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(mode)).unwrap();
+        std::fs::rename(&staged, &path).unwrap();
+    };
+    install("v1", 0o755);
+    let build = super::Build::at(path.clone(), Duration::ZERO);
+    assert!(!build.replaced());
+    install("v2 being copied", 0o644);
+    assert!(!build.replaced());
+    install("v2", 0o755);
+    assert!(!build.replaced(), "first seen: not settled yet");
+    assert!(build.replaced());
+    let patient = super::Build::at(path.clone(), Duration::from_secs(3600));
+    install("v3", 0o755);
+    assert!(!patient.replaced());
+    assert!(!patient.replaced());
+    std::fs::remove_file(&path).unwrap();
+    assert!(!super::Build::at(path, Duration::ZERO).replaced());
+}
+
+#[test]
+fn doctor_reads_a_listeners_build_from_its_session() {
+    let h = harness();
+    h.bot
+        .update_session("acme-backend", obj(json!({"listener": {"pid": 4242, "built": 7.5}})))
+        .unwrap();
+    assert_eq!(super::listener_build(&h.bot.store, 4242, "acme-backend"), Some(7.5));
+    assert_eq!(super::listener_build(&h.bot.store, 4243, "acme-backend"), None);
+    assert_eq!(super::listener_build(&h.bot.store, 4242, "nova-studio"), None);
 }
 
 #[test]

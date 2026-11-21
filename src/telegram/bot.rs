@@ -102,6 +102,14 @@ pub struct Route {
 
 pub type Listeners = Box<dyn Fn() -> Vec<(u32, String)>>;
 
+/// What `asp telegram listen` adds to a listen so that it carries on in a
+/// newer asp: the build it runs (its file's mtime, written in the session for
+/// `doctor`) and whether an update has replaced that build since.
+pub struct Renewal<'a> {
+    pub built: f64,
+    pub replaced: &'a dyn Fn() -> bool,
+}
+
 pub struct Bot {
     pub store: Store,
     tg: Box<dyn Telegram>,
@@ -2726,10 +2734,23 @@ impl Bot {
     /// Waits for this session's messages; reads Telegram for all of them when
     /// no other listener does. Returns (messages, ignored).
     pub fn listen(&self, name: &str, max_seconds: u64) -> Result<(Vec<Object>, i32)> {
+        let (received, ignored, _) = self.listen_renewing(name, max_seconds, None)?;
+        Ok((received, ignored))
+    }
+
+    /// `listen` that also ends, with nothing received, once `renewal` says
+    /// an update replaced the running build; the third value is then the
+    /// seconds still to listen (0: no limit).
+    pub fn listen_renewing(
+        &self,
+        name: &str,
+        max_seconds: u64,
+        renewal: Option<&Renewal>,
+    ) -> Result<(Vec<Object>, i32, Option<u64>)> {
         let Some(mine) = self.store.lock(&format!("session.{name}"), false) else {
             return Err(self.busy(name).into());
         };
-        let result = self.listen_holding(name, max_seconds);
+        let result = self.listen_holding(name, max_seconds, renewal);
         let _ = self.update_session(name, obj(json!({"last_listen": now()})));
         drop(mine);
         result
@@ -2743,8 +2764,17 @@ impl Bot {
         ))
     }
 
-    fn listen_holding(&self, name: &str, max_seconds: u64) -> Result<(Vec<Object>, i32)> {
-        self.update_session(name, obj(json!({"last_listen": now(), "stopped": false})))?;
+    fn listen_holding(
+        &self,
+        name: &str,
+        max_seconds: u64,
+        renewal: Option<&Renewal>,
+    ) -> Result<(Vec<Object>, i32, Option<u64>)> {
+        let mut started = obj(json!({"last_listen": now(), "stopped": false}));
+        if let Some(renewal) = renewal {
+            started.insert("listener".into(), json!({"pid": std::process::id(), "built": renewal.built}));
+        }
+        self.update_session(name, started)?;
         let span = if max_seconds == 0 { FOREVER } else { max_seconds as f64 };
         let deadline = now() + span;
         let (mut beat, mut pause, mut ignored) = (now(), 5.0f64, 0);
@@ -2759,11 +2789,15 @@ impl Bot {
                 for entry in &received {
                     self.seen(entry);
                 }
-                return Ok((received, ignored));
+                return Ok((received, ignored, None));
             }
             let at = now();
             if at >= deadline {
-                return Ok((Vec::new(), ignored));
+                return Ok((Vec::new(), ignored, None));
+            }
+            if renewal.is_some_and(|renewal| (renewal.replaced)()) {
+                let left = if max_seconds == 0 { 0 } else { (deadline - at).ceil().max(1.0) as u64 };
+                return Ok((Vec::new(), ignored, Some(left)));
             }
             if at - beat >= 60.0 {
                 self.update_session(name, obj(json!({"last_listen": at})))?;

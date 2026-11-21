@@ -15,13 +15,15 @@ use anyhow::{bail, Context, Result};
 pub(crate) use bot::Bot;
 #[cfg(target_os = "macos")]
 pub(crate) use codex::{hook_group as codex_hook_group, is_hook_group as is_codex_hook_group};
-use bot::{say, Busy, Extras};
+use bot::{say, Busy, Extras, Renewal};
 pub(crate) use setup::system_prefers_french;
 use clap::Subcommand;
 use serde::Deserialize;
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 use store::{Fields, Store};
 
 #[derive(Subcommand)]
@@ -324,14 +326,21 @@ fn relay_token_reader(settings: &TelegramSettings) -> Box<dyn Fn() -> Result<Str
 /// A running listener: its pid and session.
 type Listener = (u32, String);
 
-/// `asp telegram listen` processes started before the installed binary,
-/// and listeners of the Python sync-telegram still running.
-fn running_listeners(code: &Path) -> (Vec<Listener>, Vec<Listener>) {
-    let built = std::fs::metadata(code)
+/// When a file was last written (0 if unknown).
+fn modified_at(file: &Path) -> f64 {
+    std::fs::metadata(file)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0.0, |m| m.as_secs_f64());
+        .map_or(0.0, |m| m.as_secs_f64())
+}
+
+/// `asp telegram listen` processes running a build older than the installed
+/// binary, and listeners of the Python sync-telegram still running. A
+/// listener's build is the one written in its session (`listener_build`);
+/// one that wrote none runs the build it was started with.
+fn running_listeners(code: &Path, build_of: &dyn Fn(u32, &str) -> Option<f64>) -> (Vec<Listener>, Vec<Listener>) {
+    let built = modified_at(code);
     let Ok(output) = Command::new("/bin/ps")
         .args(["-axo", "pid=,etime=,command="])
         .output()
@@ -365,13 +374,90 @@ fn running_listeners(code: &Path) -> (Vec<Listener>, Vec<Listener>) {
             python.push((pid, session_of(&command)));
         } else if program_name(&command) == "asp" && command.contains(" telegram listen") {
             if let Some(seconds) = elapsed_seconds(elapsed) {
-                if at - seconds < built {
-                    old.push((pid, session_of(&command)));
+                let session = session_of(&command);
+                if build_of(pid, &session).unwrap_or(at - seconds) < built {
+                    old.push((pid, session));
                 }
             }
         }
     }
     (old, python)
+}
+
+/// The build a session's listener said it runs, if that listener is `pid`
+/// (a listener that carried on in a new build kept its pid).
+fn listener_build(store: &Store, pid: u32, session: &str) -> Option<f64> {
+    let data = store.read_object(&store.path(&["sessions", &format!("{session}.json")]))?;
+    let listener = data.object("listener")?;
+    (listener.int("pid") == Some(i64::from(pid))).then(|| listener.float("built"))
+}
+
+/// The asp binary a listener runs, to notice an update replacing it.
+struct Build {
+    path: PathBuf,
+    identity: Option<FileIdentity>,
+    built: f64,
+    /// Another binary found at `path`, and since when.
+    found: Cell<Option<(FileIdentity, Instant)>>,
+    settle: Duration,
+}
+
+/// Device, inode and modification time (seconds, nanoseconds).
+type FileIdentity = (u64, u64, i64, i64);
+
+impl Build {
+    /// Another binary must stand at the path this long: an update is done
+    /// copying files by then.
+    const SETTLE: Duration = Duration::from_secs(30);
+
+    fn running() -> Self {
+        Self::at(std::env::current_exe().unwrap_or_default(), Self::SETTLE)
+    }
+
+    fn at(path: PathBuf, settle: Duration) -> Self {
+        Self {
+            identity: file_identity(&path),
+            built: modified_at(&path),
+            path,
+            found: Cell::new(None),
+            settle,
+        }
+    }
+
+    /// True once another executable has stood at the build's path for
+    /// `settle`.
+    fn replaced(&self) -> bool {
+        let Some(identity) = self.identity else {
+            return false;
+        };
+        let other = file_identity(&self.path).filter(|found| *found != identity);
+        match (other, self.found.get()) {
+            (Some(other), Some((found, since))) if other == found => since.elapsed() >= self.settle,
+            _ => {
+                self.found.set(other.map(|other| (other, Instant::now())));
+                false
+            }
+        }
+    }
+}
+
+fn file_identity(file: &Path) -> Option<FileIdentity> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = std::fs::metadata(file).ok()?;
+    (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .then(|| (metadata.dev(), metadata.ino(), metadata.mtime(), metadata.mtime_nsec()))
+}
+
+/// Turns this listener into the same listen run by `program`, the new
+/// build: same pid and output, so the session waiting on it sees nothing.
+/// Returns only if that fails.
+fn carry_on(program: &Path, name: &str, left: u64) -> std::io::Error {
+    use std::io::Write;
+    use std::os::unix::process::CommandExt;
+    let _ = std::io::stdout().flush();
+    Command::new(program)
+        .args(["telegram", "listen", "--session", name, "--max", &left.to_string()])
+        .exec()
 }
 
 /// The program a `ps` command line runs: "asp" for `/usr/local/bin/asp …`,
@@ -404,11 +490,12 @@ fn open_bot() -> Result<Bot> {
     let tg = api::HttpTelegram::new(token(&settings)?);
     let relay = api::HttpRelay::new(relay_token_reader(&settings));
     let code = std::env::current_exe().unwrap_or_default();
+    let sessions = Store::new(data_dir(&settings));
     Ok(Bot::new(
         store,
         Box::new(tg),
         Box::new(relay),
-        Box::new(move || running_listeners(&code).0),
+        Box::new(move || running_listeners(&code, &|pid, session| listener_build(&sessions, pid, session)).0),
     ))
 }
 
@@ -596,7 +683,17 @@ fn execute(command: TelegramCommand) -> Result<i32> {
         }
         TelegramCommand::Listen { session, max } => {
             let name = session_name(session.as_deref())?;
-            let (received, ignored) = bot.listen(&name, max)?;
+            let build = Build::running();
+            let renewal = Renewal { built: build.built, replaced: &|| build.replaced() };
+            let (received, ignored) = match bot.listen_renewing(&name, max, Some(&renewal))? {
+                (_, _, Some(left)) => {
+                    let error = carry_on(&build.path, &name, left);
+                    eprintln!("asp: {error}");
+                    // The new build can't run: this one listens on.
+                    bot.listen(&name, left)?
+                }
+                (received, ignored, None) => (received, ignored),
+            };
             if ignored > 0 {
                 println!("{}", say!(bot, "({ignored} message(s) d’un autre compte ignoré(s))", "({ignored} message(s) from another account ignored)"));
             }
@@ -734,7 +831,7 @@ fn execute(command: TelegramCommand) -> Result<i32> {
             for line in bot.doctor()? {
                 println!("{line}");
             }
-            let (_, python) = running_listeners(Path::new(""));
+            let (_, python) = running_listeners(Path::new(""), &|_, _| None);
             if !python.is_empty() {
                 let shown = python
                     .iter()
