@@ -32,6 +32,10 @@ const DU_KEEP: f64 = 35.0 * 60.0;
 const DU_TIMEOUT: Duration = Duration::from_secs(120);
 /// No repeat per (session, type) for 20 minutes…
 const RENEWAL: f64 = 20.0 * 60.0;
+/// …or 2 hours for the whole Mac's swap and memory pressure, which last for
+/// days on a busy Mac: the heaviest sessions were told again every 20
+/// minutes (95 alerts in a day for one session, each one a turn of it)…
+const MACHINE_RENEWAL: f64 = 2.0 * 3600.0;
 /// …unless the value grew this much.
 const MULTIPLIER: f64 = 1.5;
 
@@ -681,7 +685,16 @@ pub struct Said {
     pub valeur: f64,
 }
 
-/// No new alert for 20 minutes, unless more severe or the value ×1.5.
+fn renewal(kind: &str) -> f64 {
+    if matches!(kind, "swap" | "pression") {
+        MACHINE_RENEWAL
+    } else {
+        RENEWAL
+    }
+}
+
+/// No new alert for 20 minutes (2 hours for swap and pressure), unless more
+/// severe or the value ×1.5.
 pub fn filter(alerts: Vec<Alert>, memory: &mut BTreeMap<String, Said>, at: f64) -> Vec<Alert> {
     let mut emitted = Vec::new();
     for alert in alerts {
@@ -689,7 +702,7 @@ pub fn filter(alerts: Vec<Alert>, memory: &mut BTreeMap<String, Said>, at: f64) 
         let fresh = match memory.get(&key) {
             None => true,
             Some(before) => {
-                at - before.t >= RENEWAL
+                at - before.t >= renewal(&alert.kind)
                     || alert.gravite > before.gravite
                     || (before.valeur > 0.0 && alert.valeur >= before.valeur * MULTIPLIER)
             }
@@ -1237,6 +1250,20 @@ mod tests {
         assert_eq!(critical[0].gravite, 2);
         assert_eq!(filter(critical, &mut memory, 1200.0).len(), 1);
         assert_eq!(filter(alerts, &mut memory, 1000.0 + RENEWAL + 300.0).len(), 1);
+    }
+
+    #[test]
+    fn swap_is_said_again_to_a_session_after_two_hours_unless_it_grew() {
+        let limits = Thresholds::default();
+        let tree = |gb: u64| Tree { session: session(1, "dev", "/p"), ram: gb * GIB, procs: vec![TreeProc { pid: 2, ram: gb * GIB, name: "node".into(), orphan: false }] };
+        let swapping = |gb: u64| Snapshot { swap: 10 * GIB, ..snapshot(vec![tree(gb)]) };
+        let swap = |gb: u64| memory_alerts(&swapping(gb), &limits, true).into_iter().filter(|a| a.kind == "swap").collect::<Vec<_>>();
+        let mut memory = BTreeMap::new();
+        assert_eq!(filter(swap(2), &mut memory, 1000.0).len(), 1);
+        assert!(filter(swap(2), &mut memory, 1000.0 + RENEWAL + 60.0).is_empty());
+        assert_eq!(filter(swap(3), &mut memory, 1000.0 + RENEWAL + 120.0).len(), 1, "×1.5 heavier");
+        assert!(filter(swap(3), &mut memory, 1000.0 + RENEWAL + 180.0).is_empty());
+        assert_eq!(filter(swap(3), &mut memory, 1000.0 + RENEWAL + 120.0 + MACHINE_RENEWAL).len(), 1);
     }
 
     #[test]
