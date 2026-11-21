@@ -154,8 +154,10 @@ fn project_name(pid: u32) -> String {
         .unwrap_or_else(|| "its project".to_string())
 }
 
-/// Network-level failures, as Claude Code and Codex word them.
-const NETWORK_PATTERNS: [&str; 20] = [
+/// Network-level failures, as Claude Code and Codex word them. "timeout"
+/// covers Claude Code's "Stream idle timeout - no chunks received" and
+/// "408 Request timeout", which StopFailure reports as `unknown`.
+const NETWORK_PATTERNS: [&str; 22] = [
     "connection refused",
     "connection reset",
     "connection error",
@@ -176,6 +178,8 @@ const NETWORK_PATTERNS: [&str; 20] = [
     "stopped arriving",
     "stalled",
     "timed out",
+    "timeout",
+    "connection lost",
 ];
 
 /// Server-side failures worth retrying after a pause.
@@ -785,6 +789,13 @@ mod tests {
             ),
             Some(Cause::Network)
         );
+        // Both left a session stopped for good before (asp.log, Nov 2026).
+        for message in [
+            "API Error: Stream idle timeout - no chunks received",
+            "API Error: 408 Request timeout",
+        ] {
+            assert_eq!(classify_claude_failure("unknown", message), Some(Cause::Network), "{message}");
+        }
     }
 
     #[test]
